@@ -53,7 +53,9 @@ Notes:
   19200 x 10800 RGBA screenshot (207 megapixels, 3.3 GB of pixel cache) used to
   die with "cache resources exhausted" under the old 1 GiB / 2 GiB / 4 GiB
   limits and now converts to every target (peak 5.7 GB RSS, 8.4 GB for WEBP;
-  each parallel conversion of such an image needs that much). WEBP cannot
+  each parallel conversion of such an image needs that much). See
+  "Memory: admission and temp files" below for how several of them are kept from
+  running at once. WEBP cannot
   store more than 16383 pixels per side: wider images are shrunk to fit. File names are passed
   with `%` escaped, so names like `a%d.png` or `100%.png` work.
 * **SVG input uses `RSVG:`**, never the plain `SVG:` coder. Depending on the
@@ -102,6 +104,17 @@ more than a photo does.
 * PDF: ImageMagick embeds PNG-type sources losslessly (Flate) and JPEG
   sources as JPEG at their own quality; nothing is recompressed to a lower
   quality.
+* PDF page size: a screenshot has no resolution, so ImageMagick would write 72
+  dpi and a 1920 px capture would become a 26 inch page. The source resolution
+  is read with the size probe (`identify -ping -format '%x %y %U'`); when there
+  is none (units undefined, or the 72 dpi that everything stamps on a file),
+  `-units PixelsPerInch -density N` is set so that the page fits an A4 sheet
+  (landscape for a wide image, portrait for a tall one; N is the smallest whole
+  dpi that does it, but at least 96, so an icon stays small): 1920 x 1080 gets
+  165 dpi, a 837.8 x 471.3 pt page instead of 1920 x 1080 pt. Only the density
+  is set, the pixels are embedded untouched. An image with a real resolution (a
+  300 dpi scan, a 96 dpi screen capture that says so) keeps it, and SVG keeps
+  its 192 dpi rendering.
 * HEIC input: decoded by GdkPixbuf (glycin) to an 8-bit sRGB PNG with the EXIF
   orientation applied; the colour profile is applied by the loader (the pixels
   differ from a raw decode by the P3 to sRGB conversion). Bit depth above 8 is
@@ -208,6 +221,45 @@ the main thread or crash the process:
 * **Decoding untrusted HEIC/AVIF** happens in the `nfc-decode` process, never
   inside Nautilus.
 
+### Memory: admission and temp files
+
+One 200 megapixel image needs 6 to 8 GB while it converts, and the runner starts
+up to `ncpu/2` images at once, so selecting several big ones could take far more
+memory than the machine has. Image jobs therefore go through an admission step
+(all of it bookkeeping in the main loop; nothing blocks):
+
+1. **Size, without decoding pixels.** `magick identify -ping` (own process,
+   asynchronous, 30 s timeout) reads width, height and resolution from the
+   header; for HEIC/AVIF the helper does it (`nfc-decode --info`). If the probe
+   fails the job simply runs without an estimate (it counts as small).
+2. **Estimate.** peak bytes = pixels x B/px, with B/px 30 for most targets (jpg,
+   png, ico, bmp, tiff, pdf), 40 for AVIF and 44 for WEBP. Calibrated on the
+   measured 19200 x 10800 RGBA PNG (207 MP): 5.7 GB = 27.5 B/px, AVIF 7.6 GB =
+   36.7 B/px, WEBP 8.4 GB = 40.5 B/px, plus 8-10 % margin. SVG is rendered at
+   192 dpi, so its pixels count 64/9 times.
+3. **Admission.** A job starts when it is small (below 25 megapixels: never held
+   back, so ordinary use is unchanged), or when nothing else is running (a single
+   huge file always runs, alone), or when the estimates of all running jobs plus
+   its own fit in 60 % of `MemAvailable` (`/proc/meminfo`, read when the decision
+   is made). Otherwise it waits in a FIFO queue that is looked at again whenever
+   a conversion ends and every 2 s. The accounting is global: two batches started
+   one after the other share it. The usual worker cap (`ncpu/2`) still applies.
+4. **Where ImageMagick spills.** `/tmp` is a RAM-backed tmpfs on most current
+   systems (`findmnt -T /tmp` says `tmpfs`), so pixel data ImageMagick cannot
+   keep in memory would still be RAM. Image jobs run `magick` with
+   `MAGICK_TEMPORARY_PATH` (and `MAGICK_TMPDIR`) set to
+   `$XDG_CACHE_HOME/nautilus-file-converter/tmp` (`~/.cache/...`, on the disk,
+   `findmnt -T ~/.cache` says `ext4`; mode 0700, created on demand). The work
+   directory of a job on an image of 25 megapixels or more (it holds `decoded.png`
+   or `flat.png`, hundreds of MB) is made there too; everything else uses
+   `$TMPDIR`. Entries in that directory older than one day (left by a crash or a
+   kill) are removed once per session, in a background thread. If it cannot be
+   created, the system temp directory is used.
+
+`NFC_TEST_MEMAVAILABLE_KB` replaces the `MemAvailable` figure; it exists for the
+tests and is only honoured when set.
+
+
 ### Timeouts
 
 Per tool invocation (a conversion can have two or three: decode, flatten,
@@ -258,8 +310,11 @@ meson test -C build
 
 * `core-logic`: classification, output naming, command lines (input coders, `%`
   escaping, resource limits, LibreOffice URIs), no-overwrite publishing in all
-  three strategies, and the `nfc-decode` helper (formats, a decode, garbage
-  input, usage errors).
+  three strategies, and the `nfc-decode` helper (formats, a decode, `--info`, garbage
+  input, usage errors); the size-probe parser, the memory estimate (checked
+  against the calibration numbers), the admission decision (including a fake
+  `NFC_TEST_MEMAVAILABLE_KB`), the PDF page-fit arguments and the spill directory
+  (mode, location, removal of old leftovers).
 * `robustness`: all with fake tools and a `TMPDIR` containing a space and `%`:
   a fake `ffmpeg` that hangs for 20 s must not slow the menu logic (< 100 ms
   for every selection) and is killed by the probe timeout and logged; a fake
@@ -269,7 +324,14 @@ meson test -C build
   in-flight jobs are cancelled on shutdown; the log is 0600 and rotates, and
   one entry never exceeds 64 KiB; a fake tool printing 10 MB to stderr and
   stdout fails the job with its last stderr line while the log grows by at most
-  one capped entry.
+  one capped entry. Admission: four generated 12000x8000 PNGs (96 MP, estimate
+  2.9 GB each) are converted as one batch with a fake `magick` that logs when
+  each conversion starts and ends: with little memory they run strictly one at a
+  time and all succeed, with room for two never more than two overlap, with plenty
+  all start together; small images always run in parallel even with no memory
+  at all; ImageMagick gets the spill directory; a shutdown while jobs wait ends
+  them all as cancelled and leaves nothing behind. `NFC_TEST_SKIP_HUGE` skips the
+  huge-image batches.
 * `publish-terminates`: with an `LD_PRELOAD` shim that makes `rename()` fail
   with `EEXIST`, publishing in the last-resort mode returns an error within a
   second instead of looping forever; and when the first 10000 names are all
@@ -306,6 +368,10 @@ meson test -C build
   (4:4:4, BT.709 full range tagged), WEBP of a PNG is pixel-identical, ICO of a
   non-square image has square 256/48/32/16 entries. `core-logic` asserts the
   exact quality arguments of every target.
+  PDF page size: PNGs of 1920x1080 (no density), a tall phone screenshot, an icon,
+  and 300 and 96 dpi ones are converted to PDF; `pdfinfo` must show an A4-sized
+  page for the ones without density and the source resolution for the others,
+  and `pdfimages -list` the original pixel size.
 
 ## License
 

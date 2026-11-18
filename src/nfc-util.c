@@ -171,3 +171,30 @@ nfc_kill_group (pid_t pgid)
   if (pgid > 1)
     kill (-pgid, SIGKILL);
 }
+
+/* Recursive removal (best effort, never follows symlinks). */
+void
+nfc_rm_rf (const char *path)
+{
+  GDir *d;
+  const char *name;
+
+  if (g_file_test (path, G_FILE_TEST_IS_DIR) && !g_file_test (path, G_FILE_TEST_IS_SYMLINK))
+    {
+      d = g_dir_open (path, 0, NULL);
+      if (d != NULL)
+        {
+          while ((name = g_dir_read_name (d)) != NULL)
+            {
+              char *child = g_build_filename (path, name, NULL);
+
+              nfc_rm_rf (child);
+              g_free (child);
+            }
+          g_dir_close (d);
+        }
+      g_rmdir (path);
+    }
+  else
+    g_unlink (path);
+}

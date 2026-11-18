@@ -80,32 +80,6 @@ join_argv (char **argv)
   return g_string_free (s, FALSE);
 }
 
-static void
-rm_rf (const char *path)
-{
-  GDir *d;
-  const char *name;
-
-  if (g_file_test (path, G_FILE_TEST_IS_DIR) && !g_file_test (path, G_FILE_TEST_IS_SYMLINK))
-    {
-      d = g_dir_open (path, 0, NULL);
-      if (d != NULL)
-        {
-          while ((name = g_dir_read_name (d)) != NULL)
-            {
-              char *child = g_build_filename (path, name, NULL);
-
-              rm_rf (child);
-              g_free (child);
-            }
-          g_dir_close (d);
-        }
-      g_rmdir (path);
-    }
-  else
-    g_unlink (path);
-}
-
 /* -------------------------------------------------------------------------
  * Timeouts
  *
@@ -158,6 +132,12 @@ typedef struct {
   gboolean timed_out;
   gboolean aborted;       /* module shutdown: no further steps, no fallbacks */
   gboolean finalizing;    /* output being moved into place by a worker thread */
+  NfcImageInfo info;     /* size from the probe, valid when have_info */
+  gboolean have_info;
+  guint64 pixels, est;    /* pixels (SVG: as rendered) and estimated peak bytes */
+  gboolean queued;        /* waiting for memory in the admission queue */
+  gboolean reserved;      /* its estimate is counted in reserved_bytes */
+  char *spill;            /* disk-backed temp dir for ImageMagick (images only) */
   GTask *task;
 } Job;
 
@@ -166,6 +146,9 @@ static GHashTable *active_jobs = NULL;
 static gboolean shutting_down = FALSE;
 
 static void run_step (Job *j);
+static void job_start (Job *j);
+static void admission_release (Job *j);
+static void admission_forget (Job *j);
 
 static gboolean
 is_office (NfcCategory c)
@@ -179,12 +162,14 @@ job_cleanup_files (Job *j)
   if (j->hidden != NULL && g_file_test (j->hidden, G_FILE_TEST_EXISTS))
     g_unlink (j->hidden);
   if (j->workdir != NULL)
-    rm_rf (j->workdir);
+    nfc_rm_rf (j->workdir);
 }
 
 static void
 job_free (Job *j)
 {
+  admission_forget (j);
+  admission_release (j);
   if (active_jobs != NULL)
     g_hash_table_remove (active_jobs, j);
   if (j->timeout_id)
@@ -200,6 +185,7 @@ job_free (Job *j)
   g_free (j->stem);
   g_free (j->workdir);
   g_free (j->produced);
+  g_free (j->spill);
   g_free (j->hidden);
   g_free (j->err);
   g_free (j);
@@ -284,7 +270,7 @@ finalize_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data)
   {
     GTask *task = j->task;
 
-    rm_rf (j->workdir);
+    nfc_rm_rf (j->workdir);
     g_task_return_pointer (task, final, g_free);
     j->task = NULL;
     job_free (j);
@@ -618,6 +604,13 @@ run_step (Job *j)
     }
   argv = attempt->pdata[j->si];
   l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
+  if (j->spill != NULL)
+    {
+      /* ImageMagick spills pixel data it cannot keep in memory to its temporary
+       * directory: not /tmp (RAM on most systems), see nfc_spill_dir() */
+      g_subprocess_launcher_setenv (l, "MAGICK_TEMPORARY_PATH", j->spill, TRUE);
+      g_subprocess_launcher_setenv (l, "MAGICK_TMPDIR", j->spill, TRUE);
+    }
   j->proc = g_subprocess_launcher_spawnv (l, (const char *const *) argv, &error);
   g_object_unref (l);
   if (j->proc == NULL)
@@ -641,13 +634,275 @@ run_step (Job *j)
   step_start_io (j);
 }
 
+/* -------------------------------------------------------------------------
+ * Memory-aware admission of image jobs
+ *
+ * One 200 megapixel image needs 6 to 8 GB while it converts; the runner starts
+ * up to ncpu/2 images at once. Before an image job starts, its size is read
+ * (`identify -ping`: header only, own process, asynchronous) and the peak
+ * memory estimated (nfc_estimate_peak_bytes). The job then starts when
+ *   - it is small (< NFC_SMALL_IMAGE_PIXELS): at once, never held back, or
+ *   - nothing else runs (a single huge file always runs, alone), or
+ *   - the estimates of the running jobs plus its own fit in 60 % of the
+ *     MemAvailable read at that moment.
+ * Otherwise it waits in a FIFO queue that is re-examined whenever a job ends
+ * (and every 2 s, as other programs free memory too). All bookkeeping, no
+ * blocking: it runs in the main loop. The accounting is global, so two
+ * batches started one after the other share it.
+ * ---------------------------------------------------------------------- */
+
+#define PROBE_TIMEOUT_SECS 30
+#define PUMP_RETRY_SECS    2
+
+static GQueue admit_queue = G_QUEUE_INIT; /* Job *, FIFO, jobs with queued == TRUE */
+static guint64 reserved_bytes = 0;        /* sum of est over reserved jobs */
+static guint n_reserved = 0;
+static guint pump_idle_id = 0, pump_timer_id = 0;
+
+static void admission_pump (void);
+
+static gboolean
+pump_idle_cb (gpointer data G_GNUC_UNUSED)
+{
+  pump_idle_id = 0;
+  admission_pump ();
+  return G_SOURCE_REMOVE;
+}
+
+static gboolean
+pump_timer_cb (gpointer data G_GNUC_UNUSED)
+{
+  pump_timer_id = 0;
+  admission_pump ();
+  return G_SOURCE_REMOVE;
+}
+
+static void
+admission_reserve (Job *j)
+{
+  j->reserved = TRUE;
+  reserved_bytes += j->est;
+  n_reserved++;
+}
+
+static void
+admission_release (Job *j)
+{
+  if (!j->reserved)
+    return;
+  j->reserved = FALSE;
+  reserved_bytes -= MIN (reserved_bytes, j->est);
+  n_reserved--;
+  /* a freed reservation may let a waiting job start; not from inside the
+   * callback chain of the job that just ended */
+  if (!g_queue_is_empty (&admit_queue) && pump_idle_id == 0)
+    pump_idle_id = g_idle_add (pump_idle_cb, NULL);
+}
+
+static void
+admission_forget (Job *j)
+{
+  if (j->queued)
+    {
+      g_queue_remove (&admit_queue, j);
+      j->queued = FALSE;
+    }
+}
+
+static void
+admission_pump (void)
+{
+  guint64 budget;
+
+  if (g_queue_is_empty (&admit_queue))
+    return;
+  budget = nfc_admission_budget_bytes ();
+  while (!g_queue_is_empty (&admit_queue) && !shutting_down)
+    {
+      Job *j = g_queue_peek_head (&admit_queue);
+
+      if (!nfc_admission_allows (j->pixels, j->est, reserved_bytes, n_reserved, budget))
+        break;
+      g_queue_pop_head (&admit_queue);
+      j->queued = FALSE;
+      admission_reserve (j);
+      job_start (j); /* may end the job at once: that only schedules a pump */
+    }
+  if (!g_queue_is_empty (&admit_queue) && pump_timer_id == 0)
+    pump_timer_id = g_timeout_add_seconds (PUMP_RETRY_SECS, pump_timer_cb, NULL);
+}
+
+/* the size is known (or not): start the job now or queue it */
+static void
+admission_submit (Job *j)
+{
+  NfcImageInfo *info = j->have_info ? &j->info : NULL;
+
+  j->est = nfc_estimate_peak_bytes (j->fmt, j->key, info);
+  j->pixels = info != NULL ? info->width * info->height : 0;
+  if (j->fmt != NULL && g_str_equal (j->fmt, "svg"))
+    j->pixels = j->pixels * 64 / 9;
+  if (j->pixels < NFC_SMALL_IMAGE_PIXELS)
+    {
+      admission_reserve (j); /* counted for the others, but never held back */
+      job_start (j);
+      return;
+    }
+  j->queued = TRUE;
+  g_queue_push_tail (&admit_queue, j);
+  admission_pump ();
+}
+
+static gboolean
+probe_timeout (gpointer data)
+{
+  Job *j = data;
+
+  j->timeout_id = 0;
+  nfc_kill_group (j->pgid);
+  if (j->proc != NULL)
+    g_subprocess_force_exit (j->proc);
+  if (j->cancel != NULL)
+    g_cancellable_cancel (j->cancel);
+  return G_SOURCE_REMOVE;
+}
+
+static void
+probe_done (GObject *source, GAsyncResult *res, gpointer data)
+{
+  Job *j = data;
+  char *out = NULL;
+  GError *error = NULL;
+  gboolean ok = g_subprocess_communicate_utf8_finish (G_SUBPROCESS (source), res, &out, NULL, &error);
+
+  if (j->timeout_id)
+    {
+      g_source_remove (j->timeout_id);
+      j->timeout_id = 0;
+    }
+  ok = ok && g_subprocess_get_if_exited (j->proc) && g_subprocess_get_exit_status (j->proc) == 0;
+  if (step_leader_alive (j))
+    nfc_kill_group (j->pgid); /* nothing of the probe may linger */
+  j->pgid = 0;
+  g_clear_object (&j->proc);
+  g_clear_object (&j->cancel);
+  if (shutting_down || j->aborted)
+    {
+      g_free (out);
+      g_clear_error (&error);
+      job_fail (j, "cancelled");
+      return;
+    }
+  if (ok && nfc_image_info_parse (out, &j->info))
+    j->have_info = TRUE;
+  else
+    nfc_log ("size probe failed for %s (%s): converting without a memory estimate",
+             j->src, error != NULL ? error->message : "no usable output");
+  g_free (out);
+  g_clear_error (&error);
+  admission_submit (j);
+}
+
+/* first step of an image job: read the size without decoding pixels */
+static void
+probe_start (Job *j)
+{
+  char **argv = nfc_build_probe_argv (j->fmt, j->src);
+  GSubprocessLauncher *l;
+
+  if (argv == NULL)
+    {
+      admission_submit (j);
+      return;
+    }
+  l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+  j->proc = g_subprocess_launcher_spawnv (l, (const char *const *) argv, NULL);
+  g_object_unref (l);
+  g_strfreev (argv);
+  if (j->proc == NULL)
+    {
+      admission_submit (j);
+      return;
+    }
+  j->pgid = nfc_subprocess_pgid (j->proc);
+  j->cancel = g_cancellable_new ();
+  j->timeout_id = g_timeout_add_seconds (PROBE_TIMEOUT_SECS, probe_timeout, j);
+  g_subprocess_communicate_utf8_async (j->proc, NULL, j->cancel, probe_done, j);
+}
+
+/* A private work directory. Image jobs of a big picture keep their intermediates
+ * (decoded.png, flat.png: hundreds of MB) in the disk-backed spill directory, not
+ * in /tmp. */
+static char *
+make_workdir (Job *j, GError **error)
+{
+  if (j->spill != NULL && j->pixels >= NFC_SMALL_IMAGE_PIXELS)
+    {
+      char *tmpl = g_build_filename (j->spill, "nfc-XXXXXX", NULL);
+      char *dir = g_mkdtemp_full (tmpl, 0700);
+
+      if (dir != NULL)
+        return dir;
+      g_free (tmpl);
+    }
+  return g_dir_make_tmp ("nfc-XXXXXX", error);
+}
+
+static void
+job_start (Job *j)
+{
+  GError *error = NULL;
+
+  if (shutting_down || j->aborted)
+    {
+      j->aborted = TRUE;
+      job_fail (j, "cancelled");
+      return;
+    }
+  if (j->cat == NFC_CAT_IMAGE)
+    j->spill = nfc_spill_dir ();
+  j->workdir = make_workdir (j, &error);
+  if (j->workdir == NULL)
+    {
+      char *msg = g_strdup_printf ("cannot create a temporary directory: %s", error->message);
+
+      g_clear_error (&error);
+      job_fail (j, msg);
+      g_free (msg);
+      return;
+    }
+  if (is_office (j->cat))
+    {
+      char *outdir = g_build_filename (j->workdir, "out", NULL);
+      char *name = g_strdup_printf ("%s.%s", j->stem, j->ext);
+
+      g_mkdir_with_parents (outdir, 0700);
+      j->produced = g_build_filename (outdir, name, NULL);
+      g_free (outdir);
+      g_free (name);
+    }
+  else
+    {
+      j->hidden = nfc_hidden_temp_name (j->dir, j->stem, j->ext);
+      j->produced = g_strdup (j->hidden);
+    }
+  /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
+  j->attempts = nfc_build_attempts_info (j->cat, j->fmt, j->key, j->src, j->produced,
+                                         j->workdir, j->have_info ? &j->info : NULL, NULL);
+  if (j->attempts == NULL)
+    {
+      job_fail (j, "no converter available for this format");
+      return;
+    }
+  run_step (j);
+}
+
 void
 nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
                         const char *ext, const char *src_in,
                         GAsyncReadyCallback callback, gpointer user_data)
 {
   Job *j = g_new0 (Job, 1);
-  GError *error = NULL;
   GStatBuf st;
 
   j->task = g_task_new (NULL, NULL, callback, user_data);
@@ -669,39 +924,10 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
     active_jobs = g_hash_table_new (g_direct_hash, g_direct_equal);
   g_hash_table_add (active_jobs, j);
 
-  j->workdir = g_dir_make_tmp ("nfc-XXXXXX", &error);
-  if (j->workdir == NULL)
-    {
-      char *msg = g_strdup_printf ("cannot create a temporary directory: %s", error->message);
-
-      g_clear_error (&error);
-      job_fail (j, msg);
-      g_free (msg);
-      return;
-    }
-  if (is_office (cat))
-    {
-      char *outdir = g_build_filename (j->workdir, "out", NULL);
-      char *name = g_strdup_printf ("%s.%s", j->stem, ext);
-
-      g_mkdir_with_parents (outdir, 0700);
-      j->produced = g_build_filename (outdir, name, NULL);
-      g_free (outdir);
-      g_free (name);
-    }
+  if (cat == NFC_CAT_IMAGE)
+    probe_start (j); /* then the admission decides when job_start runs */
   else
-    {
-      j->hidden = nfc_hidden_temp_name (j->dir, j->stem, ext);
-      j->produced = g_strdup (j->hidden);
-    }
-  /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
-  j->attempts = nfc_build_attempts (cat, j->fmt, key, j->src, j->produced, j->workdir, NULL);
-  if (j->attempts == NULL)
-    {
-      job_fail (j, "no converter available for this format");
-      return;
-    }
-  run_step (j);
+    job_start (j);
 }
 
 char *
@@ -715,25 +941,45 @@ nfc_shutdown (void)
 {
   GHashTableIter it;
   gpointer key;
+  GList *waiting = NULL;
 
   shutting_down = TRUE;
-  if (active_jobs == NULL)
-    return;
-  g_hash_table_iter_init (&it, active_jobs);
-  while (g_hash_table_iter_next (&it, &key, NULL))
+  /* jobs waiting for memory have started nothing: fail them (after the loop
+   * below, which must not see the table change under it) */
+  while (!g_queue_is_empty (&admit_queue))
     {
-      Job *j = key;
+      Job *q = g_queue_pop_head (&admit_queue);
 
-      j->aborted = TRUE;
-      if (step_leader_alive (j)) /* see step_leader_alive(): never a stale pgid */
-        nfc_kill_group (j->pgid);
-      if (j->cancel != NULL)
-        g_cancellable_cancel (j->cancel);
-      /* a job in its finalize thread is left alone: it ends within moments and
-       * cleans up after itself */
-      if (!j->finalizing)
-        job_cleanup_files (j);
+      q->queued = FALSE;
+      q->aborted = TRUE;
+      waiting = g_list_prepend (waiting, q);
     }
+  if (pump_timer_id != 0)
+    {
+      g_source_remove (pump_timer_id);
+      pump_timer_id = 0;
+    }
+  if (active_jobs != NULL)
+    {
+      g_hash_table_iter_init (&it, active_jobs);
+      while (g_hash_table_iter_next (&it, &key, NULL))
+        {
+          Job *j = key;
+
+          j->aborted = TRUE;
+          if (step_leader_alive (j)) /* see step_leader_alive(): never a stale pgid */
+            nfc_kill_group (j->pgid);
+          if (j->cancel != NULL)
+            g_cancellable_cancel (j->cancel);
+          /* a job in its finalize thread is left alone: it ends within moments
+           * and cleans up after itself */
+          if (!j->finalizing)
+            job_cleanup_files (j);
+        }
+    }
+  for (GList *l = waiting; l != NULL; l = l->next)
+    job_fail (l->data, "cancelled");
+  g_list_free (waiting);
 }
 
 /* -------------------------------------------------------------------------

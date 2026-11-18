@@ -1095,10 +1095,275 @@ ff_avif_step (const char *flat, const char *out, gboolean photo)
   return av_done (a);
 }
 
+/* -------------------------------------------------------------------------
+ * Image size, memory estimate and admission (see nfc-core.h)
+ * ---------------------------------------------------------------------- */
+
+/* The size comes from the header only: `identify -ping` decodes no pixels. The
+ * format is "<w> <h>|<x> <y> <units>" (%w %h|%x %y %U); nfc-decode --info
+ * prints just "<w> <h>". */
+gboolean
+nfc_image_info_parse (const char *text, NfcImageInfo *out)
+{
+  NfcImageInfo r = { 0, 0, FALSE, 0, 0 };
+  const char *p = text;
+  char *end;
+
+  if (out != NULL)
+    *out = r;
+  if (p == NULL)
+    return FALSE;
+  while (g_ascii_isspace (*p))
+    p++;
+  r.width = g_ascii_strtoull (p, &end, 10);
+  if (end == p || r.width == 0)
+    return FALSE;
+  p = end;
+  r.height = g_ascii_strtoull (p, &end, 10);
+  if (end == p || r.height == 0)
+    return FALSE;
+  p = end;
+  if (*p == '|')
+    {
+      double x, y;
+      gboolean cm;
+
+      p++;
+      x = g_ascii_strtod (p, &end);
+      if (end != p)
+        {
+          p = end;
+          y = g_ascii_strtod (p, &end);
+          if (end != p)
+            {
+              p = end;
+              while (g_ascii_isspace (*p))
+                p++;
+              /* "Undefined" units: the numbers only give a pixel aspect ratio */
+              cm = g_str_has_prefix (p, "PixelsPerCentimeter");
+              if (cm || g_str_has_prefix (p, "PixelsPerInch"))
+                {
+                  r.xdpi = cm ? x * 2.54 : x;
+                  r.ydpi = cm ? y * 2.54 : y;
+                  /* 72 dpi is what everything writes when it knows nothing */
+                  r.has_density = r.xdpi > 0 && r.ydpi > 0 &&
+                                  !(r.xdpi > 71.5 && r.xdpi < 72.5 &&
+                                    r.ydpi > 71.5 && r.ydpi < 72.5);
+                }
+            }
+        }
+    }
+  if (out != NULL)
+    *out = r;
+  return TRUE;
+}
+
+char **
+nfc_build_probe_argv (const char *fmt, const char *src_in)
+{
+  GPtrArray *a;
+  char *src, *arg;
+  const char *coder;
+  char *base;
+
+  nfc_tools_init ();
+  if (fmt == NULL || src_in == NULL)
+    return NULL;
+  src = g_canonicalize_filename (src_in, NULL);
+  a = av_new ();
+  if (is_pixbuf_src (fmt))
+    {
+      /* no ImageMagick delegate for HEIC/AVIF here: the helper that decodes
+       * them reads the header */
+      if (nfc_tools.decode == NULL)
+        {
+          g_ptr_array_unref (a);
+          g_free (src);
+          return NULL;
+        }
+      av_add (a, nfc_tools.decode, "--info", src, NULL);
+      g_free (src);
+      return av_done (a);
+    }
+  coder = im_input_coder (fmt);
+  if (coder == NULL || nfc_tools.magick == NULL)
+    {
+      g_ptr_array_unref (a);
+      g_free (src);
+      return NULL;
+    }
+  base = g_path_get_basename (nfc_tools.magick);
+  if (g_str_equal (base, "magick"))
+    av_add (a, nfc_tools.magick, "identify", NULL);
+  else
+    {
+      /* ImageMagick 6: `convert` has no identify mode, `identify` is a tool */
+      char *ident = g_find_program_in_path ("identify");
+
+      if (ident == NULL)
+        {
+          g_free (base);
+          g_ptr_array_unref (a);
+          g_free (src);
+          return NULL;
+        }
+      av_add (a, ident, NULL);
+      g_free (ident);
+    }
+  g_free (base);
+  arg = im_path_arg (coder, src, "[0]");
+  av_add (a, "-quiet", "-ping", "-format", "%w %h|%x %y %U", arg, NULL);
+  g_free (arg);
+  g_free (src);
+  return av_done (a);
+}
+
+guint
+nfc_pdf_fit_dpi (guint64 w, guint64 h)
+{
+  /* A4 is 11.69 x 8.27 in; the long side goes along the long side */
+  double longer = (double) MAX (w, h), shorter = (double) MIN (w, h);
+  double dpi = MAX (longer / 11.69, shorter / 8.27);
+
+  if (dpi < 96.0)
+    dpi = 96.0;
+  if (dpi > 100000.0)
+    dpi = 100000.0;
+  return (guint) dpi + ((double) (guint) dpi < dpi ? 1 : 0);
+}
+
+/* Bytes of peak memory per pixel, measured on a 19200 x 10800 RGBA PNG (207
+ * megapixels, ImageMagick 7 Q16-HDRI, limits as in im_limits):
+ *   jpg, ico, bmp, tiff, pdf, png  5.7 GB  = 27.5 B/px  -> 30
+ *   avif (flat PNG, then libaom)   7.6 GB  = 36.7 B/px  -> 40
+ *   webp (lossless or sharp YUV)   8.4 GB  = 40.5 B/px  -> 44
+ * i.e. the measured value plus 8 to 10 % margin. */
+guint64
+nfc_estimate_peak_bytes (const char *fmt, const char *key, const NfcImageInfo *info)
+{
+  guint64 px, bpp;
+
+  if (info == NULL || info->width == 0 || info->height == 0)
+    return 0;
+  px = MIN (info->width, (guint64) 1000000) * MIN (info->height, (guint64) 1000000);
+  /* an SVG is rendered at 192 dpi instead of its nominal 72 */
+  if (fmt != NULL && g_str_equal (fmt, "svg"))
+    px = px * 64 / 9;
+  if (key != NULL && g_str_equal (key, "webp"))
+    bpp = 44;
+  else if (key != NULL && g_str_equal (key, "avif"))
+    bpp = 40;
+  else
+    bpp = 30;
+  return px * bpp;
+}
+
+static guint64
+meminfo_kb (const char *text, const char *field)
+{
+  const char *p = strstr (text, field);
+
+  return p != NULL ? g_ascii_strtoull (p + strlen (field), NULL, 10) : 0;
+}
+
+guint64
+nfc_mem_available_bytes (void)
+{
+  const char *e = g_getenv ("NFC_TEST_MEMAVAILABLE_KB");
+  char *text = NULL;
+  guint64 kb = 0;
+
+  if (e != NULL && *e != '\0')
+    return g_ascii_strtoull (e, NULL, 10) * 1024;
+  if (g_file_get_contents ("/proc/meminfo", &text, NULL, NULL))
+    kb = meminfo_kb (text, "MemAvailable:");
+  g_free (text);
+  return kb * 1024;
+}
+
+guint64
+nfc_admission_budget_bytes (void)
+{
+  return nfc_mem_available_bytes () / 10 * 6;
+}
+
+gboolean
+nfc_admission_allows (guint64 pixels, guint64 est, guint64 reserved, guint n_running,
+                      guint64 budget)
+{
+  if (pixels < NFC_SMALL_IMAGE_PIXELS || n_running == 0)
+    return TRUE;
+  return est <= budget && reserved <= budget - est;
+}
+
+/* Remove what a crashed or killed session left behind: entries not modified
+ * for a day. Own thread: they can be gigabytes of pixel cache. */
+static gpointer
+spill_cleanup_thread (gpointer data)
+{
+  char *dir = data;
+  GDir *d = g_dir_open (dir, 0, NULL);
+  const char *name;
+  gint64 now = g_get_real_time () / G_USEC_PER_SEC;
+
+  if (d != NULL)
+    {
+      while ((name = g_dir_read_name (d)) != NULL)
+        {
+          char *p = g_build_filename (dir, name, NULL);
+          GStatBuf st;
+
+          if (g_lstat (p, &st) == 0 && now - (gint64) st.st_mtime > 24 * 3600)
+            nfc_rm_rf (p);
+          g_free (p);
+        }
+      g_dir_close (d);
+    }
+  g_free (dir);
+  return NULL;
+}
+
+char *
+nfc_spill_dir (void)
+{
+  static gsize cleaned = 0;
+  char *dir = g_build_filename (g_get_user_cache_dir (), "nautilus-file-converter", "tmp", NULL);
+  GStatBuf st;
+
+  if (g_mkdir_with_parents (dir, 0700) != 0 || g_stat (dir, &st) != 0 || !S_ISDIR (st.st_mode) ||
+      st.st_uid != geteuid ())
+    {
+      g_free (dir);
+      return g_strdup (g_get_tmp_dir ());
+    }
+  if ((st.st_mode & 07777) != 0700)
+    g_chmod (dir, 0700);
+  if (g_once_init_enter (&cleaned))
+    {
+      char *copy = g_strdup (dir);
+      GThread *t = g_thread_try_new ("nfc-spill-clean", spill_cleanup_thread, copy, NULL);
+
+      if (t != NULL)
+        g_thread_unref (t);
+      else
+        g_free (copy);
+      g_once_init_leave (&cleaned, 1);
+    }
+  return dir;
+}
+
 GPtrArray *
 nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
-                    const char *src_in, const char *out, const char *workdir,
+                    const char *src, const char *out, const char *workdir,
                     gboolean *needs_decode)
+{
+  return nfc_build_attempts_info (cat, fmt, key, src, out, workdir, NULL, needs_decode);
+}
+
+GPtrArray *
+nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
+                         const char *src_in, const char *out, const char *workdir,
+                         const NfcImageInfo *info, gboolean *needs_decode)
 {
   GPtrArray *attempts, *a;
   char *src;
@@ -1229,6 +1494,18 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
         {
           av_add (a, "-auto-orient", NULL);
           im_flatten (a);
+          /* Screenshots and renders carry no resolution, so ImageMagick writes
+           * them at 72 dpi: a 1920 px wide one becomes a 26 inch page. Give
+           * those (only those: a photo or scan with a real dpi keeps it) a
+           * density that fits an A4 sheet. Only the density is set, the pixels
+           * are embedded untouched. SVG is rendered at 192 dpi above. */
+          if (info != NULL && !info->has_density && !g_str_equal (fmt, "svg"))
+            {
+              char *dpi = g_strdup_printf ("%u", nfc_pdf_fit_dpi (info->width, info->height));
+
+              av_add (a, "-units", "PixelsPerInch", "-density", dpi, NULL);
+              g_free (dpi);
+            }
         }
       else /* png, bmp, tiff */
         av_add (a, "-auto-orient", NULL);

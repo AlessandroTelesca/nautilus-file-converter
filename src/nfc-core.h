@@ -130,6 +130,70 @@ GPtrArray *nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key
                                const char *src, const char *out,
                                const char *workdir, gboolean *needs_decode);
 
+/* ---- image size, memory estimate and admission ----
+ *
+ * Several huge images converted at the same time would need far more memory
+ * than the machine has. Before an image job starts, its size is read WITHOUT
+ * decoding pixels (nfc_build_probe_argv: `magick identify -ping`, or
+ * `nfc-decode --info` for HEIC/AVIF), the peak memory of the conversion is
+ * estimated from it, and the runner only starts the job when the estimates of
+ * the running jobs plus this one fit in the memory that is available. */
+
+typedef struct {
+  guint64  width, height;
+  gboolean has_density;   /* the file carries a real resolution (see below) */
+  double   xdpi, ydpi;    /* pixels per inch, valid when has_density */
+} NfcImageInfo;
+
+/* Parse the output of the probe command: "<w> <h>" or "<w> <h>|<x> <y> <units>"
+ * (identify's %x %y %U). has_density is TRUE only for a resolution that
+ * somebody wrote: units PixelsPerInch or PixelsPerCentimeter and not the 72
+ * dpi ImageMagick and most tools stamp on everything. FALSE if unparsable. */
+gboolean nfc_image_info_parse (const char *text, NfcImageInfo *out);
+
+/* argv (g_strfreev) that prints the size of src's first frame; NULL if no tool
+ * is available for it. */
+char   **nfc_build_probe_argv (const char *fmt, const char *src);
+
+/* Same as nfc_build_attempts, but info (may be NULL) is what the probe found:
+ * a PDF made from an image without a resolution gets one that makes the page
+ * fit an A4 sheet (see README). */
+GPtrArray *nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
+                                    const char *src, const char *out,
+                                    const char *workdir, const NfcImageInfo *info,
+                                    gboolean *needs_decode);
+
+/* dpi that makes a w x h pixel image fit an A4 page (landscape for a wide
+ * image), never below 96 and never resampling; whole number. */
+guint    nfc_pdf_fit_dpi (guint64 w, guint64 h);
+
+/* Estimated peak memory (bytes) of converting an image of this size from
+ * source format fmt to target key. */
+guint64  nfc_estimate_peak_bytes (const char *fmt, const char *key,
+                                  const NfcImageInfo *info);
+
+/* Images below this many pixels skip the accounting (they are never held back). */
+#define NFC_SMALL_IMAGE_PIXELS ((guint64) 25 * 1000 * 1000)
+
+/* MemAvailable from /proc/meminfo in bytes (0 if unreadable). The environment
+ * variable NFC_TEST_MEMAVAILABLE_KB, when set, replaces it (tests only). */
+guint64  nfc_mem_available_bytes (void);
+/* The part of it the converters may use: 60 %. */
+guint64  nfc_admission_budget_bytes (void);
+
+/* May a job of `pixels` pixels and estimate `est` start while n_running jobs
+ * hold `reserved` bytes? Yes when it is small, when nothing runs (a single huge
+ * file always runs, alone), or when everything fits in `budget`. */
+gboolean nfc_admission_allows (guint64 pixels, guint64 est, guint64 reserved,
+                               guint n_running, guint64 budget);
+
+/* Where ImageMagick spills pixels and where big per-job work directories go:
+ * $XDG_CACHE_HOME/nautilus-file-converter/tmp (mode 0700, created if needed;
+ * leftovers older than a day are removed once per process, in the background).
+ * It is on the disk, unlike /tmp, which is usually RAM (tmpfs). Falls back to
+ * the system temp directory (never NULL). g_free. */
+char    *nfc_spill_dir (void);
+
 /* ---- output naming ---- */
 
 char *nfc_candidate_name (const char *stem, const char *ext, guint n);

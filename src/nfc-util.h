@@ -37,4 +37,7 @@ pid_t nfc_subprocess_pgid (GSubprocess *proc);
  * g_subprocess_get_identifier() != NULL (leader unreaped). */
 void nfc_kill_group (pid_t pgid);
 
+/* Remove a file or a directory tree (best effort; symlinks are removed, not followed). */
+void nfc_rm_rf (const char *path);
+
 G_END_DECLS

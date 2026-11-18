@@ -11,6 +11,7 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "nfc-convert.h"
@@ -814,6 +815,121 @@ test_large_image (void)
   g_free (dir);
 }
 
+/* PDF page size. A screenshot has no resolution, ImageMagick then writes 72 dpi
+ * and a 1920 px wide capture becomes a 26 inch (1920 pt) page; it must be an
+ * A4-sized page instead, with the pixels untouched. Images that carry a real
+ * resolution keep it. */
+static gboolean
+pdf_page_pts (const char *pdf, double *w, double *h)
+{
+  char *out = NULL, *p;
+  gboolean ok = run (NULL, &out, "pdfinfo", pdf, NULL) && out != NULL &&
+                (p = strstr (out, "Page size:")) != NULL &&
+                sscanf (p + strlen ("Page size:"), " %lf x %lf", w, h) == 2;
+
+  g_free (out);
+  return ok;
+}
+
+/* size in pixels of the one image embedded in the PDF */
+static char *
+pdf_image_size (const char *pdf)
+{
+  char *out = NULL, *res = NULL;
+
+  if (run (NULL, &out, "pdfimages", "-list", pdf, NULL) && out != NULL)
+    {
+      char **lines = g_strsplit (out, "\n", -1);
+
+      if (g_strv_length (lines) > 2)
+        {
+          int page, num, w, h;
+          char type[32];
+
+          if (sscanf (lines[2], " %d %d %31s %d %d", &page, &num, type, &w, &h) == 5)
+            res = g_strdup_printf ("%dx%d", w, h);
+        }
+      g_strfreev (lines);
+    }
+  g_free (out);
+  return res != NULL ? res : g_strdup ("?");
+}
+
+static void
+check_pdf_page (const char *name, const char *size, const char *density_args, double want_w,
+                double want_h, double tol, const char *want_px)
+{
+  char *dir = P ("pdfsize"), *rel = g_strdup_printf ("pdfsize/%s", name), *out;
+  double w = 0, h = 0;
+  char *px, *detail;
+  gboolean ok;
+
+  g_mkdir_with_parents (dir, 0755);
+  {
+    char *file = g_strdup_printf ("PNG:%s", name);
+    char *argv_dens[] = { "magick", "-size", (char *) size, "gradient:#ff8000-#0040ff", NULL, NULL, NULL, NULL, NULL };
+
+    /* optional "-units PixelsPerInch -density N" (density_args = "N") */
+    if (density_args != NULL)
+      {
+        argv_dens[4] = "-units"; argv_dens[5] = "PixelsPerInch";
+        argv_dens[6] = "-density"; argv_dens[7] = (char *) density_args;
+      }
+    {
+      GPtrArray *a = g_ptr_array_new ();
+      gint status = -1;
+
+      for (char **s = argv_dens; *s; s++)
+        g_ptr_array_add (a, *s);
+      g_ptr_array_add (a, file);
+      g_ptr_array_add (a, NULL);
+      fixture (name, g_spawn_sync (dir, (char **) a->pdata, NULL, G_SPAWN_SEARCH_PATH |
+                                   G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, NULL, NULL, &status, NULL) &&
+                     g_spawn_check_wait_status (status, NULL));
+      g_ptr_array_unref (a);
+    }
+    g_free (file);
+  }
+  out = check (rel, "pdf");
+  if (out == NULL || !pdf_page_pts (out, &w, &h))
+    {
+      add_row (rel, "pdf page size", FALSE, "no output or pdfinfo failed");
+      g_free (out); g_free (dir); g_free (rel);
+      return;
+    }
+  px = pdf_image_size (out);
+  ok = w >= want_w - tol && w <= want_w + tol && h >= want_h - tol && h <= want_h + tol &&
+       g_str_equal (px, want_px);
+  detail = g_strdup_printf ("page %.1f x %.1f pt (%.2f x %.2f in), image %s px", w, h, w / 72, h / 72, px);
+  add_row (rel, "pdf page size", ok, detail);
+  g_print ("%s -> %s\n", name, detail);
+  g_free (detail); g_free (px); g_free (out); g_free (dir); g_free (rel);
+}
+
+static void
+test_pdf_page_size (void)
+{
+  char *pdfinfo = g_find_program_in_path ("pdfinfo"), *pdfimages = g_find_program_in_path ("pdfimages");
+
+  if (pdfinfo == NULL || pdfimages == NULL)
+    {
+      add_row ("(pdf page size)", "skipped", TRUE, "pdfinfo/pdfimages not installed");
+      g_free (pdfinfo); g_free (pdfimages);
+      return;
+    }
+  /* no density: 165 dpi, 837.8 x 471.3 pt = A4 landscape wide (842 pt), pixels intact */
+  check_pdf_page ("shot.png", "1920x1080", NULL, 837.8, 471.3, 1.0, "1920x1080");
+  /* a tall phone screenshot: 217 dpi, A4 tall (842 pt) at most */
+  check_pdf_page ("phone.png", "1170x2532", NULL, 388.2, 840.2, 1.0, "1170x2532");
+  /* a small icon: never blown up beyond 96 dpi (64 px = 48 pt) */
+  check_pdf_page ("icon.png", "64x64", NULL, 48.0, 48.0, 0.5, "64x64");
+  /* a real 300 dpi resolution is kept: 1920 px = 6.4 in = 460.8 pt */
+  check_pdf_page ("scan300.png", "1920x1080", "300", 460.8, 259.2, 0.5, "1920x1080");
+  /* and a real 96 dpi (screen) too: 1920 px = 20 in = 1440 pt, not "fixed" */
+  check_pdf_page ("dpi96.png", "1920x1080", "96", 1440.0, 810.0, 0.5, "1920x1080");
+  g_free (pdfinfo); g_free (pdfimages);
+}
+
 int
 main (void)
 {
@@ -971,6 +1087,7 @@ main (void)
   check_error ("noaudio.mp4", "m4a", "no audio track");
   test_quality ();
   test_large_image ();
+  test_pdf_page_size ();
   check_many ("test.mov", k_mov);
   check_many ("test.mkv", k_mkv);
   check_many ("test.txt", k_txt);
@@ -1043,6 +1160,27 @@ main (void)
   }
   test_batch ();
   test_notifications ();
+  /* the size probe (identify -ping / nfc-decode --info) must have worked for every
+   * image of the run: only the garbage files may have failed it */
+  {
+    char *logp = g_build_filename (g_get_user_cache_dir (), "nautilus-file-converter.log", NULL);
+    char *log = NULL, **lines;
+    guint bad = 0;
+
+    g_file_get_contents (logp, &log, NULL, NULL);
+    lines = g_strsplit (log != NULL ? log : "", "\n", -1);
+    for (char **l = lines; *l; l++)
+      if (strstr (*l, "size probe failed") != NULL && strstr (*l, "bad.png") == NULL &&
+          strstr (*l, "corrupt.png") == NULL)
+        {
+          g_printerr ("%s\n", *l);
+          bad++;
+        }
+    add_row ("(size probe)", "worked for every image", bad == 0, bad ? "see stderr" : "");
+    g_strfreev (lines);
+    g_free (log);
+    g_free (logp);
+  }
   {
     gboolean none = !leftover_temp_files (work, &left);
 

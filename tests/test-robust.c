@@ -568,6 +568,415 @@ test_output_flood (void)
   g_free (err); g_free (out); g_free (src); g_free (script); g_free (log);
 }
 
+/* ---- memory-aware admission of image jobs (batch level) ----
+ *
+ * ImageMagick is a fake script named "magick" that answers `identify` with
+ * the real one (the size probe needs real headers) and, for a conversion,
+ * logs "start <time> <pid>", the MAGICK_TEMPORARY_PATH it was given and how
+ * many work directories exist there, sleeps one second, writes the output and
+ * logs "end <time> <pid>". The test then reads from the log how many
+ * conversions overlapped. The "huge" images are real 12000 x 8000 (96 MP)
+ * PNGs, white, so a few KB each; the memory estimate for one is 2.9 GB.
+ * NFC_TEST_SKIP_HUGE=1 skips the tests that need them. */
+
+typedef struct {
+  GMainLoop *loop;
+  GPtrArray *results;
+  gboolean fired;
+} BatchWait;
+
+static void
+batch_done (GPtrArray *results, gpointer data)
+{
+  BatchWait *w = data;
+
+  w->results = g_ptr_array_new_with_free_func (g_free);
+  for (guint i = 0; i < results->len; i++)
+    {
+      NfcResult *r = results->pdata[i];
+
+      g_ptr_array_add (w->results, g_strdup_printf ("%s|%s", r->ok ? "ok" : "FAIL",
+                                                    r->ok ? r->output : r->error));
+    }
+  w->fired = TRUE;
+  g_main_loop_quit (w->loop);
+}
+
+typedef struct {
+  double t;
+  int delta;
+} Edge;
+
+static int
+edge_cmp (gconstpointer a, gconstpointer b)
+{
+  const Edge *x = a, *y = b;
+
+  if (x->t != y->t)
+    return x->t < y->t ? -1 : 1;
+  return x->delta - y->delta; /* at a tie an end comes before a start */
+}
+
+/* maximum number of overlapping start..end spans in the fake's log; fills
+ * `report` with the relative timeline */
+static guint
+max_concurrency (const char *logfile, GString *report, guint *n_spans)
+{
+  char *data = NULL;
+  char **lines;
+  GArray *edges = g_array_new (FALSE, FALSE, sizeof (Edge));
+  guint cur = 0, best = 0;
+  double t0 = -1;
+
+  *n_spans = 0;
+  if (g_file_get_contents (logfile, &data, NULL, NULL))
+    {
+      lines = g_strsplit (data, "\n", -1);
+      for (char **l = lines; *l; l++)
+        {
+          char **f = g_strsplit (*l, " ", 4);
+
+          if (g_strv_length (f) >= 3 && (g_str_equal (f[0], "start") || g_str_equal (f[0], "end")))
+            {
+              Edge e = { g_ascii_strtod (f[1], NULL), g_str_equal (f[0], "start") ? 1 : -1 };
+
+              g_array_append_val (edges, e);
+              if (e.delta > 0)
+                (*n_spans)++;
+            }
+          g_strfreev (f);
+        }
+      g_strfreev (lines);
+    }
+  g_free (data);
+  g_array_sort (edges, edge_cmp);
+  for (guint i = 0; i < edges->len; i++)
+    {
+      Edge *e = &g_array_index (edges, Edge, i);
+
+      if (t0 < 0)
+        t0 = e->t;
+      cur += e->delta;
+      best = MAX (best, cur);
+      if (report != NULL)
+        g_string_append_printf (report, "  t=%6.3fs %s (now %u running)\n", e->t - t0,
+                                e->delta > 0 ? "start" : "end  ", cur);
+    }
+  g_array_free (edges, TRUE);
+  return best;
+}
+
+static char *real_magick;
+static char *orig_path; /* PATH before the fake tools were put in front */
+
+/* the real ImageMagick: not one of the fakes in bindir */
+static char *
+find_real_magick (void)
+{
+  char **dirs = g_strsplit (orig_path != NULL ? orig_path : "", ":", -1);
+  char *found = NULL;
+
+  for (char **d = dirs; *d != NULL && found == NULL; d++)
+    {
+      char *p = B (**d ? *d : ".", "magick");
+
+      if (g_file_test (p, G_FILE_TEST_IS_EXECUTABLE) && !g_file_test (p, G_FILE_TEST_IS_DIR))
+        found = p;
+      else
+        g_free (p);
+    }
+  g_strfreev (dirs);
+  return found;
+}
+
+static void
+write_fake_magick (const char *path, const char *logfile)
+{
+  char *body = g_strdup_printf (
+    "REAL='%s'\n"
+    "if [ \"$1\" = identify ]; then exec \"$REAL\" \"$@\"; fi\n"
+    "for a; do last=\"$a\"; done\n"
+    "out=$(printf '%%s' \"${last#*:}\" | sed 's/%%%%/%%/g')\n"
+    "now() { date +%%s.%%N; }\n"
+    "echo \"start $(now) $$\" >> '%s'\n"
+    "echo \"env $MAGICK_TEMPORARY_PATH $(ls -d \"$MAGICK_TEMPORARY_PATH\"/nfc-* 2>/dev/null | wc -l)\" >> '%s'\n"
+    "sleep 1\n"
+    "printf data > \"$out\"\n"
+    "echo \"end $(now) $$\" >> '%s'\n", real_magick, logfile, logfile, logfile);
+
+  write_script (path, body);
+  g_free (body);
+}
+
+static char *
+make_images (const char *dir, const char *prefix, const char *size, guint n)
+{
+  char *first = NULL;
+
+  g_assert_cmpint (g_mkdir_with_parents (dir, 0755), ==, 0);
+  for (guint i = 0; i < n; i++)
+    {
+      char *name = g_strdup_printf ("%s%u.png", prefix, i);
+      char *p = B (dir, name);
+
+      if (i == 0)
+        {
+          char *arg = g_strconcat ("PNG:", p, NULL);
+          char *argv[] = { real_magick, "-limit", "memory", "1GiB", "-limit", "map", "1GiB",
+                           "-size", (char *) size, "xc:white", "-type", "Grayscale",
+                           "-depth", "8", arg, NULL };
+          gint status = -1;
+
+          g_assert_true (g_spawn_sync (NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, NULL, NULL,
+                                       &status, NULL));
+          g_assert_true (g_spawn_check_wait_status (status, NULL));
+          first = g_strdup (p);
+          g_free (arg);
+        }
+      else
+        {
+          char *data = NULL;
+          gsize len;
+
+          g_assert_true (g_file_get_contents (first, &data, &len, NULL));
+          g_assert_true (g_file_set_contents (p, data, len, NULL));
+          g_free (data);
+        }
+      g_free (name);
+      g_free (p);
+    }
+  return first;
+}
+
+/* run `n` images of `dir` as one batch to jpg; returns the number that succeeded */
+static guint
+run_batch_images (const char *dir, const char *prefix, guint n)
+{
+  char **paths = g_new0 (char *, n + 1), **fmts = g_new0 (char *, n + 1);
+  BatchWait w = { g_main_loop_new (NULL, FALSE), NULL, FALSE };
+  guint wd = g_timeout_add_seconds (60, watchdog, NULL), good = 0;
+
+  for (guint i = 0; i < n; i++)
+    {
+      char *name = g_strdup_printf ("%s%u.png", prefix, i);
+
+      paths[i] = B (dir, name);
+      fmts[i] = g_strdup ("png");
+      g_free (name);
+    }
+  nfc_batch_run (NFC_CAT_IMAGE, "jpg", "JPG", "jpg", (const char *const *) paths,
+                 (const char *const *) fmts, n, batch_done, &w);
+  if (!w.fired)
+    g_main_loop_run (w.loop);
+  g_source_remove (wd);
+  g_assert_cmpuint (w.results->len, ==, n);
+  for (guint i = 0; i < n; i++)
+    {
+      const char *r = w.results->pdata[i];
+
+      if (g_str_has_prefix (r, "ok|"))
+        {
+          good++;
+          g_assert_true (g_file_test (r + 3, G_FILE_TEST_IS_REGULAR));
+        }
+      else
+        g_test_message ("%s", r);
+    }
+  g_ptr_array_unref (w.results);
+  g_main_loop_unref (w.loop);
+  g_strfreev (paths);
+  g_strfreev (fmts);
+  return good;
+}
+
+static gboolean
+admission_setup (void)
+{
+  if (real_magick == NULL)
+    real_magick = find_real_magick ();
+  if (real_magick == NULL)
+    {
+      g_test_skip ("no ImageMagick");
+      return FALSE;
+    }
+  return TRUE;
+}
+
+static void
+test_admission_batch (void)
+{
+  char *fake = B (bindir, "magick"), *logfile = B (base, "admission.log");
+  char *notify = B (bindir, "notify-send-fake");
+  char *huge_dir = B (datadir, "huge"), *small_dir = B (datadir, "small");
+  char *saved_magick = nfc_tools.magick, *saved_notify = nfc_tools.notify;
+  gboolean skip_huge = g_getenv ("NFC_TEST_SKIP_HUGE") != NULL;
+  GString *rep = g_string_new (NULL);
+  guint spans, conc, ncpu = g_get_num_processors ();
+  char *envlog = NULL;
+
+  if (!admission_setup ())
+    goto out;
+  nfc_tools_init ();
+  write_fake_magick (fake, logfile);
+  write_script (notify, "echo 1\n");
+  nfc_tools.magick = fake;
+  nfc_tools.notify = notify;
+
+  /* ---- small images (4 x 64x64): not held back, even with no memory at all */
+  g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "1000", TRUE);
+  g_free (make_images (small_dir, "s", "64x64", 4));
+  g_unlink (logfile);
+  g_assert_cmpuint (run_batch_images (small_dir, "s", 4), ==, 4);
+  conc = max_concurrency (logfile, rep, &spans);
+  g_test_message ("small images, budget 600 KB:\n%s", rep->str);
+  g_assert_cmpuint (spans, ==, 4);
+  if (ncpu >= 4)
+    g_assert_cmpuint (conc, ==, MIN (4, MAX (1, ncpu / 2)));
+  /* their work directories are in TMPDIR, not in the spill directory */
+  g_assert_true (g_file_get_contents (logfile, &envlog, NULL, NULL));
+  g_assert_nonnull (strstr (envlog, "/nautilus-file-converter/tmp 0\n"));
+  g_assert_null (strstr (envlog, "/nautilus-file-converter/tmp 1\n"));
+  g_free (envlog);
+
+  if (skip_huge)
+    {
+      g_test_message ("NFC_TEST_SKIP_HUGE set: huge-image batches skipped");
+      goto out;
+    }
+  g_free (make_images (huge_dir, "h", "12000x8000", 4));
+
+  /* ---- huge images, almost no memory: one at a time, all succeed. 96 MP x 30
+   * B/px = 2.88 GB each, over any budget here, so each runs alone */
+  g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "4000000", TRUE);
+  g_unlink (logfile);
+  g_assert_cmpuint (run_batch_images (huge_dir, "h", 4), ==, 4);
+  g_string_truncate (rep, 0);
+  conc = max_concurrency (logfile, rep, &spans);
+  g_test_message ("4 huge images, MemAvailable 4 GB (budget 2.4 GB < 2.9 GB each):\n%s", rep->str);
+  g_assert_cmpuint (spans, ==, 4);
+  g_assert_cmpuint (conc, ==, 1);
+  /* ImageMagick was pointed at the disk-backed spill directory, which also holds
+   * the job's work directory (1 of them while that job runs) */
+  g_assert_true (g_file_get_contents (logfile, &envlog, NULL, NULL));
+  {
+    char *spill = B (g_get_user_cache_dir (), "nautilus-file-converter/tmp");
+    char *want = g_strdup_printf ("env %s 1\n", spill);
+
+    g_assert_nonnull (strstr (envlog, want));
+    g_free (want);
+    g_free (spill);
+  }
+  g_free (envlog);
+
+  /* ---- room for exactly two: 10 GB * 0.6 = 6 GB; 2 x 2.88 fits, 3 x does not */
+  if (ncpu >= 6) /* the batch needs at least 3 workers to show the cap */
+    {
+      g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "10000000", TRUE);
+      g_unlink (logfile);
+      g_assert_cmpuint (run_batch_images (huge_dir, "h", 4), ==, 4);
+      g_string_truncate (rep, 0);
+      conc = max_concurrency (logfile, rep, &spans);
+      g_test_message ("4 huge images, MemAvailable 10 GB (budget 6 GB, 2.88 GB each):\n%s", rep->str);
+      g_assert_cmpuint (spans, ==, 4);
+      g_assert_cmpuint (conc, ==, 2);
+    }
+
+  /* ---- plenty of memory: they all run together (up to the worker cap) */
+  g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "64000000", TRUE);
+  g_unlink (logfile);
+  g_assert_cmpuint (run_batch_images (huge_dir, "h", 4), ==, 4);
+  g_string_truncate (rep, 0);
+  conc = max_concurrency (logfile, rep, &spans);
+  g_test_message ("4 huge images, MemAvailable 64 GB:\n%s", rep->str);
+  g_assert_cmpuint (spans, ==, 4);
+  if (ncpu >= 8)
+    g_assert_cmpuint (conc, ==, 4);
+
+out:
+  g_unsetenv ("NFC_TEST_MEMAVAILABLE_KB");
+  nfc_tools.magick = saved_magick;
+  nfc_tools.notify = saved_notify;
+  g_string_free (rep, TRUE);
+  g_free (fake); g_free (logfile); g_free (notify); g_free (huge_dir); g_free (small_dir);
+}
+
+/* Shutdown while huge image jobs wait for memory (part of the shutdown test,
+ * which is terminal: nfc_shutdown() cannot be undone). Three huge jobs, room
+ * for none besides the first: one runs, two wait. After nfc_shutdown() all end
+ * "cancelled" and nothing is left behind (work directory in the spill dir,
+ * hidden temp files). */
+typedef struct {
+  gboolean active;
+  char *fake, *logfile, *huge_dir, *spill, *p[3];
+  Wait w[3];
+  char *saved_magick;
+} QueuedShutdown;
+
+static void
+queued_shutdown_begin (QueuedShutdown *q)
+{
+  q->active = FALSE;
+  if (g_getenv ("NFC_TEST_SKIP_HUGE") != NULL || !admission_setup ())
+    return;
+  q->active = TRUE;
+  q->fake = B (bindir, "magick");
+  q->logfile = B (base, "admission2.log");
+  q->huge_dir = B (datadir, "huge2");
+  q->spill = B (g_get_user_cache_dir (), "nautilus-file-converter/tmp");
+  q->saved_magick = nfc_tools.magick;
+  nfc_tools_init ();
+  write_fake_magick (q->fake, q->logfile);
+  nfc_tools.magick = q->fake;
+  g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "4000000", TRUE);
+  g_free (make_images (q->huge_dir, "h", "12000x8000", 3));
+  for (guint i = 0; i < 3; i++)
+    {
+      char *name = g_strdup_printf ("h%u.png", i);
+
+      q->w[i] = (Wait) { g_main_loop_new (NULL, FALSE), NULL, NULL };
+      q->p[i] = B (q->huge_dir, name);
+      g_free (name);
+      nfc_convert_file_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", q->p[i], on_done, &q->w[i]);
+    }
+  /* the first one starts (its fake logs "start"); the two others wait */
+  for (int i = 0; i < 500; i++)
+    {
+      char *data = NULL;
+      gboolean started;
+
+      g_main_context_iteration (NULL, FALSE);
+      started = g_file_get_contents (q->logfile, &data, NULL, NULL) && strstr (data, "start") != NULL;
+      g_free (data);
+      if (started)
+        break;
+      g_usleep (20000);
+    }
+  g_assert_cmpuint (count_entries (q->spill, "nfc-"), ==, 1); /* only the running job has a work dir */
+}
+
+static void
+queued_shutdown_end (QueuedShutdown *q)
+{
+  if (!q->active)
+    return;
+  g_assert_cmpuint (count_entries (q->spill, "nfc-"), ==, 0);
+  for (guint i = 0; i < 3; i++)
+    {
+      while (q->w[i].out == NULL && q->w[i].error == NULL)
+        g_main_context_iteration (NULL, TRUE);
+      g_assert_null (q->w[i].out);
+      g_assert_nonnull (q->w[i].error);
+      g_assert_cmpstr (q->w[i].error->message, ==, "cancelled");
+      g_clear_error (&q->w[i].error);
+      g_main_loop_unref (q->w[i].loop);
+      g_assert_cmpuint (count_entries (q->huge_dir, "."), ==, 0); /* no hidden temp file */
+      g_free (q->p[i]);
+    }
+  g_unsetenv ("NFC_TEST_MEMAVAILABLE_KB");
+  nfc_tools.magick = q->saved_magick;
+  g_free (q->spill); g_free (q->fake); g_free (q->logfile); g_free (q->huge_dir);
+}
+
 /* module shutdown: in-flight jobs are killed and their files removed */
 static void
 test_cancel_on_shutdown (void)
@@ -583,6 +992,7 @@ test_cancel_on_shutdown (void)
   GArray *pids;
   guint before = count_entries (base, "nfc-");
   gint64 t0 = g_get_monotonic_time ();
+  QueuedShutdown qs;
 
   body = g_strdup_printf ("sleep 30 &\necho $! > '%s'\necho $$ >> '%s'\nexec sleep 30\n", pidfile, pidfile);
   write_script (script, body);
@@ -620,7 +1030,9 @@ test_cancel_on_shutdown (void)
     }
   g_assert_cmpuint (count_entries (shutdir, "."), ==, 1); /* the hidden temp file exists */
   g_assert_cmpuint (count_entries (base, "nfc-"), ==, before + 2); /* both workdirs exist */
+  queued_shutdown_begin (&qs); /* image jobs waiting for memory (defined below) */
   nfc_shutdown ();
+  queued_shutdown_end (&qs);
   g_assert_cmpuint (count_entries (base, "nfc-"), ==, before);     /* ... and are gone */
   g_assert_cmpuint (count_entries (shutdir, "."), ==, 0);          /* hidden temp file removed */
   while ((w.out == NULL && w.error == NULL) || (w2.out == NULL && w2.error == NULL))
@@ -769,6 +1181,7 @@ main (int argc, char **argv)
   path = B (base, "cache");
   g_setenv ("XDG_CACHE_HOME", path, TRUE);
   g_free (path);
+  orig_path = g_strdup (g_getenv ("PATH"));
   path = g_strconcat (bindir, ":", g_getenv ("PATH"), NULL);
   g_setenv ("PATH", path, TRUE);
   g_free (path);
@@ -782,6 +1195,7 @@ main (int argc, char **argv)
   g_test_add_func ("/robust/ffmpeg-timeout-cleanup", test_ffmpeg_timeout_cleanup);
   g_test_add_func ("/robust/log-mode-and-rotation", test_log_mode_and_rotation);
   g_test_add_func ("/robust/output-flood", test_output_flood);
+  g_test_add_func ("/robust/admission-batch", test_admission_batch);
   g_test_add_func ("/robust/cancel-on-shutdown", test_cancel_on_shutdown);
   rc = g_test_run ();
 

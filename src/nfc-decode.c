@@ -2,6 +2,7 @@
  *
  *   nfc-decode <input> <output.png>   decode (EXIF orientation applied), write PNG
  *   nfc-decode --formats              list the GdkPixbuf formats that can be read
+ *   nfc-decode --info <input>         print "<width> <height>" from the header only
  *
  * Why a separate executable: HEIC/AVIF files are untrusted input and the
  * loaders (libheif, glycin, ...) are large C/Rust codebases. A crash or hang
@@ -86,13 +87,31 @@ decode (const char *in, const char *out)
   return rc;
 }
 
+/* The size from the header, without decoding (the runner uses it to estimate
+ * the memory of the conversion before starting it). */
+static int
+info (const char *in)
+{
+  int w = 0, h = 0;
+
+  if (gdk_pixbuf_get_file_info (in, &w, &h) == NULL || w <= 0 || h <= 0)
+    {
+      fprintf (stderr, "cannot read the size of %s\n", in);
+      return 1;
+    }
+  printf ("%d %d\n", w, h);
+  return 0;
+}
+
 int
 main (int argc, char **argv)
 {
   if (argc == 2 && strcmp (argv[1], "--formats") == 0)
     return list_formats ();
+  if (argc == 3 && strcmp (argv[1], "--info") == 0)
+    return info (argv[2]);
   if (argc == 3 && argv[1][0] != '-')
     return decode (argv[1], argv[2]);
-  fprintf (stderr, "usage: nfc-decode <input> <output.png> | nfc-decode --formats\n");
+  fprintf (stderr, "usage: nfc-decode <input> <output.png> | --formats | --info <input>\n");
   return 2;
 }
