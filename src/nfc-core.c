@@ -939,7 +939,9 @@ add_attempt (GPtrArray *attempts, char **first, ...)
   g_ptr_array_add (attempts, at);
 }
 
-#define EVEN "scale=trunc(iw/2)*2:trunc(ih/2)*2"
+/* H.264/VP9 4:2:0 need even sizes: drop the odd last row/column (a scale would
+ * resample, i.e. blur, the whole picture by a pixel) */
+#define EVEN "crop=trunc(iw/2)*2:trunc(ih/2)*2"
 
 static GPtrArray *
 ff_base (const char *src)
@@ -1011,12 +1013,86 @@ im_path_arg (const char *coder, const char *path, const char *suffix)
   return r;
 }
 
-/* resource limits: a hostile or huge image must not eat the machine */
+/* Resource limits: a hostile or huge image must not eat the machine, but a
+ * legitimate big one (a 19200 x 10800 upscaled screenshot is 207 megapixels,
+ * ~3.3 GB of Q16-HDRI pixel cache) must still convert. ImageMagick's own
+ * defaults scale with the machine, so only the memory budget is tightened: a
+ * quarter of the physical RAM, between 1 and 8 GiB. Pixel data beyond that
+ * spills to a memory-mapped file (map: twice the budget) and then to a disk
+ * cache (generous 16 GiB), so a huge image becomes slow rather than failing,
+ * and two parallel conversions cannot take the whole machine. Memory cannot
+ * be read (no /proc)? 2 GiB. */
+#define GIB ((guint64) 1024 * 1024 * 1024)
+
+static guint64
+im_memory_budget (void)
+{
+  char *text = NULL;
+  guint64 total = 0, budget;
+
+  if (g_file_get_contents ("/proc/meminfo", &text, NULL, NULL))
+    {
+      const char *p = strstr (text, "MemTotal:");
+
+      if (p != NULL)
+        total = g_ascii_strtoull (p + strlen ("MemTotal:"), NULL, 10) * 1024; /* kB */
+    }
+  g_free (text);
+  budget = total != 0 ? total / 4 : 2 * GIB;
+  return CLAMP (budget, 1 * GIB, 8 * GIB);
+}
+
 static void
 im_limits (GPtrArray *a)
 {
-  av_add (a, "-limit", "memory", "1GiB", "-limit", "map", "2GiB", "-limit", "disk",
-          "4GiB", "-limit", "time", "600", NULL);
+  guint64 mem = im_memory_budget () / (1024 * 1024);
+  char *m = g_strdup_printf ("%" G_GUINT64_FORMAT "MiB", mem);
+  char *map = g_strdup_printf ("%" G_GUINT64_FORMAT "MiB", 2 * mem);
+
+  av_add (a, "-limit", "memory", m, "-limit", "map", map, "-limit", "disk", "16GiB",
+          "-limit", "time", "600", NULL);
+  g_free (m);
+  g_free (map);
+}
+
+
+/* Photographic (lossy, camera or phone) source versus graphics (screenshots,
+ * drawings, icons, scans: lossless formats). The two want different
+ * settings: sharp text and colour edges need full chroma resolution and a
+ * much higher quality; a photo does not, and the lossy encoders already
+ * start from lossy data. WEBP sources count as photos: the format is mostly
+ * used lossy. */
+static gboolean
+photo_source (const char *fmt)
+{
+  return g_str_equal (fmt, "jpg") || g_str_equal (fmt, "heic") ||
+         g_str_equal (fmt, "avif") || g_str_equal (fmt, "webp");
+}
+
+/* The ffmpeg step that makes the AVIF from the flattened PNG.
+ *
+ * Graphics: 4:4:4 (no chroma smearing of text), crf 9. Photos: 4:2:0, crf 12.
+ * 8-bit: the 10-bit variants gave no better result on screenshots once the
+ * viewer converts back to 8 bits, and 8-bit 4:4:4 decodes everywhere.
+ * Colour: RGB -> YCbCr with the BT.709 matrix, FULL range, and the file is
+ * tagged exactly that (colr box), so viewers do not guess BT.601/limited and
+ * shift the colours. No even-size scale: AVIF handles odd sizes, and the old
+ * even-size scale resampled (blurred) every odd-sized image by a pixel.
+ * No -tiles: AV1 allows tiles up to 4096 px wide only, libaom picks as many as
+ * the width needs by itself (an explicit count made wide images fail). */
+static char **
+ff_avif_step (const char *flat, const char *out, gboolean photo)
+{
+  GPtrArray *a = ff_base (flat);
+
+  av_add (a, "-frames:v", "1", "-vf",
+          photo ? "scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv420p"
+                : "scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv444p",
+          "-c:v", "libaom-av1", "-crf", photo ? "12" : "9", "-b:v", "0",
+          "-cpu-used", "6", "-row-mt", "1", "-still-picture", "1",
+          "-colorspace", "bt709", "-color_primaries", "bt709", "-color_range", "pc",
+          "-f", "avif", out, NULL);
+  return av_done (a);
 }
 
 GPtrArray *
@@ -1088,13 +1164,15 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
           av_add (a, flatp, NULL);
           s1 = av_done (a);
 
-          a = ff_base (flat);
-          av_add (a, "-frames:v", "1", "-vf", EVEN ",format=yuv420p",
-                  "-c:v", "libaom-av1", "-crf", "28", "-b:v", "0",
-                  "-cpu-used", "6", "-row-mt", "1", "-still-picture", "1",
-                  "-f", "avif", out, NULL);
-          s2 = av_done (a);
+          /* attempt 1: the quality settings of the source class. Attempt 2
+           * (8-bit 4:2:0) only runs when libaom refuses attempt 1, which it
+           * does for some huge images (4:4:4 at ~200 megapixels). Each attempt
+           * runs the whole chain: the steps are owned by the attempt. */
+          s2 = ff_avif_step (flat, out, photo_source (fmt));
           add_attempt (attempts, dec_step, s1, s2, NULL);
+          if (!photo_source (fmt))
+            add_attempt (attempts, g_strdupv (dec_step), g_strdupv (s1),
+                         ff_avif_step (flat, out, TRUE), NULL);
           g_free (flat);
           g_free (flatp);
           g_free (im_in);
@@ -1112,14 +1190,41 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
       av_add (a, im_in, NULL);
       if (g_str_equal (key, "jpg"))
         {
+          /* 4:4:4 stated explicitly (ImageMagick only does it by itself from
+           * quality 90 up, and a screenshot's text and colour edges are
+           * smeared by 4:2:0). Graphics need q99 to stay clean around text
+           * (SSIM on text-heavy screenshots: q92 0.90-0.98, q98 0.96-0.998, q99
+           * 0.989-0.999);
+           * photos are fine at q95. */
           av_add (a, "-auto-orient", NULL);
           im_flatten (a);
-          av_add (a, "-quality", "92", NULL);
+          av_add (a, "-quality", photo_source (fmt) ? "95" : "99",
+                  "-sampling-factor", "4:4:4", NULL);
         }
       else if (g_str_equal (key, "webp"))
-        av_add (a, "-auto-orient", "-quality", "90", NULL);
+        {
+          /* WEBP stores at most 16383 pixels per side: shrink only beyond that.
+           * Graphics (lossless sources): lossless WEBP, which was smaller than
+           * the source PNG for every screenshot tried and has no chroma
+           * subsampling or ringing. Photos: lossy q94, method 6, sharp YUV
+           * (the chroma conversion that keeps colour edges). */
+          av_add (a, "-auto-orient", "-resize", "16383x16383>", NULL);
+          if (photo_source (fmt))
+            av_add (a, "-quality", "94", "-define", "webp:method=6",
+                    "-define", "webp:sharp-yuv=true", NULL);
+          else
+            av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
+        }
       else if (g_str_equal (key, "ico"))
-        av_add (a, "-auto-orient", "-resize", "256x256>", NULL);
+        {
+          /* up to 256 px, never enlarged, aspect ratio kept (padded
+           * transparently to a square: icon:auto-resize would stretch a
+           * non-square image), then the usual 256/48/32/16 sizes */
+          av_add (a, "-auto-orient", "-resize", "256x256>", "-background", "none",
+                  "-gravity", "center", "-set", "option:nfc:side", "%[fx:max(w,h)]",
+                  "-extent", "%[option:nfc:side]x%[option:nfc:side]",
+                  "-define", "icon:auto-resize=256,48,32,16", NULL);
+        }
       else if (g_str_equal (key, "pdf"))
         {
           av_add (a, "-auto-orient", NULL);
@@ -1176,8 +1281,8 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
         {
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-vf", EVEN, "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k",
+                  "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
                   "-movflags", "+faststart", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
         }
@@ -1189,16 +1294,16 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
           add_attempt (attempts, av_done (a), NULL);
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-vf", EVEN, "-c:v", "libx264", "-crf", "23", "-preset", "medium",
-                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", out, NULL);
+                  "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
         }
       else if (g_str_equal (key, "webm"))
         {
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-row-mt", "1",
-                  "-cpu-used", "2", "-pix_fmt", "yuv420p", "-vf", EVEN,
+                  "-c:v", "libvpx-vp9", "-crf", "28", "-b:v", "0", "-row-mt", "1",
+                  "-deadline", "good", "-cpu-used", "2", "-pix_fmt", "yuv420p", "-vf", EVEN,
                   "-c:a", "libopus", "-b:a", "128k", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
         }
@@ -1206,8 +1311,9 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
         {
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf",
-                  "fps=12,scale='min(480,iw)':-1:flags=lanczos,"
-                  "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+                  "fps=15,scale='min(960,iw)':-1:flags=lanczos,"
+                  "split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+                  "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
                   "-loop", "0", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
         }

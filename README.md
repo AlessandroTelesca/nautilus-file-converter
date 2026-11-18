@@ -17,9 +17,9 @@ MIME type as a fallback.
 
 | Category | Input | Targets | Backend |
 |---|---|---|---|
-| Image | png, jpg/jpeg, webp, avif, heic/heif, bmp, tiff, gif, ico, svg | PNG, JPG, WEBP, AVIF, ICO (max 256 px), BMP, TIFF, PDF | ImageMagick (+ the `nfc-decode` helper, GdkPixbuf, for HEIC/AVIF input; ffmpeg/libaom for AVIF output) |
+| Image | png, jpg/jpeg, webp, avif, heic/heif, bmp, tiff, gif, ico, svg | PNG, JPG, WEBP, AVIF, ICO (256/48/32/16 px), BMP, TIFF, PDF (see "Image quality" below) | ImageMagick (+ the `nfc-decode` helper, GdkPixbuf, for HEIC/AVIF input; ffmpeg/libaom for AVIF output) |
 | Audio | mp3, wav, flac, ogg, opus, m4a, aac, wma | MP3 (LAME V2), FLAC, WAV, OGG (Vorbis), OPUS (128k), M4A (AAC 192k) | ffmpeg |
-| Video | mp4, mkv, webm, mov, avi, wmv, flv, m4v | MP4 (H.264 CRF 23 + AAC), MKV (stream copy, falls back to re-encode), WebM (VP9 CRF 32 + Opus), GIF (12 fps, 480 px wide), MP3 / M4A (audio only) | ffmpeg |
+| Video | mp4, mkv, webm, mov, avi, wmv, flv, m4v | MP4 (H.264 CRF 18, preset slow, + AAC 192k), MKV (stream copy, falls back to re-encode), WebM (VP9 CRF 28 + Opus 128k), GIF (15 fps, up to 960 px wide), MP3 / M4A (audio only; a video without an audio track fails with "it has no audio track") | | ffmpeg |
 | Document | doc, docx, odt, rtf, txt | PDF, DOCX, ODT | LibreOffice |
 | Spreadsheet | xls, xlsx, ods, csv | PDF, XLSX, ODS, CSV (first sheet) | LibreOffice |
 | Presentation | ppt, pptx, odp | PDF, PPTX, ODP | LibreOffice |
@@ -47,8 +47,14 @@ Notes:
   sniffing content (an image-named file that is really PostScript, MVG or MSL
   does not reach Ghostscript or the script coders). The flip side: a file whose
   extension lies about its format (a PNG named `.jpg`) fails to convert.
-  ImageMagick also runs with resource limits (`-limit memory 1GiB map 2GiB
-  disk 4GiB time 600`); larger images spill to disk. File names are passed
+  ImageMagick also runs with resource limits: memory a quarter of the RAM
+  (between 1 and 8 GiB), map twice that, disk 16 GiB, time 600 s. A larger
+  image spills to a mapped file and then to disk instead of failing: a
+  19200 x 10800 RGBA screenshot (207 megapixels, 3.3 GB of pixel cache) used to
+  die with "cache resources exhausted" under the old 1 GiB / 2 GiB / 4 GiB
+  limits and now converts to every target (peak 5.7 GB RSS, 8.4 GB for WEBP;
+  each parallel conversion of such an image needs that much). WEBP cannot
+  store more than 16383 pixels per side: wider images are shrunk to fit. File names are passed
   with `%` escaped, so names like `a%d.png` or `100%.png` work.
 * **SVG input uses `RSVG:`**, never the plain `SVG:` coder. Depending on the
   build, ImageMagick delegates `SVG:` to an external renderer (Inkscape on
@@ -66,6 +72,52 @@ Notes:
   "Never blocks Nautilus" below).
 * LibreOffice runs headless with its own throw-away profile, so conversion
   works while LibreOffice is open.
+
+### Image and video quality
+
+The settings were chosen by measurement (SSIM against the source, on real
+screenshots and photos), not by habit. Sources are split into *photos* (jpg,
+heic, avif, webp: lossy, camera or phone) and *graphics* (everything else:
+screenshots, drawings, icons, scans), because text and colour edges need much
+more than a photo does.
+
+| Target | Graphics source (png, bmp, tiff, gif, ico, svg) | Photo source |
+|---|---|---|
+| JPG | quality 99, 4:4:4 | quality 95, 4:4:4 |
+| WEBP | lossless (smaller than the source PNG for every screenshot tried) | lossy quality 94, method 6, sharp YUV |
+| AVIF | libaom 4:4:4, CRF 9, 8-bit | libaom 4:2:0, CRF 12, 8-bit |
+| PDF, PNG, BMP, TIFF | lossless | lossless |
+| ICO | 256, 48, 32 and 16 px entries, aspect ratio kept (padded transparently to a square) | same |
+
+* JPG is always 4:4:4, stated explicitly (ImageMagick only uses it on its own
+  from quality 90 up). 4:2:0 smears the colour edges of screenshots.
+* AVIF: RGB is converted to YCbCr with the BT.709 matrix in full range and the
+  file is tagged exactly that, so viewers do not guess BT.601 / limited range
+  and shift the colours. Odd image sizes are kept as they are (the old
+  even-size scale resampled every odd-sized image by a pixel). If libaom
+  refuses the 4:4:4 encode of a gigantic image a second attempt uses 4:2:0.
+  `-tiles` is not set: AV1 tiles are at most 4096 px wide and libaom picks as
+  many as the width needs.
+* WEBP stores at most 16383 pixels per side: larger images are shrunk to fit.
+* PDF: ImageMagick embeds PNG-type sources losslessly (Flate) and JPEG
+  sources as JPEG at their own quality; nothing is recompressed to a lower
+  quality.
+* HEIC input: decoded by GdkPixbuf (glycin) to an 8-bit sRGB PNG with the EXIF
+  orientation applied; the colour profile is applied by the loader (the pixels
+  differ from a raw decode by the P3 to sRGB conversion). Bit depth above 8 is
+  lost. This is the only loss before the target encoder.
+* Video: H.264 CRF 18 with `-preset slow`, 4:2:0, `+faststart`, audio AAC
+  192k; VP9 CRF 28 with `-deadline good -cpu-used 2 -row-mt 1`, Opus 128k;
+  GIF at 15 fps up to 960 px wide with a per-frame difference palette and
+  ordered (Bayer 5) dithering. Error diffusion (Sierra) was measured at 5 times
+  the size and a lower SSIM, no dithering at the same size with banding.
+  Odd frame sizes are cropped by one pixel, not scaled.
+* Audio settings are unchanged: MP3 `-q:a 2`, Opus 128k, AAC 192k.
+* A video with no audio track converts to MP4, MKV, WebM and GIF as usual
+  (audio is mapped optionally). Converting it to MP3 or M4A fails at once with
+  "it has no audio track" instead of ffmpeg's `Stream map '' matches no
+  streams`. The audio is detected by ffmpeg's own error (no `ffprobe` pre-step:
+  the menu never probes files, and ffmpeg fails in about 0.1 s anyway).
 
 ## Dependencies
 
@@ -244,6 +296,16 @@ meson test -C build
   `file://`, `text:` and relative
   `href`s must convert without embedding it, and a fake `inkscape` first in
   `PATH` must never be run.
+  Quality and robustness cases from real failures: a generated 19200x10800 RGBA
+  PNG (the size of a real upscaled screenshot, which used to fail with "cache
+  resources exhausted") converts to every image target (skipped with a notice
+  when less than 16 GiB RAM is available or `NFC_TEST_SKIP_HUGE` is set; it
+  needs 6-8 GB); a video without an audio track converts to MP4, MKV, WebM and
+  GIF (odd frame size included) and fails to MP3/M4A with "it has no audio
+  track"; JPG output is 4:4:4, an odd-sized PNG keeps its exact size in AVIF
+  (4:4:4, BT.709 full range tagged), WEBP of a PNG is pixel-identical, ICO of a
+  non-square image has square 256/48/32/16 entries. `core-logic` asserts the
+  exact quality arguments of every target.
 
 ## License
 

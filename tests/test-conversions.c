@@ -155,7 +155,10 @@ check_type (const char *ext, const char *path)
 {
   static const struct { const char *ext, *mimes; } want[] = {
     { "png", "image/png" }, { "jpg", "image/jpeg" }, { "webp", "image/webp" },
-    { "avif", "image/avif" }, { "ico", "image/vnd.microsoft.icon|image/x-icon" },
+    { "avif", "image/avif" },
+    /* libmagic reads the header of a multi-size ICO (00 00 01 00, n > 1 images)
+     * as a SIMH tape image: for .ico the header is checked directly below */
+    { "ico", "image/vnd.microsoft.icon|image/x-icon|application/SIMH-tape-data" },
     { "bmp", "image/bmp|image/x-ms-bmp" }, { "tiff", "image/tiff" },
     { "pdf", "application/pdf" }, { "gif", "image/gif" },
     { "mp3", "audio/mpeg" }, { "flac", "audio/flac|audio/x-flac" },
@@ -192,6 +195,17 @@ check_type (const char *ext, const char *path)
 
         if (!g_strv_contains ((const char *const *) alts, mime))
           res = g_strdup_printf ("real type is %s, expected %s", mime, want[i].mimes);
+        if (res == NULL && g_str_equal (ext, "ico"))
+          {
+            /* ICONDIR: reserved 0, type 1 (icon), image count >= 1 */
+            char *d = NULL;
+            gsize n = 0;
+
+            if (!g_file_get_contents (path, &d, &n, NULL) || n < 6 ||
+                memcmp (d, "\0\0\1\0", 4) != 0 || (guchar) d[4] == 0)
+              res = g_strdup ("not an ICO header");
+            g_free (d);
+          }
         g_strfreev (alts);
         g_free (mime);
         return res;
@@ -634,6 +648,172 @@ test_heic (void)
   }
 }
 
+/* A conversion that must FAIL with a message containing `want` (the toast
+ * text), and leave nothing behind. */
+static void
+check_error (const char *src_name, const char *key, const char *want)
+{
+  char *src = P (src_name), *err = NULL, *out;
+  NfcFormat f;
+  GPtrArray *tg;
+  const NfcTarget *t = NULL;
+  char *left = NULL;
+  gboolean ok;
+
+  g_assert_true (nfc_classify (src, NULL, &f));
+  tg = nfc_targets_for (f.cat, f.fmt);
+  for (guint i = 0; i < tg->len; i++)
+    if (g_str_equal (((const NfcTarget *) tg->pdata[i])->key, key))
+      t = tg->pdata[i];
+  g_ptr_array_unref (tg);
+  g_assert_nonnull (t);
+  out = convert_sync (f.cat, f.fmt, t->key, t->ext, src, &err);
+  ok = out == NULL && err != NULL && strstr (err, want) != NULL &&
+       !leftover_temp_files (work, &left);
+  add_row (src_name, key, ok, out != NULL ? "unexpectedly succeeded"
+                              : ok ? err : err ? err : "no message");
+  g_free (left);
+  g_free (src);
+  g_free (err);
+  g_free (out);
+}
+
+/* a stream's property through ffprobe ("width", "pix_fmt", ...) */
+static char *
+probe_stream (const char *path, const char *entry)
+{
+  char *out = NULL, *what = g_strdup_printf ("stream=%s", entry);
+
+  if (!run (NULL, &out, "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", what, "-of", "csv=p=0", path, NULL))
+    out = g_strdup ("(ffprobe failed)");
+  g_free (what);
+  return g_strstrip (out);
+}
+
+/* Quality settings that must survive in the real output files. */
+static void
+test_quality (void)
+{
+  char *out, *src;
+
+  /* JPG: 4:4:4, ImageMagick's own default switches to 4:2:0 below quality 90 */
+  out = check ("test.png", "jpg");
+  if (out != NULL)
+    {
+      char *sf = NULL;
+      gboolean ok = run (NULL, &sf, "magick", "identify", "-format", "%[jpeg:sampling-factor]", out, NULL);
+
+      add_row ("test.png", "jpg 4:4:4", ok && sf != NULL && g_str_equal (sf, "1x1,1x1,1x1"),
+               sf ? sf : "(identify failed)");
+      g_free (sf);
+    }
+  g_free (out);
+  /* AVIF: an odd-sized image keeps its exact size (no 1-pixel rescale), 4:4:4 for
+   * a screenshot-type source, BT.709 full range tagged */
+  fixture ("odd.png", run (work, NULL, "magick", "-size", "101x51", "gradient:red-blue", "-depth", "8", "odd.png", NULL));
+  src = P ("odd.png");
+  out = check ("odd.png", "avif");
+  if (out != NULL)
+    {
+      char *w = probe_stream (out, "width"), *h = probe_stream (out, "height");
+      char *pf = probe_stream (out, "pix_fmt"), *cs = probe_stream (out, "color_space");
+      char *cr = probe_stream (out, "color_range");
+      char *det = g_strdup_printf ("%sx%s %s %s %s", w, h, pf, cs, cr);
+
+      add_row ("odd.png (101x51)", "avif size/format",
+               g_str_equal (w, "101") && g_str_equal (h, "51") && g_str_equal (pf, "yuv444p") &&
+               g_str_equal (cs, "bt709") && g_str_equal (cr, "pc"), det);
+      g_free (det); g_free (w); g_free (h); g_free (pf); g_free (cs); g_free (cr);
+    }
+  g_free (out);
+  /* WEBP of a PNG is lossless (pixel identical) */
+  out = check ("odd.png", "webp");
+  if (out != NULL)
+    {
+      char *m = NULL;
+      gboolean ok = run (NULL, &m, "magick", "compare", "-metric", "AE", src, out, "null:", NULL);
+
+      /* compare exits 1 when the images differ, 0 when identical */
+      add_row ("odd.png", "webp lossless", ok, "pixel identical");
+      g_free (m);
+    }
+  g_free (out);
+  /* ICO of a non-square image: square entries, several sizes, not stretched */
+  fixture ("wide400.png", run (work, NULL, "magick", "-size", "400x100", "gradient:red-blue", "-depth", "8", "wide400.png", NULL));
+  out = check ("wide400.png", "ico");
+  if (out != NULL)
+    {
+      char *sizes = NULL;
+      gboolean ok = run (NULL, &sizes, "magick", "identify", "-format", "%wx%h ", out, NULL);
+
+      add_row ("wide400.png (400x100)", "ico sizes",
+               ok && sizes != NULL && g_str_equal (g_strstrip (sizes), "256x256 48x48 32x32 16x16"),
+               sizes ? sizes : "(identify failed)");
+      g_free (sizes);
+    }
+  g_free (out);
+  g_free (src);
+}
+
+/* Free memory in GiB (MemAvailable), 0 if unknown. */
+static guint64
+available_gib (void)
+{
+  char *text = NULL;
+  guint64 kb = 0;
+
+  if (g_file_get_contents ("/proc/meminfo", &text, NULL, NULL))
+    {
+      const char *p = strstr (text, "MemAvailable:");
+
+      if (p != NULL)
+        kb = g_ascii_strtoull (p + strlen ("MemAvailable:"), NULL, 10);
+    }
+  g_free (text);
+  return kb / (1024 * 1024);
+}
+
+/* The user's real failure: a 19200 x 10800 RGBA screenshot (207 megapixels,
+ * 3.3 GB of pixel cache) died with "cache resources exhausted" under the old
+ * 1 GiB / 2 GiB / 4 GiB limits. The generated image compresses to under a
+ * megabyte, but converting it needs ~6-8 GB of RAM: skipped (and said so) when
+ * less than 16 GiB is available. NFC_TEST_SKIP_HUGE=1 skips it too. */
+static void
+test_large_image (void)
+{
+  const char *k[] = { "jpg", "webp", "avif", "ico", "bmp", "tiff", "pdf", NULL };
+  guint64 gib = available_gib ();
+  char *big = P ("huge/big.png");
+  char *dir = P ("huge");
+
+  if (g_getenv ("NFC_TEST_SKIP_HUGE") != NULL || gib < 16)
+    {
+      char *why = g_strdup_printf ("skipped: %" G_GUINT64_FORMAT " GiB available, 16 needed", gib);
+
+      g_print ("large image: %s\n", why);
+      add_row ("big.png (19200x10800)", "(all targets)", TRUE, why);
+      g_free (why);
+      g_free (big);
+      g_free (dir);
+      return;
+    }
+  g_mkdir_with_parents (dir, 0755);
+  fixture ("big.png (19200x10800)",
+           run (dir, NULL, "magick", "-size", "19200x10800", "gradient:#ff8000-#0040ff", "-alpha", "set",
+                "-depth", "8", "-define", "png:compression-level=1", "PNG:big.png", NULL));
+  for (const char **t = k; *t; t++)
+    {
+      char *out = check ("huge/big.png", *t);
+
+      if (out != NULL)
+        g_unlink (out); /* bmp and tiff are 800 MB each */
+      g_free (out);
+    }
+  g_free (big);
+  g_free (dir);
+}
+
 int
 main (void)
 {
@@ -649,6 +829,7 @@ main (void)
   const char *k_mp4[] = { "mkv", "webm", "gif", "mp3", "m4a", NULL };
   const char *k_mov[] = { "mp4", "mkv", NULL };
   const char *k_mkv[] = { "mp4", NULL };
+  const char *k_noaudio[] = { "mkv", "webm", "gif", NULL };
   const char *k_txt[] = { "pdf", "docx", "odt", NULL };
   const char *k_odt[] = { "pdf", "docx", NULL };
   const char *k_docx[] = { "pdf", "odt", NULL };
@@ -706,6 +887,9 @@ main (void)
   fixture ("test.mp4", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=2:s=320x240", "-f", "lavfi", "-i", "sine=d=2", "-shortest", "-pix_fmt", "yuv420p", "test.mp4", NULL));
   fixture ("test.mov", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "test.mp4", "-c", "copy", "test.mov", NULL));
   fixture ("test.mkv", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "test.mp4", "-c", "copy", "test.mkv", NULL));
+  /* GNOME screencasts have no audio track at all */
+  fixture ("noaudio.mp4", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=d=2:s=321x241", "-pix_fmt", "yuv420p", "noaudio.mp4", NULL));
+  fixture ("noaudio.mkv", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "noaudio.mp4", "-c", "copy", "noaudio.mkv", NULL));
   fixture ("test.avif", run (work, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "test.png", "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", "8", "-still-picture", "1", "-f", "avif", "test.avif", NULL));
   write_file ("test.txt", "Hello\nWorld\n");
   write_file ("test.csv", "a,b\n1,2\n3,4\n");
@@ -779,6 +963,14 @@ main (void)
   check_many ("test.opus", k_toWav);
   check_many ("test.m4a", k_toWav);
   check_many ("test.mp4", k_mp4);
+  /* audio-less video: every video target works (odd frame size 321x241 too), the
+   * audio targets fail fast with a plain message instead of ffmpeg's text */
+  check_many ("noaudio.mp4", k_noaudio);
+  check_many ("noaudio.mkv", k_mkv);
+  check_error ("noaudio.mp4", "mp3", "no audio track");
+  check_error ("noaudio.mp4", "m4a", "no audio track");
+  test_quality ();
+  test_large_image ();
   check_many ("test.mov", k_mov);
   check_many ("test.mkv", k_mkv);
   check_many ("test.txt", k_txt);

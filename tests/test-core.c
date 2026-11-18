@@ -16,6 +16,16 @@ argv_has (char **argv, const char *s)
   return FALSE;
 }
 
+/* the argument that follows the first occurrence of opt, or NULL */
+static const char *
+argv_after (char **argv, const char *opt)
+{
+  for (; *argv; argv++)
+    if (g_str_equal (*argv, opt))
+      return argv[1];
+  return NULL;
+}
+
 static void
 test_classify (void)
 {
@@ -158,8 +168,20 @@ test_argv (void)
         g_assert_true (argv_has (argv, want));
         g_assert_true (argv_has (argv, "PNG:/s/a.png[0]")); /* explicit input coder */
         g_assert_true (argv_has (argv, "-limit"));       /* resource limits */
-        g_assert_true (argv_has (argv, "1GiB"));
-        g_assert_true (argv_has (argv, "4GiB"));
+        /* memory: a quarter of the RAM, 1..8 GiB (never below the old 1 GiB);
+         * map: twice that; disk: generous, the old 4 GiB made a 207 megapixel
+         * screenshot fail with "cache resources exhausted" */
+        {
+          guint64 mem = g_ascii_strtoull (argv_after (argv, "memory"), NULL, 10);
+          guint64 map = g_ascii_strtoull (argv_after (argv, "map"), NULL, 10);
+
+          g_assert_true (g_str_has_suffix (argv_after (argv, "memory"), "MiB"));
+          g_assert_cmpuint (mem, >=, 1024);
+          g_assert_cmpuint (mem, <=, 8192);
+          g_assert_cmpuint (map, ==, 2 * mem);
+        }
+        g_assert_cmpstr (argv_after (argv, "disk"), ==, "16GiB");
+        g_assert_cmpstr (argv_after (argv, "time"), ==, "600");
         g_ptr_array_unref (at);
         g_free (out);
         g_free (want);
@@ -172,9 +194,94 @@ test_argv (void)
   at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "png", "/s/a.png", "/o/x.png", "/w", &dec);
   g_assert_false (argv_has (((GPtrArray *) at->pdata[0])->pdata[0], "remove"));
   g_ptr_array_unref (at);
-  /* ICO is limited to 256 */
+  /* ICO: 256 max, aspect kept (square transparent padding), several sizes */
   at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "ico", "/s/a.png", "/o/x.ico", "/w", &dec);
-  g_assert_true (argv_has (((GPtrArray *) at->pdata[0])->pdata[0], "256x256>"));
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_true (argv_has (argv, "256x256>"));
+  g_assert_true (argv_has (argv, "icon:auto-resize=256,48,32,16"));
+  g_assert_true (argv_has (argv, "-extent"));
+  g_ptr_array_unref (at);
+  /* JPG: explicit 4:4:4 always; q99 for graphics (screenshots), q95 for photos */
+  {
+    const struct { const char *fmt, *src, *q; } j[] = {
+      { "png", "/s/a.png", "99" }, { "bmp", "/s/a.bmp", "99" }, { "svg", "/s/a.svg", "99" },
+      { "heic", "/s/a.heic", "95" }, { "webp", "/s/a.webp", "95" },
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (j); i++)
+      {
+        at = nfc_build_attempts (NFC_CAT_IMAGE, j[i].fmt, "jpg", j[i].src, "/o/x.jpg", "/w", &dec);
+        a0 = at->pdata[0];
+        argv = a0->pdata[a0->len - 1];
+        g_assert_cmpstr (argv_after (argv, "-sampling-factor"), ==, "4:4:4");
+        g_assert_cmpstr (argv_after (argv, "-quality"), ==, j[i].q);
+        g_ptr_array_unref (at);
+      }
+  }
+  /* WEBP: lossless for lossless sources, lossy q94 + sharp YUV for photos;
+   * never wider than the 16383 pixels WEBP can hold */
+  at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "webp", "/s/a.png", "/o/x.webp", "/w", &dec);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_true (argv_has (argv, "webp:lossless=true"));
+  g_assert_false (argv_has (argv, "-quality"));
+  g_assert_true (argv_has (argv, "16383x16383>"));
+  g_ptr_array_unref (at);
+  at = nfc_build_attempts (NFC_CAT_IMAGE, "heic", "webp", "/s/a.heic", "/o/x.webp", "/w", &dec);
+  a0 = at->pdata[0];
+  argv = a0->pdata[a0->len - 1];
+  g_assert_false (argv_has (argv, "webp:lossless=true"));
+  g_assert_cmpstr (argv_after (argv, "-quality"), ==, "94");
+  g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
+  g_ptr_array_unref (at);
+  /* AVIF: graphics 4:4:4 crf 9 with a fallback attempt (8-bit 4:2:0), photos
+   * 4:2:0 crf 12; both tagged BT.709 full range, even-size scale gone */
+  at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "avif", "/s/a.png", "/o/x.avif", "/w", &dec);
+  check_attempts (at, 2);
+  a0 = at->pdata[0];
+  argv = a0->pdata[1];
+  g_assert_true (g_str_has_suffix (argv_after (argv, "-vf"), "format=yuv444p"));
+  g_assert_cmpstr (argv_after (argv, "-crf"), ==, "9");
+  g_assert_cmpstr (argv_after (argv, "-colorspace"), ==, "bt709");
+  g_assert_cmpstr (argv_after (argv, "-color_range"), ==, "pc");
+  g_assert_false (argv_has (argv, "-tiles"));
+  g_assert_null (strstr (argv_after (argv, "-vf"), "trunc"));
+  argv = ((GPtrArray *) at->pdata[1])->pdata[1];
+  g_assert_true (g_str_has_suffix (argv_after (argv, "-vf"), "format=yuv420p"));
+  g_ptr_array_unref (at);
+  at = nfc_build_attempts (NFC_CAT_IMAGE, "jpg", "avif", "/s/a.jpg", "/o/x.avif", "/w", &dec);
+  check_attempts (at, 1);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[1];
+  g_assert_true (g_str_has_suffix (argv_after (argv, "-vf"), "format=yuv420p"));
+  g_assert_cmpstr (argv_after (argv, "-crf"), ==, "12");
+  g_ptr_array_unref (at);
+  /* video: x264 crf 18 slow (audio optional, 192k), VP9 crf 28, GIF 15 fps up to
+   * 960 px with the diff palette; the audio maps are all optional */
+  at = nfc_build_attempts (NFC_CAT_VIDEO, "mkv", "mp4", "/s/a.mkv", "/o/x.mp4", "/w", &dec);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_cmpstr (argv_after (argv, "-crf"), ==, "18");
+  g_assert_cmpstr (argv_after (argv, "-preset"), ==, "slow");
+  g_assert_cmpstr (argv_after (argv, "-b:a"), ==, "192k");
+  g_assert_true (argv_has (argv, "0:a:0?"));
+  g_assert_false (argv_has (argv, "0:a:0"));
+  g_assert_true (argv_has (argv, "+faststart"));
+  g_ptr_array_unref (at);
+  at = nfc_build_attempts (NFC_CAT_VIDEO, "mp4", "webm", "/s/a.mp4", "/o/x.webm", "/w", &dec);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_cmpstr (argv_after (argv, "-crf"), ==, "28");
+  g_assert_cmpstr (argv_after (argv, "-deadline"), ==, "good");
+  g_assert_true (argv_has (argv, "0:a:0?"));
+  g_ptr_array_unref (at);
+  at = nfc_build_attempts (NFC_CAT_VIDEO, "mp4", "gif", "/s/a.mp4", "/o/x.gif", "/w", &dec);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_nonnull (strstr (argv_after (argv, "-vf"), "fps=15,scale='min(960,iw)'"));
+  g_assert_nonnull (strstr (argv_after (argv, "-vf"), "palettegen=stats_mode=diff"));
+  g_assert_nonnull (strstr (argv_after (argv, "-vf"), "diff_mode=rectangle"));
+  g_ptr_array_unref (at);
+  /* audio targets map the first audio stream (required: a video without audio
+   * fails, and nfc-convert turns that into a plain message) */
+  at = nfc_build_attempts (NFC_CAT_VIDEO, "mp4", "mp3", "/s/a.mp4", "/o/x.mp3", "/w", &dec);
+  argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+  g_assert_true (argv_has (argv, "0:a:0"));
   g_ptr_array_unref (at);
   /* svg input gets density */
   at = nfc_build_attempts (NFC_CAT_IMAGE, "svg", "png", "/s/a.svg", "/o/x.png", "/w", &dec);

@@ -46,6 +46,23 @@ last_line (const char *text)
   return res;
 }
 
+/* ffmpeg's own words for "this file has no audio stream" are no help in a toast
+ * ("Stream map '' matches no streams."): recognise that failure (the audio
+ * targets map a required audio stream, the video targets map it optionally, so
+ * it can only come from there) and say it plainly. NULL if it is something else. */
+static char *
+no_audio_message (char **argv, const char *stderr_text)
+{
+  gboolean maps_audio = FALSE;
+
+  if (stderr_text == NULL || strstr (stderr_text, "matches no streams") == NULL)
+    return NULL;
+  for (char **a = argv; *a != NULL; a++)
+    if (g_str_equal (*a, "0:a:0"))
+      maps_audio = TRUE;
+  return maps_audio ? g_strdup ("it has no audio track") : NULL;
+}
+
 static char *
 join_argv (char **argv)
 {
@@ -494,7 +511,13 @@ step_finished (StepIO *io)
         char *log_so = tail_text (&io->tail[0], LOG_OUT_BYTES, TRUE);
         gboolean final = j->timed_out; /* killed by the timeout: final */
 
-        msg = j->timed_out ? g_strdup ("timed out") : last_line (se);
+        msg = j->timed_out ? NULL : no_audio_message (argv, se);
+        if (msg != NULL)
+          final = TRUE; /* no other attempt can find audio that is not there */
+        else if (j->timed_out)
+          msg = g_strdup ("timed out");
+        else
+          msg = last_line (se);
         if (msg == NULL)
           msg = last_line (so);
         if (msg == NULL)
