@@ -127,13 +127,13 @@ free_top (GList *items)
     nautilus_menu_item_list_free (items);
 }
 
-/* The top-level items of the selection ("Convert to", "Compress", "Resize"): never
+/* The top-level items of the selection ("Convert to", "Compress", "Resize", "Upscale"): never
  * any other, each at most once, in that order ("Convert to" first). */
 static GList *
 top_items (GList *infos)
 {
   GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
-  guint n_convert = 0, n_compress = 0, n_resize = 0, pos = 0;
+  guint n_convert = 0, n_compress = 0, n_resize = 0, n_upscale = 0, pos = 0;
 
   for (GList *l = items; l; l = l->next, pos++)
     {
@@ -149,9 +149,15 @@ top_items (GList *infos)
         {
           n_compress++;
           g_assert_cmpuint (n_resize, ==, 0);
+          g_assert_cmpuint (n_upscale, ==, 0);
         }
       else if (g_strcmp0 (label, "Resize") == 0)
-        n_resize++;
+        {
+          n_resize++;
+          g_assert_cmpuint (n_upscale, ==, 0);
+        }
+      else if (g_strcmp0 (label, "Upscale") == 0)
+        n_upscale++;
       else
         g_error ("unexpected top-level item '%s'", label);
       g_free (label);
@@ -159,6 +165,7 @@ top_items (GList *infos)
   g_assert_cmpuint (n_convert, <=, 1);
   g_assert_cmpuint (n_compress, <=, 1);
   g_assert_cmpuint (n_resize, <=, 1);
+  g_assert_cmpuint (n_upscale, <=, 1);
   return items;
 }
 
@@ -923,6 +930,235 @@ test_entry_points (void)
   /* internal helpers must not leak out of the module */
   g_assert_true (!g_module_symbol (m, "nfc_classify", &init));
 }
+/* ---- Upscale ---- */
+
+/* The names (after "FileConverter::Upscale::") of the Upscale submenu, joined by
+ * ',' (every item a leaf; its labels and tooltips through the out arguments when
+ * wanted), or NULL when there is no Upscale item. As resize_names_wait. */
+static char *
+upscale_names_wait (GList *infos, gboolean expect, char **labels_out, char **tips_out)
+{
+  GList *items = NULL;
+  NautilusMenuItem *top = NULL;
+  GString *names = NULL, *labels = g_string_new (NULL), *tips = g_string_new (NULL);
+
+  for (int i = 0; i < 600; i++)
+    {
+      items = top_items (infos);
+      top = find_top (items, "Upscale");
+      if (top != NULL || (!expect && find_top (items, "Convert to") != NULL))
+        break;
+      free_top (items);
+      items = NULL;
+      g_usleep (20000);
+    }
+  if (top != NULL)
+    {
+      NautilusMenu *sub = NULL;
+      GList *sub_items;
+      char *name = item_prop (top, "name");
+
+      g_assert_cmpstr (name, ==, "FileConverter::Upscale");
+      g_free (name);
+      g_object_get (top, "menu", &sub, NULL);
+      g_assert_nonnull (sub);
+      sub_items = nautilus_menu_get_items (sub);
+      names = g_string_new (NULL);
+      for (GList *l = sub_items; l; l = l->next)
+        {
+          char *n = item_prop (l->data, "name"), *lab = item_prop (l->data, "label");
+          char *tip = item_prop (l->data, "tip");
+
+          g_assert_true (g_str_has_prefix (n, "FileConverter::Upscale::"));
+          g_assert_true (item_is_leaf (l->data));
+          g_string_append_printf (names, "%s%s", names->len ? "," : "",
+                                  n + strlen ("FileConverter::Upscale::"));
+          g_string_append_printf (labels, "%s%s", labels->len ? "|" : "", lab);
+          g_string_append_printf (tips, "%s%s", tips->len ? "|" : "", tip);
+          g_free (n); g_free (lab); g_free (tip);
+        }
+      nautilus_menu_item_list_free (sub_items);
+      g_object_unref (sub);
+    }
+  free_top (items);
+  if (labels_out != NULL)
+    *labels_out = g_string_free (labels, FALSE);
+  else
+    g_string_free (labels, TRUE);
+  if (tips_out != NULL)
+    *tips_out = g_string_free (tips, FALSE);
+  else
+    g_string_free (tips, TRUE);
+  return names != NULL ? g_string_free (names, FALSE) : NULL;
+}
+
+/* the labels of the top-level items, in order, joined by ',' */
+static char *
+top_labels (GList *infos)
+{
+  GList *items = top_items (infos);
+  GString *s = g_string_new (NULL);
+
+  for (GList *l = items; l; l = l->next)
+    {
+      char *label = item_prop (l->data, "label");
+
+      g_string_append_printf (s, "%s%s", s->len ? "," : "", label);
+      g_free (label);
+    }
+  free_top (items);
+  return g_string_free (s, FALSE);
+}
+
+/* "Upscale" after "Resize": 2× ... 8× for the pictures Upscayl takes, only the scales whose
+ * result stays within 32768 px per side and 400 megapixels (sizes from the file
+ * headers), all of them where the size is not known; none for SVG, ICO, video, documents,
+ * folders. (The module of this process found a fake upscayl-bin: see main.) */
+static void
+test_upscale_menus (void)
+{
+  char *magick = g_find_program_in_path ("magick");
+  char *names, *labels, *tips, *tl;
+  GList *l;
+  const char *all = "2x,3x,4x,5x,6x,8x";
+
+  touch ("u-garbage.png"); touch ("u-video.mp4"); touch ("u-svg.svg"); touch ("u-ico.ico");
+  touch ("u-doc.docx"); touch ("u-noise.mp3");
+  g_mkdir_with_parents ("upscale-dir", 0755);
+  if (magick != NULL)
+    {
+      g_assert_true (make_image (magick, "u-640x480.png", 640, 480));
+      g_assert_true (make_image (magick, "u-5000x4000.png", 5000, 4000));
+      g_assert_true (make_image (magick, "u-3840.png", 3840, 2160));
+      g_assert_true (make_image (magick, "u-4100x50.jpg", 4100, 50));
+      g_assert_true (make_image (magick, "u-20000x20.png", 20000, 20));
+      g_assert_true (make_image (magick, "u-64.jpg", 64, 64));
+
+      /* 640 x 480: every scale, the exact size in the tooltip, after Resize */
+      l = sel1 ("u-640x480.png", "image/png", FALSE);
+      names = upscale_names_wait (l, TRUE, &labels, &tips);
+      g_assert_cmpstr (names, ==, all);
+      g_assert_cmpstr (labels, ==, "2×|3×|4×|5×|6×|8×");
+      g_assert_nonnull (strstr (tips, "1280 × 960 px"));   /* 2× */
+      g_assert_nonnull (strstr (tips, "2560 × 1920 px"));  /* 4× */
+      g_assert_nonnull (strstr (tips, "3200 × 2400 px"));  /* 5× */
+      g_assert_nonnull (strstr (tips, "5120 × 3840 px"));  /* 8× */
+      g_free (names); g_free (labels); g_free (tips);
+      tl = top_labels (l);
+      g_assert_cmpstr (tl, ==, "Convert to,Resize,Upscale"); /* a PNG has no Compress */
+      g_free (tl);
+      g_list_free_full (l, g_object_unref);
+
+      /* a JPG has all four (Compress, Resize: smaller; Upscale: larger), Upscale last */
+      l = sel1 ("u-4100x50.jpg", "image/jpeg", FALSE);
+      names = upscale_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x"); /* 8×: 32800 px */
+      g_free (names);
+      tl = top_labels (l);
+      g_assert_cmpstr (tl, ==, "Convert to,Compress,Resize,Upscale");
+      g_free (tl);
+      g_list_free_full (l, g_object_unref);
+
+      /* a 5000 x 4000 picture: 4× is 320 MP; 5× (500 MP), 6× and 8× are too big */
+      l = sel1 ("u-5000x4000.png", "image/png", FALSE);
+      names = upscale_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "2x,3x,4x");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* 3840 x 2160: 6× is 298 MP, 8× 530 MP */
+      l = sel1 ("u-3840.png", "image/png", FALSE);
+      names = upscale_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* 20000 x 20: even 2× is 40000 px: no Upscale, the rest of the menu is there */
+      l = sel1 ("u-20000x20.png", "image/png", FALSE);
+      g_assert_null (upscale_names_wait (l, FALSE, NULL, NULL));
+      tl = top_labels (l);
+      g_assert_cmpstr (tl, ==, "Convert to,Resize");
+      g_free (tl);
+      g_list_free_full (l, g_object_unref);
+
+      /* a selection: a scale that fits one file is shown (the others are skipped when it runs);
+       * the tooltips then say no exact size */
+      l = sel1 ("u-5000x4000.png", "image/png", FALSE);
+      l = sel_add (l, "u-64.jpg", "image/jpeg");
+      names = upscale_names_wait (l, TRUE, NULL, &tips);
+      g_assert_cmpstr (names, ==, all);
+      g_assert_null (strstr (tips, " px"));
+      g_free (names); g_free (tips);
+      g_list_free_full (l, g_object_unref);
+      /* two files that are both too big for the scale: none (for 20000 x 20 and 5000 x 4000: 2x, 3x, 4x) */
+      l = sel1 ("u-20000x20.png", "image/png", FALSE);
+      l = sel_add (l, "u-20000x20.png", "image/png");
+      g_assert_null (upscale_names_wait (l, FALSE, NULL, NULL));
+      g_list_free_full (l, g_object_unref);
+
+      /* a file whose size cannot be read: every scale (the job reads it and skips if too big) */
+      l = sel1 ("u-garbage.png", "image/png", FALSE);
+      names = upscale_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, all);
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* every other picture format Upscayl needs a conversion for is offered too */
+      touch ("u-a.bmp"); touch ("u-a.tiff"); touch ("u-a.gif"); touch ("u-a.webp");
+      {
+        const struct { const char *name, *mime; } more[] = {
+          { "u-a.bmp", "image/bmp" }, { "u-a.tiff", "image/tiff" }, { "u-a.gif", "image/gif" },
+          { "u-a.webp", "image/webp" },
+        };
+
+        for (guint i = 0; i < G_N_ELEMENTS (more); i++)
+          {
+            l = sel1 (more[i].name, more[i].mime, FALSE);
+            names = upscale_names_wait (l, TRUE, NULL, NULL);
+            g_assert_cmpstr (names, ==, all);
+            g_free (names);
+            g_list_free_full (l, g_object_unref);
+          }
+      }
+    }
+
+  /* a vector picture and an icon: nothing to enlarge */
+  l = sel1 ("u-svg.svg", "image/svg+xml", FALSE);
+  g_assert_null (upscale_names_wait (l, FALSE, NULL, NULL));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-ico.ico", "image/vnd.microsoft.icon", FALSE);
+  g_assert_null (upscale_names_wait (l, FALSE, NULL, NULL));
+  g_list_free_full (l, g_object_unref);
+  /* a video, audio, a document: none (no Upscale item at all) */
+  l = sel1 ("u-video.mp4", "video/mp4", FALSE);
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-noise.mp3", "audio/mpeg", FALSE);
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", FALSE);
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  /* a directory, alone or with a picture; a picture and a video; a picture and an SVG */
+  l = sel1 ("upscale-dir", "inode/directory", TRUE);
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-garbage.png", "image/png", FALSE);
+  l = g_list_append (l, fake_new ("file:///tmp", "inode/directory", TRUE));
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-garbage.png", "image/png", FALSE);
+  l = sel_add (l, "u-video.mp4", "video/mp4");
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("u-garbage.png", "image/png", FALSE);
+  l = sel_add (l, "u-svg.svg", "image/svg+xml");
+  g_assert_null (top_submenu (l, "Upscale"));
+  g_list_free_full (l, g_object_unref);
+
+  g_free (magick);
+}
+
 
 static void
 test_register_and_menu (void)
@@ -1092,6 +1328,7 @@ test_register_and_menu (void)
   test_preset_menus ();
   test_compress_menus ();
   test_resize_menus ();
+  test_upscale_menus ();
 
   /* no background items */
   {
@@ -1102,6 +1339,50 @@ test_register_and_menu (void)
     g_object_unref (folder);
   }
 
+  g_object_unref (provider);
+  shutdown ();
+}
+
+/* Without upscayl-bin (or without its models) there is no Upscale item, whatever the
+ * selection, and everything else is as before. Runs in its own process (mode
+ * "no-upscayl" or "no-models"): the tools are looked up once per process. There the
+ * environment of main has made the backend not found, or found without its models. */
+static void
+test_no_upscayl (void)
+{
+  GModule *m = g_module_open (module_path, G_MODULE_BIND_LOCAL);
+  void (*initialize) (GTypeModule *);
+  void (*list_types) (const GType **, int *);
+  void (*shutdown) (void);
+  GTypeModule *tm = g_object_new (test_module_get_type (), NULL);
+  const GType *types = NULL;
+  int n = 0;
+  char *magick = g_find_program_in_path ("magick"), *tl, *names;
+  GList *l;
+
+  g_assert_nonnull (m);
+  g_assert_true (g_module_symbol (m, "nautilus_module_initialize", (gpointer *) &initialize));
+  g_assert_true (g_module_symbol (m, "nautilus_module_list_types", (gpointer *) &list_types));
+  g_assert_true (g_module_symbol (m, "nautilus_module_shutdown", (gpointer *) &shutdown));
+  g_type_module_use (tm);
+  initialize (tm);
+  list_types (&types, &n);
+  provider = g_object_new (types[0], NULL);
+  if (magick != NULL)
+    {
+      g_assert_true (make_image (magick, "n-640x480.jpg", 640, 480));
+      l = sel1 ("n-640x480.jpg", "image/jpeg", FALSE);
+      /* Resize shows up when the probes have finished: then Upscale would have, too */
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_nonnull (names);
+      g_free (names);
+      tl = top_labels (l);
+      g_assert_cmpstr (tl, ==, "Convert to,Compress,Resize");
+      g_free (tl);
+      g_assert_null (top_submenu (l, "Upscale"));
+      g_list_free_full (l, g_object_unref);
+    }
+  g_free (magick);
   g_object_unref (provider);
   shutdown ();
 }
@@ -1202,6 +1483,37 @@ main (int argc, char **argv)
   module_path = argv[1];
   work = g_dir_make_tmp ("nfc-menu-XXXXXX", NULL);
   g_assert_nonnull (work);
+  /* The backend of Upscale: a fake upscayl-bin (never run here) with its models, found through
+   * NFC_UPSCAYL_BIN; the modes "no-upscayl" (not found) and "no-models" (found, but the
+   * models directory is empty) take it away. The user's configuration and log stay out of it. */
+  {
+    char *cfg = g_build_filename (work, "xdg-config", NULL), *cache = g_build_filename (work, "xdg-cache", NULL);
+    char *bin = g_build_filename (work, "upscayl", "bin", NULL), *models = g_build_filename (work, "upscayl", "models", NULL);
+    char *exe = g_build_filename (bin, "upscayl-bin", NULL), *p;
+    const char *mode = argc > 2 ? argv[2] : "";
+
+    g_setenv ("XDG_CONFIG_HOME", cfg, TRUE);
+    g_setenv ("XDG_CACHE_HOME", cache, TRUE);
+    g_mkdir_with_parents (bin, 0755);
+    g_mkdir_with_parents (models, 0755);
+    write_script (exe, "exit 0\n");
+    for (const char *ext = "param"; ext != NULL; ext = g_str_equal (ext, "param") ? "bin" : NULL)
+      {
+        char *name = g_strdup_printf ("upscayl-standard-4x.%s", ext);
+
+        p = g_build_filename (models, name, NULL);
+        if (!g_str_equal (mode, "no-models"))
+          g_file_set_contents (p, "x", -1, NULL);
+        g_free (p);
+        g_free (name);
+      }
+    g_setenv ("NFC_UPSCAYL_BIN", g_str_equal (mode, "no-upscayl") ? "/nonexistent/upscayl-bin" : exe, TRUE);
+    g_free (cfg);
+    g_free (cache);
+    g_free (bin);
+    g_free (models);
+    g_free (exe);
+  }
   if (argc > 2 && g_str_equal (argv[2], "freeze"))
     {
       /* fakes first in PATH, before the module looks the tools up */
@@ -1223,6 +1535,8 @@ main (int argc, char **argv)
       g_free (bin);
       g_test_add_func ("/module/probe-freeze", test_freeze);
     }
+  else if (argc > 2 && (g_str_equal (argv[2], "no-upscayl") || g_str_equal (argv[2], "no-models")))
+    g_test_add_func ("/module/no-upscale", test_no_upscayl);
   else
     {
       g_test_add_func ("/module/entry-points", test_entry_points);

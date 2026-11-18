@@ -8,6 +8,7 @@
 #include <utime.h>
 
 #include "nfc-core.h"
+#include "nfc-util.h"
 #include "nfc-header.h"
 
 static gboolean
@@ -2498,9 +2499,621 @@ test_small_labels (void)
   g_assert_false (nfc_preset_output_size (NFC_CAT_VIDEO, "gif", SMALL, 0, 0, NULL, NULL));
 }
 
+/* ---------------------------------------------------------------------
+ * Upscale
+ * --------------------------------------------------------------------- */
+
+/* which presets a w x h image offers, as "a,b,c" of keys */
+static char *
+upscale_offered (guint64 w, guint64 h)
+{
+  GString *s = g_string_new (NULL);
+  guint n;
+  const NfcUpscalePreset *all = nfc_upscale_presets (&n);
+
+  for (guint i = 0; i < n; i++)
+    if (nfc_upscale_output_size (&all[i], w, h, NULL, NULL))
+      g_string_append_printf (s, "%s%s", s->len ? "," : "", all[i].key);
+  return g_string_free (s, FALSE);
+}
+
+static void
+test_upscale_presets (void)
+{
+  guint n;
+  const NfcUpscalePreset *p = nfc_upscale_presets (&n);
+  const char *keys[] = { "2x", "3x", "4x", "5x", "6x", "8x" };
+  const char *labels[] = { "2×", "3×", "4×", "5×", "6×", "8×" };
+  const guint factors[] = { 2, 3, 4, 5, 6, 8 };
+  /* the pass chains: one -s per pass; 5x is made as 6x and shrunk */
+  const guint passes[][2] = { { 2, 0 }, { 3, 0 }, { 4, 0 }, { 3, 2 }, { 3, 2 }, { 4, 2 } };
+  const guint chains[] = { 2, 3, 4, 6, 6, 8 };
+  guint64 ow, oh;
+  char *s;
+
+  g_assert_cmpuint (n, ==, 6);
+  for (guint i = 0; i < n; i++)
+    {
+      g_assert_cmpstr (p[i].key, ==, keys[i]);
+      g_assert_cmpstr (p[i].label, ==, labels[i]);
+      g_assert_cmpuint (p[i].factor, ==, factors[i]);
+      g_assert_cmpuint (p[i].pass[0], ==, passes[i][0]);
+      g_assert_cmpuint (p[i].pass[1], ==, passes[i][1]);
+      g_assert_cmpuint (nfc_upscale_chain_factor (&p[i]), ==, chains[i]);
+      g_assert_true (nfc_upscale_preset_from_key (keys[i]) == &p[i]);
+    }
+  g_assert_null (nfc_upscale_preset_from_key ("7x"));
+  g_assert_null (nfc_upscale_preset_from_key (NULL));
+  g_assert_cmpuint (nfc_upscale_chain_factor (NULL), ==, 0);
+
+  /* exact size: width x factor */
+  g_assert_true (nfc_upscale_output_size (&p[2], 640, 480, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 2560);
+  g_assert_cmpuint (oh, ==, 1920);
+  g_assert_true (nfc_upscale_output_size (&p[3], 87, 98, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 435);
+  g_assert_cmpuint (oh, ==, 490);
+  g_assert_true (nfc_upscale_output_size (&p[5], 640, 480, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 5120);
+  g_assert_cmpuint (oh, ==, 3840);
+
+  /* which scales a size offers: at most 32768 px per side and 400 megapixels */
+  s = upscale_offered (640, 480);
+  g_assert_cmpstr (s, ==, "2x,3x,4x,5x,6x,8x");
+  g_free (s);
+  s = upscale_offered (1000, 1000); /* 8x: 8000 x 8000 = 64 MP */
+  g_assert_cmpstr (s, ==, "2x,3x,4x,5x,6x,8x");
+  g_free (s);
+  s = upscale_offered (5000, 4000); /* 4x: 320 MP; 5x: 500 MP; 6x: 30000 px, 720 MP; 8x: 40000 px */
+  g_assert_cmpstr (s, ==, "2x,3x,4x");
+  g_free (s);
+  s = upscale_offered (4096, 4096); /* 8x is exactly 32768 px per side, but 1074 MP */
+  g_assert_cmpstr (s, ==, "2x,3x,4x");
+  g_free (s);
+  s = upscale_offered (10000, 10000); /* 2x: exactly 400 MP */
+  g_assert_cmpstr (s, ==, "2x");
+  g_free (s);
+  s = upscale_offered (10001, 10000);
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+  s = upscale_offered (16384, 1); /* a strip: 2x is exactly 32768 px, 3x is 49152 */
+  g_assert_cmpstr (s, ==, "2x");
+  g_free (s);
+  s = upscale_offered (16385, 1);
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+  s = upscale_offered (4000, 1); /* 8x: 32000 px wide, 8 px high */
+  g_assert_cmpstr (s, ==, "2x,3x,4x,5x,6x,8x");
+  g_free (s);
+  s = upscale_offered (4097, 1); /* 8x: 32776 px */
+  g_assert_cmpstr (s, ==, "2x,3x,4x,5x,6x");
+  g_free (s);
+  /* unknown size: not "fits": the selection logic treats it as fitting, the job reads the size */
+  g_assert_false (nfc_upscale_output_size (&p[0], 0, 480, NULL, NULL));
+  g_assert_false (nfc_upscale_output_size (&p[0], 640, 0, NULL, NULL));
+  g_assert_false (nfc_upscale_output_size (NULL, 640, 480, NULL, NULL));
+  /* absurd sizes cannot overflow */
+  g_assert_false (nfc_upscale_output_size (&p[5], G_MAXUINT64, G_MAXUINT64, &ow, &oh));
+  g_assert_false (nfc_upscale_output_size (&p[5], G_MAXUINT64, 1, NULL, NULL));
+  /* the exact size is reported also when it is too big (the toast says it) */
+  g_assert_false (nfc_upscale_output_size (&p[2], 9000, 9000, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 36000);
+  g_assert_cmpuint (oh, ==, 36000);
+
+  /* tooltips: the exact size when known and fitting */
+  s = nfc_upscale_tooltip (&p[2], 640, 480);
+  g_assert_nonnull (strstr (s, "2560 × 1920 px"));
+  g_free (s);
+  s = nfc_upscale_tooltip (&p[2], 0, 0);
+  g_assert_nonnull (strstr (s, "4 times as wide and tall"));
+  g_free (s);
+  s = nfc_upscale_tooltip (&p[5], 9000, 9000);
+  g_assert_null (strstr (s, "×"));
+  g_free (s);
+  s = nfc_upscale_tooltip (NULL, 1, 1);
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+}
+
+static void
+test_upscale_targets (void)
+{
+  NfcUpscaleTarget t;
+  const struct { const char *fmt, *key; } yes[] = {
+    { "png", "png" }, { "jpg", "jpg" }, { "webp", "webp" },
+    { "avif", "png" }, { "heic", "png" }, { "bmp", "png" }, { "tiff", "png" }, { "gif", "png" },
+  };
+  const char *no[] = { "svg", "ico", "mp4", "pdf", "docx", "xyz", "", NULL };
+
+  for (guint i = 0; i < G_N_ELEMENTS (yes); i++)
+    {
+      g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, yes[i].fmt, 640, 480, &t));
+      g_assert_cmpstr (t.key, ==, yes[i].key);
+      g_assert_cmpstr (t.ext, ==, yes[i].key);
+      g_assert_false (t.capped);
+    }
+  for (guint i = 0; no[i] != NULL; i++)
+    g_assert_false (nfc_upscale_target (NFC_CAT_IMAGE, no[i], 0, 0, NULL));
+  g_assert_false (nfc_upscale_target (NFC_CAT_IMAGE, NULL, 0, 0, NULL));
+  /* only images: the same format keys of any other category are no upscale source */
+  g_assert_false (nfc_upscale_target (NFC_CAT_VIDEO, "gif", 0, 0, NULL));
+  g_assert_false (nfc_upscale_target (NFC_CAT_VIDEO, "png", 0, 0, NULL));
+  g_assert_false (nfc_upscale_target (NFC_CAT_AUDIO, "mp3", 0, 0, NULL));
+
+  /* WEBP holds 16383 px per side: a bigger result is a PNG */
+  g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", 16383, 16383, &t));
+  g_assert_false (t.capped);
+  g_assert_cmpstr (t.key, ==, "webp");
+  g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", 16384, 100, &t));
+  g_assert_true (t.capped);
+  g_assert_cmpstr (t.key, ==, "png");
+  g_assert_cmpstr (t.ext, ==, "png");
+  g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", 100, 16384, &t));
+  g_assert_true (t.capped);
+  g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", 0, 0, &t)); /* unknown: not capped */
+  g_assert_false (t.capped);
+  /* a PNG or JPG is never "capped" (the cap is WebP's) */
+  g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "jpg", 30000, 30000, &t));
+  g_assert_false (t.capped);
+  g_assert_cmpstr (t.key, ==, "jpg");
+  /* ... and the whole range: the 8x of a 2049 px strip is 16392 px */
+  {
+    guint64 ow, oh;
+
+    g_assert_true (nfc_upscale_output_size (nfc_upscale_preset_from_key ("8x"), 2049, 100, &ow, &oh));
+    g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", ow, oh, &t));
+    g_assert_true (t.capped);
+    g_assert_true (nfc_upscale_output_size (nfc_upscale_preset_from_key ("8x"), 2047, 100, &ow, &oh));
+    g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "webp", ow, oh, &t));
+    g_assert_false (t.capped);
+  }
+}
+
+static void
+write_text (const char *path, const char *text)
+{
+  g_assert_true (g_file_set_contents (path, text, -1, NULL));
+}
+
+static void
+test_upscale_config (void)
+{
+  char *m;
+
+  /* what the file says */
+  m = nfc_upscale_config_model ("upscale-model=remacri-4x\n");
+  g_assert_cmpstr (m, ==, "remacri-4x");
+  g_free (m);
+  m = nfc_upscale_config_model ("# comment\n\n  upscale-model =  ultrasharp-4x  \nother=1\n");
+  g_assert_cmpstr (m, ==, "ultrasharp-4x");
+  g_free (m);
+  m = nfc_upscale_config_model ("upscale-model=a\nupscale-model=b"); /* the last wins, no final newline */
+  g_assert_cmpstr (m, ==, "b");
+  g_free (m);
+  m = nfc_upscale_config_model ("upscale-model=remacri-4x\r\nx=y\r\n"); /* CRLF */
+  g_assert_cmpstr (m, ==, "remacri-4x");
+  g_free (m);
+  g_assert_null (nfc_upscale_config_model (""));
+  g_assert_null (nfc_upscale_config_model (NULL));
+  g_assert_null (nfc_upscale_config_model ("upscale-model=\n"));
+  g_assert_null (nfc_upscale_config_model ("# upscale-model=remacri-4x\n"));
+  g_assert_null (nfc_upscale_config_model ("upscale-modelx=remacri-4x\nupscale=remacri-4x\n"));
+  g_assert_null (nfc_upscale_config_model ("no equals sign here\n"));
+}
+
+/* a fake Upscayl install: <dir>/bin/upscayl-bin and <dir>/models/<model>.{param,bin} */
+static char *
+make_fake_install (const char *const *models)
+{
+  char *dir = g_dir_make_tmp ("nfc-upscayl-XXXXXX", NULL);
+  char *bin = g_build_filename (dir, "bin", NULL), *md = g_build_filename (dir, "models", NULL), *exe;
+
+  g_assert_nonnull (dir);
+  g_assert_cmpint (g_mkdir_with_parents (bin, 0755), ==, 0);
+  g_assert_cmpint (g_mkdir_with_parents (md, 0755), ==, 0);
+  exe = g_build_filename (bin, "upscayl-bin", NULL);
+  write_text (exe, "#!/bin/sh\nexit 0\n");
+  g_assert_cmpint (g_chmod (exe, 0755), ==, 0);
+  for (guint i = 0; models != NULL && models[i] != NULL; i++)
+    {
+      char *p = g_strdup_printf ("%s/%s.param", md, models[i]);
+      char *b = g_strdup_printf ("%s/%s.bin", md, models[i]);
+
+      write_text (p, "7767517\n");
+      write_text (b, "x");
+      g_free (p);
+      g_free (b);
+    }
+  g_free (bin);
+  g_free (md);
+  g_free (exe);
+  return dir;
+}
+
+static void
+test_upscale_resolve (void)
+{
+  const char *two[] = { "upscayl-standard-4x", "remacri-4x", NULL };
+  const char *only_other[] = { "remacri-4x", NULL };
+  char *dir = make_fake_install (two), *exe = g_build_filename (dir, "bin", "upscayl-bin", NULL);
+  char *conf = g_build_filename (dir, "config", NULL), *md = g_build_filename (dir, "models", NULL);
+  char *models, *model;
+
+  /* no config: the default model, in <bindir>/../models */
+  g_assert_true (nfc_upscale_resolve (exe, NULL, &models, &model));
+  g_assert_cmpstr (models, ==, md);
+  g_assert_cmpstr (model, ==, "upscayl-standard-4x");
+  g_free (models);
+  g_free (model);
+  g_assert_true (nfc_upscale_resolve (exe, conf, &models, &model)); /* a config file that is not there */
+  g_assert_cmpstr (model, ==, "upscayl-standard-4x");
+  g_free (models);
+  g_free (model);
+  /* a valid choice */
+  write_text (conf, "upscale-model=remacri-4x\n");
+  g_assert_true (nfc_upscale_resolve (exe, conf, &models, &model));
+  g_assert_cmpstr (model, ==, "remacri-4x");
+  g_free (models);
+  g_free (model);
+  /* invalid choices fall back to the default: not installed, a path, empty, odd characters */
+  {
+    const char *bad[] = { "upscale-model=nosuch-4x\n", "upscale-model=../models/remacri-4x\n",
+                          "upscale-model=/etc/passwd\n", "upscale-model=\n", "upscale-model=remacri 4x\n",
+                          "upscale-model=.hidden\n", "upscale-model=remacri-4x.param\n", NULL };
+
+    for (guint i = 0; bad[i] != NULL; i++)
+      {
+        write_text (conf, bad[i]);
+        g_assert_true (nfc_upscale_resolve (exe, conf, &models, &model));
+        g_assert_cmpstr (model, ==, "upscayl-standard-4x");
+        g_free (models);
+        g_free (model);
+      }
+  }
+  /* only the .param exists: not a model */
+  {
+    char *b = g_build_filename (dir, "models", "remacri-4x.bin", NULL);
+
+    write_text (conf, "upscale-model=remacri-4x\n");
+    g_assert_cmpint (g_unlink (b), ==, 0);
+    g_assert_true (nfc_upscale_resolve (exe, conf, &models, &model));
+    g_assert_cmpstr (model, ==, "upscayl-standard-4x");
+    g_free (models);
+    g_free (model);
+    g_free (b);
+  }
+  nfc_rm_rf (dir);
+  g_free (dir);
+  g_free (exe);
+  g_free (conf);
+  g_free (md);
+
+  /* the default model is missing: the configured one is used, else nothing is offered */
+  dir = make_fake_install (only_other);
+  exe = g_build_filename (dir, "bin", "upscayl-bin", NULL);
+  conf = g_build_filename (dir, "config", NULL);
+  g_assert_false (nfc_upscale_resolve (exe, NULL, &models, &model));
+  g_assert_null (models);
+  g_assert_null (model);
+  write_text (conf, "upscale-model=remacri-4x\n");
+  g_assert_true (nfc_upscale_resolve (exe, conf, &models, &model));
+  g_assert_cmpstr (model, ==, "remacri-4x");
+  g_free (models);
+  g_free (model);
+  nfc_rm_rf (dir);
+  g_free (dir);
+  g_free (exe);
+  g_free (conf);
+
+  /* no models directory at all */
+  dir = make_fake_install (NULL);
+  exe = g_build_filename (dir, "bin", "upscayl-bin", NULL);
+  md = g_build_filename (dir, "models", NULL);
+  nfc_rm_rf (md);
+  g_assert_false (nfc_upscale_resolve (exe, NULL, &models, &model));
+  g_assert_null (models);
+  g_assert_false (nfc_upscale_resolve (NULL, NULL, &models, &model));
+  nfc_rm_rf (dir);
+  g_free (dir);
+  g_free (exe);
+  g_free (md);
+}
+
+/* nfc_tools_init found the fake install of main (NFC_UPSCAYL_BIN, XDG_CONFIG_HOME) */
+static const char *discovery_dir; /* g_free'd by main */
+
+static void
+test_upscale_discovery (void)
+{
+  char *exe = g_build_filename (discovery_dir, "bin", "upscayl-bin", NULL);
+  char *md = g_build_filename (discovery_dir, "models", NULL);
+
+  nfc_tools_init ();
+  g_assert_cmpstr (nfc_tools.upscayl, ==, exe);
+  g_assert_cmpstr (nfc_tools.upscale_models, ==, md);
+  /* the configuration file of XDG_CONFIG_HOME names an installed model */
+  g_assert_cmpstr (nfc_tools.upscale_model, ==, "remacri-4x");
+  g_free (exe);
+  g_free (md);
+}
+
+static void
+use_fake_upscayl (void)
+{
+  use_fake_tools ();
+  g_free (nfc_tools.upscayl);
+  g_free (nfc_tools.upscale_models);
+  g_free (nfc_tools.upscale_model);
+  nfc_tools.upscayl = g_strdup ("/u/upscayl-bin");
+  nfc_tools.upscale_models = g_strdup ("/u/models");
+  nfc_tools.upscale_model = g_strdup ("m-4x");
+}
+
+/* the argv of an upscale of source fmt to output key with preset up_key, as one string */
+static char *
+upscale_str (const char *fmt, const char *key, const char *up_key, gboolean *dec)
+{
+  char *src = g_strdup_printf ("/s/a.%s", fmt), *out = g_strdup_printf ("/o/x.%s", key), *s;
+  GPtrArray *at = nfc_build_attempts_upscale (fmt, key, nfc_upscale_preset_from_key (up_key), src, out,
+                                              "/w", dec);
+
+  g_assert_nonnull (at);
+  g_assert_cmpuint (at->len, ==, 1); /* one attempt: no fallback to anything else */
+  s = attempts_string (at);
+  g_ptr_array_unref (at);
+  g_free (src);
+  g_free (out);
+  return s;
+}
+
+#define UP_PREP "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -depth 8 PNG:/w/in.png"
+#define UP_PASS(i, o, s) " && /u/upscayl-bin -i " i " -o " o " -m /u/models -n m-4x -s " s " -f png"
+
+static void
+test_upscale_argv (void)
+{
+  gboolean dec = TRUE;
+  char *s;
+  GPtrArray *at;
+  const char *bad_in = "/w";
+
+  use_fake_upscayl ();
+
+  /* one pass: -s N, then the PNG out by ImageMagick (alpha kept, nothing else done to it) */
+  s = upscale_str ("png", "png", "2x", &dec);
+  g_assert_false (dec);
+  g_assert_cmpstr (s, ==, UP_PREP UP_PASS ("/w/in.png", "/w/up1.png", "2")
+                          " && /bin/magick -quiet PNG:/w/up1.png[0] PNG:/o/x.png");
+  g_free (s);
+  s = upscale_str ("png", "png", "3x", NULL);
+  g_assert_nonnull (strstr (s, UP_PASS ("/w/in.png", "/w/up1.png", "3") " && /bin/magick"));
+  g_assert_null (strstr (s, "up2.png"));
+  g_free (s);
+  s = upscale_str ("png", "png", "4x", NULL);
+  g_assert_nonnull (strstr (s, UP_PASS ("/w/in.png", "/w/up1.png", "4") " && /bin/magick"));
+  g_free (s);
+
+  /* chains: the second pass reads the first's output; 6x = 3x then 2x, 8x = 4x then 2x */
+  s = upscale_str ("png", "png", "6x", NULL);
+  g_assert_cmpstr (s, ==, UP_PREP UP_PASS ("/w/in.png", "/w/up1.png", "3")
+                          UP_PASS ("/w/up1.png", "/w/up2.png", "2")
+                          " && /bin/magick -quiet PNG:/w/up2.png[0] PNG:/o/x.png");
+  g_free (s);
+  s = upscale_str ("png", "png", "8x", NULL);
+  g_assert_cmpstr (s, ==, UP_PREP UP_PASS ("/w/in.png", "/w/up1.png", "4")
+                          UP_PASS ("/w/up1.png", "/w/up2.png", "2")
+                          " && /bin/magick -quiet PNG:/w/up2.png[0] PNG:/o/x.png");
+  g_free (s);
+  /* 5x: the 6x chain, shrunk by 5/6 with Lanczos */
+  s = upscale_str ("png", "png", "5x", NULL);
+  g_assert_cmpstr (s, ==, UP_PREP UP_PASS ("/w/in.png", "/w/up1.png", "3")
+                          UP_PASS ("/w/up1.png", "/w/up2.png", "2")
+                          " && /bin/magick -quiet PNG:/w/up2.png[0] -filter Lanczos -resize 83.3333333333% PNG:/o/x.png");
+  g_free (s);
+
+  /* the format of the result: JPG at the Best settings of a photo, flattened */
+  s = upscale_str ("jpg", "jpg", "2x", NULL);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -depth 8 PNG:/w/in.png"
+                          UP_PASS ("/w/in.png", "/w/up1.png", "2")
+                          " && /bin/magick -quiet PNG:/w/up1.png[0] -background white -alpha remove -alpha off -quality 95 -sampling-factor 4:4:4 JPEG:/o/x.jpg");
+  g_free (s);
+  /* WEBP at the Best settings of a photo; alpha is kept */
+  s = upscale_str ("webp", "webp", "4x", NULL);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet WEBP:/s/a.webp[0] -auto-orient -depth 8 PNG:/w/in.png"
+                          UP_PASS ("/w/in.png", "/w/up1.png", "4")
+                          " && /bin/magick -quiet PNG:/w/up1.png[0] -resize 16383x16383> -quality 90 -define webp:method=6 -define webp:use-sharp-yuv=true WEBP:/o/x.webp");
+  g_assert_null (strstr (s, "-alpha"));
+  g_free (s);
+  /* the WEBP that became a PNG (see nfc_upscale_target): a plain PNG out */
+  s = upscale_str ("webp", "png", "4x", NULL);
+  g_assert_nonnull (strstr (s, "PNG:/w/up1.png[0] PNG:/o/x.png"));
+  g_free (s);
+
+  /* sources the backend cannot read go through ImageMagick, PNG out */
+  {
+    const struct { const char *fmt, *coder; } im[] = {
+      { "bmp", "BMP" }, { "tiff", "TIFF" }, { "gif", "GIF" }, { "webp", "WEBP" }, { "jpg", "JPEG" },
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (im); i++)
+      {
+        char *want = g_strdup_printf ("/bin/magick -quiet %s:/s/a.%s[0] -auto-orient -depth 8 PNG:/w/in.png",
+                                      im[i].coder, im[i].fmt);
+
+        s = upscale_str (im[i].fmt, "png", "2x", &dec);
+        g_assert_true (g_str_has_prefix (s, want));
+        g_assert_false (dec);
+        g_free (want);
+        g_free (s);
+      }
+  }
+  /* HEIC and AVIF: the out-of-process decoder makes the PNG (oriented), no ImageMagick step */
+  s = upscale_str ("heic", "png", "3x", &dec);
+  g_assert_true (dec);
+  g_assert_cmpstr (s, ==, "/bin/nfc-decode /s/a.heic /w/decoded.png"
+                          UP_PASS ("/w/decoded.png", "/w/up1.png", "3")
+                          " && /bin/magick -quiet PNG:/w/up1.png[0] PNG:/o/x.png");
+  g_free (s);
+  s = upscale_str ("avif", "png", "2x", &dec);
+  g_assert_true (dec);
+  g_assert_true (g_str_has_prefix (s, "/bin/nfc-decode /s/a.avif /w/decoded.png"));
+  g_free (s);
+
+  /* nothing for SVG, ICO, other output formats, or a missing tool */
+  g_assert_null (nfc_build_attempts_upscale ("svg", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.svg",
+                                             "/o/x.png", "/w", NULL));
+  g_assert_null (nfc_build_attempts_upscale ("ico", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.ico",
+                                             "/o/x.png", "/w", NULL));
+  g_assert_null (nfc_build_attempts_upscale ("png", "avif", nfc_upscale_preset_from_key ("2x"), "/s/a.png",
+                                             "/o/x.avif", "/w", NULL));
+  g_assert_null (nfc_build_attempts_upscale ("mp4", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.mp4",
+                                             "/o/x.png", "/w", NULL));
+  g_assert_null (nfc_build_attempts_upscale ("png", "png", NULL, "/s/a.png", "/o/x.png", "/w", NULL));
+  g_assert_null (nfc_build_attempts_upscale ("png", "png", nfc_upscale_preset_from_key ("2x"), NULL, "/o/x.png",
+                                             "/w", NULL));
+  {
+    char *saved = nfc_tools.upscayl;
+
+    nfc_tools.upscayl = NULL;
+    g_assert_null (nfc_build_attempts_upscale ("png", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.png",
+                                               "/o/x.png", "/w", NULL));
+    nfc_tools.upscayl = saved;
+    saved = nfc_tools.magick;
+    nfc_tools.magick = NULL;
+    g_assert_null (nfc_build_attempts_upscale ("png", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.png",
+                                               "/o/x.png", "/w", NULL));
+    nfc_tools.magick = saved;
+    saved = nfc_tools.decode;
+    nfc_tools.decode = NULL;
+    g_assert_null (nfc_build_attempts_upscale ("heic", "png", nfc_upscale_preset_from_key ("2x"), "/s/a.heic",
+                                               "/o/x.png", "/w", NULL));
+    nfc_tools.decode = saved;
+  }
+
+  /* paths with spaces and ImageMagick's escapes stay single arguments, % doubled */
+  at = nfc_build_attempts_upscale ("png", "png", nfc_upscale_preset_from_key ("2x"), "/s/my 100%.png",
+                                   "/o/out 100%.png", "/w d%", NULL);
+  g_assert_nonnull (at);
+  {
+    GPtrArray *a0 = at->pdata[0];
+    char **prep = a0->pdata[0], **pass = a0->pdata[1], **fin = a0->pdata[2];
+
+    g_assert_true (argv_has (prep, "PNG:/s/my 100%%.png[0]"));
+    g_assert_true (argv_has (prep, "PNG:/w d%%/in.png"));
+    g_assert_true (argv_has (pass, "/w d%/in.png")); /* not ImageMagick: no escaping */
+    g_assert_true (argv_has (pass, "/w d%/up1.png"));
+    g_assert_true (argv_has (fin, "PNG:/w d%%/up1.png[0]"));
+    g_assert_true (argv_has (fin, "PNG:/o/out 100%%.png"));
+  }
+  g_ptr_array_unref (at);
+  (void) bad_in;
+}
+
+static void
+test_upscale_estimates (void)
+{
+  const NfcUpscalePreset *p4 = nfc_upscale_preset_from_key ("4x"), *p5 = nfc_upscale_preset_from_key ("5x");
+  const NfcUpscalePreset *p8 = nfc_upscale_preset_from_key ("8x");
+  guint64 gib = (guint64) 1024 * 1024 * 1024;
+
+  /* the picture the passes make, at the B/px of ImageMagick's output format, plus 1 GiB */
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p4, 640, 480, "png"), ==, 2560 * 1920 * (guint64) 30 + gib);
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p4, 640, 480, "jpg"), ==, 2560 * 1920 * (guint64) 30 + gib);
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p4, 640, 480, "webp"), ==, 2560 * 1920 * (guint64) 44 + gib);
+  /* 5x is made as 6x */
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p5, 640, 480, "png"), ==, 3840 * 2880 * (guint64) 30 + gib);
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p8, 640, 480, "png"), ==, 5120 * 3840 * (guint64) 30 + gib);
+  g_assert_cmpuint (nfc_upscale_peak_bytes (p4, 0, 0, "png"), ==, gib); /* unknown size: the backend alone */
+  /* a result at the limits (400 MP) is far beyond the small-image threshold: it is queued */
+  g_assert_cmpuint (nfc_upscale_peak_bytes (nfc_upscale_preset_from_key ("2x"), 10000, 10000, "png"), >,
+                    NFC_SMALL_IMAGE_PIXELS);
+
+  /* 120 s plus 4 s per output megapixel, at most 2 h */
+  g_assert_cmpuint (nfc_upscale_timeout_secs (0, 0), ==, 120);
+  g_assert_cmpuint (nfc_upscale_timeout_secs (1000, 1000), ==, 124);
+  g_assert_cmpuint (nfc_upscale_timeout_secs (2560, 1920), ==, 120 + 4 * 5);
+  g_assert_cmpuint (nfc_upscale_timeout_secs (20000, 20000), ==, 120 + 4 * 400);
+  g_assert_cmpuint (nfc_upscale_timeout_secs (G_MAXUINT64, G_MAXUINT64), ==, 7200);
+}
+
+static void
+test_upscale_failure_messages (void)
+{
+  const struct { const char *text, *want; } c[] = {
+    /* what upscayl-bin prints: no Vulkan at all ... */
+    { "🚀 Starting Upscayl - Copyright © 2024\n✨ Detected scale x4\nvkCreateInstance failed -9\n"
+      "vkCreateInstance failed -9\nvkCreateInstance failed -9\n🚨 Error: Invalid GPU Device\n",
+      "no usable GPU: Upscale needs a Vulkan-capable graphics card and driver" },
+    { "vkCreateInstance failed -9\n", "no usable GPU: Upscale needs a Vulkan-capable graphics card and driver" },
+    /* ... out of video memory, with the device list it always prints ... */
+    { "WARNING: radv is not a conformant Vulkan implementation, testing use only.\n"
+      "[0 AMD Radeon RX 9070 XT (RADV GFX1201)]  queueC=1[4]  queueG=0[1]  queueT=0[1]\n"
+      "[0 AMD Radeon RX 9070 XT (RADV GFX1201)]  subgroup=64  basic=1  vote=1  ballot=1  shuffle=1\n"
+      "vkAllocateMemory failed -2\n",
+      "the GPU ran out of memory (try a smaller image or a lower scale)" },
+    { "vkCreateBuffer failed -2\n", "the GPU ran out of memory (try a smaller image or a lower scale)" },
+    { "vkQueueSubmit failed -4\n", "the GPU stopped responding (try again, or a lower scale)" },
+    { "vkWaitForFences failed -4\n", "the GPU stopped responding (try again, or a lower scale)" },
+    /* ... a missing model (after the success line it prints anyway) ... */
+    { "fopen /opt/Upscayl/resources/bin//opt/Upscayl/resources/models/nosuch.param failed\n"
+      "🙌 Upscayled Successfully!\n",
+      "the Upscale model files are missing (check upscale-model in the config)" },
+    { "🚨 Error: Unknown model dir type. Make sure that the model directory is called 'models' with "
+      "*.param and *.bin files inside it.\n",
+      "the Upscale model files are missing (check upscale-model in the config)" },
+    /* ... and an input it cannot read */
+    { "[1 llvmpipe (LLVM 22.1.8, 256 bits)]  subgroup=8  basic=1\n🚨 Error: Couldn't read the image 'x.png'!\n",
+      "the Upscale backend could not read the image" },
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+    {
+      char *m = nfc_failure_message (c[i].text, "png");
+
+      g_assert_cmpstr (m, ==, c[i].want);
+      g_free (m);
+    }
+  /* nothing but the device list and chatter: no message (the runner says "exit code N") */
+  {
+    char *m = nfc_failure_message ("WARNING: radv is not a conformant Vulkan implementation\n"
+                                   "[0 AMD Radeon]  queueC=1[4]\n✨ Using the default scale x4\n", "png");
+
+    g_assert_null (m);
+  }
+  /* ffmpeg's bracketed lines are still read as before */
+  {
+    char *m = nfc_failure_message ("[dec:libopenh264 @ 0x55d3] Error while opening decoder\n", "mp4");
+
+    g_assert_nonnull (m);
+    g_assert_nonnull (strstr (m, "video decoder failed"));
+    g_free (m);
+  }
+}
+
 int
 main (int argc, char **argv)
 {
+  /* a fake Upscayl install and a config file for the discovery test: set before anything
+   * calls nfc_tools_init (), which reads them once */
+  {
+    const char *models[] = { "upscayl-standard-4x", "remacri-4x", NULL };
+    char *exe, *cfgdir, *cfg;
+
+    discovery_dir = make_fake_install (models);
+    exe = g_build_filename (discovery_dir, "bin", "upscayl-bin", NULL);
+    g_setenv ("NFC_UPSCAYL_BIN", exe, TRUE);
+    cfgdir = g_build_filename (discovery_dir, "xdg", NULL);
+    g_setenv ("XDG_CONFIG_HOME", cfgdir, TRUE);
+    g_setenv ("XDG_CACHE_HOME", cfgdir, TRUE); /* keep the log out of the user's ~/.cache */
+    g_free (cfgdir);
+    cfgdir = g_build_filename (discovery_dir, "xdg", "nautilus-file-converter", NULL);
+    g_assert_cmpint (g_mkdir_with_parents (cfgdir, 0755), ==, 0);
+    cfg = g_build_filename (cfgdir, "config", NULL);
+    write_text (cfg, "# the model of Upscale\nupscale-model=remacri-4x\n");
+    g_free (cfg);
+    g_free (cfgdir);
+    g_free (exe);
+  }
   g_test_init (&argc, &argv, NULL);
   g_test_add_func ("/core/classify", test_classify);
   g_test_add_func ("/core/naming", test_naming);
@@ -2532,5 +3145,19 @@ main (int argc, char **argv)
   g_test_add_func ("/core/resize-targets", test_resize_targets);
   g_test_add_func ("/core/resize-argv", test_resize_argv);
   g_test_add_func ("/core/small-labels", test_small_labels);
-  return g_test_run ();
+  g_test_add_func ("/core/upscale-discovery", test_upscale_discovery); /* first: reads what main set up */
+  g_test_add_func ("/core/upscale-presets", test_upscale_presets);
+  g_test_add_func ("/core/upscale-targets", test_upscale_targets);
+  g_test_add_func ("/core/upscale-config", test_upscale_config);
+  g_test_add_func ("/core/upscale-resolve", test_upscale_resolve);
+  g_test_add_func ("/core/upscale-argv", test_upscale_argv);
+  g_test_add_func ("/core/upscale-estimates", test_upscale_estimates);
+  g_test_add_func ("/core/upscale-failure-messages", test_upscale_failure_messages);
+  {
+    int r = g_test_run ();
+
+    nfc_rm_rf (discovery_dir);
+    g_free ((char *) discovery_dir);
+    return r;
+  }
 }

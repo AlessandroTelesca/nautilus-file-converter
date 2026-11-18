@@ -35,7 +35,11 @@ GQuark nfc_convert_error_quark (void);
 typedef enum {
   /* the output was not smaller than NfcConvertOptions.reference_size: it has
    * been deleted, nothing was left behind. Not a failure of the conversion. */
-  NFC_CONVERT_ERROR_NOT_SMALLER = 1
+  NFC_CONVERT_ERROR_NOT_SMALLER = 1,
+  /* Upscale: the result would exceed the size limits (NFC_UPSCALE_MAX_SIDE,
+   * NFC_UPSCALE_MAX_PIXELS); nothing ran. Not a failure either (NfcResult.skipped);
+   * the message says what it would have been. */
+  NFC_CONVERT_ERROR_TOO_BIG = 2
 } NfcConvertError;
 
 #define NFC_REFERENCE_NONE   ((gint64) -1) /* keep the output whatever its size */
@@ -59,6 +63,14 @@ typedef struct {
    * nfc_resize_target; preset is ignored (Best). Add new fields below this one:
    * callers initialise the leading ones positionally. */
   const NfcResizePreset *resize;
+  /* Upscale: the preset to enlarge by (NULL: no upscale). cat is NFC_CAT_IMAGE,
+   * fmt the source format, key/ext those of nfc_upscale_target (a WEBP whose result
+   * exceeds 16383 px per side is switched to PNG by the job, once it knows the
+   * size). The job probes the size first and ends with NFC_CONVERT_ERROR_TOO_BIG
+   * when the result would exceed the limits. The job holds the (single, global)
+   * GPU slot while it runs: at most one Upscale job at a time, whichever batch it
+   * belongs to. */
+  const NfcUpscalePreset *upscale;
 } NfcConvertOptions;
 
 /* The pixel size of the source as the job's own size probe found it (the first
@@ -131,6 +143,17 @@ void nfc_batch_run_compress (NfcCategory cat, NfcPreset preset,
 void nfc_batch_run_resize (NfcCategory cat, const char *preset_key,
                            const char *const *paths, const char *const *fmts, guint n,
                            NfcBatchDone done, gpointer user_data);
+
+/* Upscale paths[i] (source format fmts[i], images; see nfc_upscale_target) with
+ * the preset (nfc_upscale_preset_from_key (preset_key)): each file becomes a copy
+ * "<name> (4x).<ext>" N times as wide and tall; files whose result would be too
+ * big are `skipped`. One file at a time (the GPU). Shows "Upscaling…", then
+ * "photo.png → photo (4x).png, 640×480 → 2560×1920" / "Upscaled 3 files 4×", plus
+ * a line for each file that was too big. An unknown preset key finishes the batch
+ * at once with every file failed. */
+void nfc_batch_run_upscale (const char *preset_key, const char *const *paths,
+                            const char *const *fmts, guint n,
+                            NfcBatchDone done, gpointer user_data);
 
 /* Module shutdown: kill the process groups of all in-flight conversions,
  * remove their work directories and hidden temp files (best effort), and

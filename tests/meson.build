@@ -32,6 +32,11 @@ test('module-load-and-menu', test_module, args: [ext], depends: [ext, nfc_decode
   timeout: 120, env: test_env)
 test('module-probe-freeze', test_module, args: [ext, 'freeze'], depends: [ext, nfc_decode],
   timeout: 120, env: test_env)
+# no Upscale item without upscayl-bin, or without its models
+test('module-no-upscayl', test_module, args: [ext, 'no-upscayl'], depends: [ext, nfc_decode],
+  timeout: 120, env: test_env)
+test('module-no-models', test_module, args: [ext, 'no-models'], depends: [ext, nfc_decode],
+  timeout: 120, env: test_env)
 test('conversions', test_conv, timeout: 1500, is_parallel: false, depends: nfc_decode,
   env: test_env)
 

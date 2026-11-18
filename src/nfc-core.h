@@ -159,6 +159,91 @@ gboolean nfc_resize_target (NfcCategory cat, const char *fmt, NfcResizeTarget *o
 /* Can a source of category/fmt be resized right now (target + tools probed). */
 gboolean nfc_resize_available (NfcCategory cat, const char *fmt);
 
+/* ---- Upscale: an AI-enlarged copy (Upscayl) ----
+ *
+ * "Upscale" > 2× / 3× / 4× / 5× / 6× / 8×: every selected image becomes a copy
+ * N times as wide and tall, named "<name> (4x).<ext>", made by the native
+ * backend of Upscayl (upscayl-bin, Real-ESRGAN on the GPU through Vulkan; see
+ * README). Offered only when upscayl-bin and its models are found
+ * (nfc_tools.upscayl) and only for images ImageMagick or the decoder can read,
+ * never for SVG (vector) or ICO.
+ *
+ * One pass is `upscayl-bin -s N`: the 4x model enlarges 4x and the backend
+ * resizes that to N (2x and 3x measured as good as, and simpler than, a 4x pass
+ * Lanczos-shrunk by ImageMagick). Bigger factors chain passes, the second one on
+ * the output of the first: 6x = 3x then 2x, 8x = 4x then 2x; 5x has no integer
+ * product, so it is made as 6x and Lanczos-shrunk by 5/6 (sharper than one 4x
+ * pass stretched by 1.25: see README). The sizes are exact (width x factor).
+ *
+ * The output keeps the source format when that is JPG, PNG or WEBP, with the Best
+ * settings of the format (alpha is kept; JPG is flattened onto white); anything
+ * else (AVIF, HEIC, BMP, TIFF, GIF first frame) becomes PNG; a WEBP that would
+ * exceed WebP's 16383 px per side becomes PNG. */
+
+typedef struct {
+  const char *key;    /* menu item name part and CLI key: "4x" */
+  const char *label;  /* menu label: "4×" */
+  guint       factor; /* output size / input size */
+  guint       pass[2]; /* the `upscayl-bin -s` values, pass[1] == 0: a single pass */
+} NfcUpscalePreset;
+
+/* An upscale never makes an image beyond this: per side and in pixels (the
+ * entry is hidden for a selection it would exceed, the job is skipped). */
+#define NFC_UPSCALE_MAX_SIDE   32768
+#define NFC_UPSCALE_MAX_PIXELS ((guint64) 400 * 1000 * 1000)
+
+/* The presets in menu order (2x, 3x, 4x, 5x, 6x, 8x). Static table. */
+const NfcUpscalePreset *nfc_upscale_presets (guint *n);
+const NfcUpscalePreset *nfc_upscale_preset_from_key (const char *key);
+/* The size of the picture the passes make (the product of the -s values; 6x for
+ * the 5x preset, which is then shrunk). */
+guint                   nfc_upscale_chain_factor (const NfcUpscalePreset *p);
+
+/* The size a w x h source gets (width x factor). TRUE only when it is within the
+ * limits above; FALSE when too big or when the size is unknown (0). ow/oh may be
+ * NULL; they are set (also when FALSE, if the size is known) to the exact size. */
+gboolean nfc_upscale_output_size (const NfcUpscalePreset *p, guint64 w, guint64 h,
+                                  guint64 *ow, guint64 *oh);
+/* Menu tooltip: "AI-upscale to 2560 × 1920 px" when the size (0: unknown) is known
+ * and fits, "too big" when it does not, else what the preset means. g_free. */
+char *nfc_upscale_tooltip (const NfcUpscalePreset *p, guint64 w, guint64 h);
+
+typedef struct {
+  const char *key;   /* output format key: "png", "jpg", "webp" */
+  const char *ext;
+  gboolean    capped; /* WEBP source whose result exceeds 16383 px: PNG instead */
+} NfcUpscaleTarget;
+
+/* The output format of a source of canonical format fmt (category must be image;
+ * FALSE for SVG, ICO, everything that is no image). ow/oh: the output size, 0 if
+ * unknown (no WEBP cap). Static table: says nothing about the installed tools. */
+gboolean nfc_upscale_target (NfcCategory cat, const char *fmt, guint64 ow, guint64 oh,
+                             NfcUpscaleTarget *out);
+/* Can a source of category/fmt be upscaled right now: backend and model found,
+ * target and decoder available (probes finished). */
+gboolean nfc_upscale_available (NfcCategory cat, const char *fmt);
+
+/* The model of upscale-model=<name> in the text of a configuration file (lines
+ * "key=value", "#" comments, blanks trimmed; the last upscale-model line wins), or
+ * NULL if there is none. g_free. */
+char    *nfc_upscale_config_model (const char *text);
+/* Resolve the backend of the upscayl-bin at `bin`: its models directory
+ * (<bindir>/../models) and the model to use: upscale-model of the configuration
+ * file config_path (may be NULL or missing) if both its .param and .bin files exist
+ * there (else logged, and the default), else "upscayl-standard-4x" if present.
+ * FALSE if neither exists. *models and *model are g_free'd. */
+gboolean nfc_upscale_resolve (const char *bin, const char *config_path,
+                              char **models, char **model);
+#define NFC_UPSCALE_DEFAULT_MODEL "upscayl-standard-4x"
+
+/* Estimated peak memory (bytes) of upscaling a w x h source to preset p with
+ * output format key: the picture the passes make (nfc_estimate_peak_bytes of it)
+ * plus 1 GiB for the backend itself. */
+guint64  nfc_upscale_peak_bytes (const NfcUpscalePreset *p, guint64 w, guint64 h, const char *key);
+/* Timeout of one step of an upscale job with this output size: 120 s plus 4 s per
+ * output megapixel, at most 2 h. */
+guint    nfc_upscale_timeout_secs (guint64 ow, guint64 oh);
+
 /* Result of classifying a file. fmt is a static canonical key ("jpg", "heic"). */
 typedef struct {
   NfcCategory cat;
@@ -172,6 +257,9 @@ typedef struct {
   char *notify;
   char *decode; /* nfc-decode helper (HEIC/AVIF decode, GdkPixbuf format list) */
   char *ffprobe; /* video size probe for the H.264 bitrate; optional */
+  char *upscayl; /* upscayl-bin, the Upscale backend; NULL: no Upscale entry */
+  char *upscale_models; /* its models directory (<bindir>/../models) */
+  char *upscale_model;  /* the model used: upscale-model of the config file, or the default */
 } NfcTools;
 
 /* Global tool paths; resolved by nfc_tools_init(). Tests may overwrite. */
@@ -257,6 +345,10 @@ typedef struct {
    * least one selected file smaller (a file of unknown size counts); NULL or
    * empty when "Resize" is not offered. */
   GPtrArray  *resize;
+  /* Upscale presets (const NfcUpscalePreset *, static, in menu order) whose
+   * result fits the limits for every selected file (a file of unknown size counts);
+   * NULL or empty when "Upscale" is not offered. */
+  GPtrArray  *upscale;
 } NfcSelection;
 
 /* Selections with more files than this are not given sizes (the menu must stay
@@ -366,6 +458,23 @@ GPtrArray *nfc_build_attempts_resize (NfcCategory cat, const char *fmt, const ch
                                       const NfcResizePreset *rs, const char *src,
                                       const char *out, const char *workdir,
                                       const NfcImageInfo *info, gboolean *needs_decode);
+
+/* The commands of an Upscale job: one attempt of these steps, run in order:
+ *   1. a PNG the backend can read, <workdir>/in.png: `nfc-decode` for HEIC/AVIF
+ *      (decoded.png, orientation applied), else ImageMagick `-auto-orient` of the
+ *      first frame (the backend reads neither TIFF, BMP nor GIF, applies no EXIF
+ *      orientation and stumbles over CMYK and 16-bit files);
+ *   2. `upscayl-bin -i in -o up1.png -m <models> -n <model> -s p->pass[0] -f png`,
+ *      and, for the chained presets, a second one on up1.png writing up2.png;
+ *   3. ImageMagick: the last PNG to `out` as `key` ("png", "jpg", "webp"; the Best
+ *      settings of that format as in a conversion; the 5x preset first shrinks the
+ *      6x picture by 5/6, Lanczos), alpha kept.
+ * The commands never fall back to anything else (a single attempt). *needs_decode
+ * is set for HEIC/AVIF. NULL if a tool (upscayl-bin, its models, ImageMagick, the
+ * decoder) is missing or fmt/key are not an upscale source/target. */
+GPtrArray *nfc_build_attempts_upscale (const char *fmt, const char *key, const NfcUpscalePreset *p,
+                                       const char *src, const char *out, const char *workdir,
+                                       gboolean *needs_decode);
 
 /* dpi that makes a w x h pixel image fit an A4 page (landscape for a wide
  * image), never below 96 and never resampling; whole number. */

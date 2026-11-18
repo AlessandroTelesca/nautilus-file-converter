@@ -5,6 +5,8 @@
 #include <glib/gstdio.h>
 #include <string.h>
 
+#include "nfc-header.h"
+
 /* -------------------------------------------------------------------------
  * Helpers
  * ---------------------------------------------------------------------- */
@@ -48,7 +50,8 @@ join_argv (char **argv)
  *
  * Per step (one tool invocation): images 600 s, audio and documents 1800 s,
  * video 1800 s plus 60 s per 100 MiB of input, capped at 4 h (a long film
- * re-encode legitimately takes hours; a hung tool is killed eventually).
+ * re-encode legitimately takes hours; a hung tool is killed eventually); an
+ * Upscale step 120 s plus 4 s per output megapixel, capped at 2 h.
  * NFC_TEST_TIMEOUT_SECS overrides all of them (tests only, honoured only when
  * set to a positive number).
  * ---------------------------------------------------------------------- */
@@ -58,7 +61,7 @@ join_argv (char **argv)
 #define TIMEOUT_VIDEO_CAP_SECS (4 * 3600)
 
 static guint
-timeout_secs (NfcCategory cat, gint64 input_bytes)
+timeout_secs (NfcCategory cat, gint64 input_bytes, guint upscale_secs)
 {
   const char *e = g_getenv ("NFC_TEST_TIMEOUT_SECS");
   guint64 v = (e != NULL && *e != '\0') ? g_ascii_strtoull (e, NULL, 10) : 0;
@@ -66,6 +69,8 @@ timeout_secs (NfcCategory cat, gint64 input_bytes)
 
   if (v > 0 && v < G_MAXUINT)
     return (guint) v;
+  if (upscale_secs > 0) /* Upscale: by output size, see nfc_upscale_timeout_secs */
+    return upscale_secs;
   if (cat == NFC_CAT_IMAGE)
     return TIMEOUT_IMAGE_SECS;
   if (cat == NFC_CAT_VIDEO)
@@ -87,6 +92,8 @@ typedef struct {
   gint64 ref_size;        /* keep the output only if smaller than this (-1: always keep) */
   NfcPreset preset;
   const NfcResizePreset *resize; /* Resize job: static preset, NULL otherwise */
+  const NfcUpscalePreset *upscale; /* Upscale job: static preset, NULL otherwise */
+  guint64 out_w, out_h;   /* Upscale: the size of the result, once probed */
   char *workdir, *produced, *hidden;
   gint64 src_size;
   GPtrArray *attempts;
@@ -265,6 +272,29 @@ job_skip_resize (Job *j)
                                : g_strdup_printf ("already smaller than %s", j->resize->name);
   g_task_return_new_error (task, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER, "%s", msg);
   g_free (msg);
+  j->task = NULL;
+  job_free (j);
+  g_object_unref (task);
+}
+
+/* An Upscale job whose result (ow x oh) would exceed the size limits: ends before
+ * any tool runs, with NFC_CONVERT_ERROR_TOO_BIG, no output, no temporary file */
+static void
+job_skip_upscale (Job *j, guint64 ow, guint64 oh)
+{
+  GTask *task = j->task;
+
+  nfc_log ("SKIP %s -> %s (%s): the result, %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT
+           ", would exceed %d px per side or %" G_GUINT64_FORMAT " pixels",
+           j->src, j->key, j->upscale->key, ow, oh, NFC_UPSCALE_MAX_SIDE,
+           (guint64) NFC_UPSCALE_MAX_PIXELS);
+  job_cleanup_files (j);
+  task_keep_dims (j);
+  g_task_return_new_error (task, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_TOO_BIG,
+                           "too big to upscale %s (%" G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT
+                           " px; the limit is %d px per side or %d megapixels)",
+                           j->upscale->label, ow, oh, NFC_UPSCALE_MAX_SIDE,
+                           (int) (NFC_UPSCALE_MAX_PIXELS / 1000000));
   j->task = NULL;
   job_free (j);
   g_object_unref (task);
@@ -542,6 +572,27 @@ step_leader_alive (Job *j)
   return j->proc != NULL && j->pgid > 1 && g_subprocess_get_identifier (j->proc) != NULL;
 }
 
+/* what a killed step is called in the failure message */
+static const char *
+timed_out_text (const Job *j)
+{
+  return j->upscale != NULL ? "timed out (the GPU may be busy or too slow)" : "timed out";
+}
+
+/* The value after "-o" of an upscayl-bin step (its output file), NULL for any
+ * other step. upscayl-bin exits 0 after most of its failures (unreadable input,
+ * missing model): the only sign is that it wrote nothing. */
+static const char *
+upscayl_output (const Job *j, char **argv)
+{
+  if (j->upscale == NULL || nfc_tools.upscayl == NULL || !g_str_equal (argv[0], nfc_tools.upscayl))
+    return NULL;
+  for (guint i = 1; argv[i] != NULL && argv[i + 1] != NULL; i++)
+    if (g_str_equal (argv[i], "-o"))
+      return argv[i + 1];
+  return NULL;
+}
+
 static void
 step_finished (StepIO *io)
 {
@@ -563,7 +614,7 @@ step_finished (StepIO *io)
       gboolean final = j->timed_out || j->aborted;
       const char *why = io->io_error != NULL ? io->io_error : "Operation was cancelled";
 
-      msg = g_strdup (j->timed_out ? "timed out" : j->aborted ? "cancelled" : why);
+      msg = g_strdup (j->timed_out ? timed_out_text (j) : j->aborted ? "cancelled" : why);
       nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  %s", j->src, j->key,
                j->timed_out ? "timeout" : j->aborted ? "cancelled" : "I/O error", cmd, why);
       /* a timeout or shutdown already killed the group while the leader was
@@ -603,7 +654,7 @@ step_finished (StepIO *io)
         if (msg != NULL)
           final = TRUE; /* no other attempt can find audio that is not there */
         else if (j->timed_out)
-          msg = g_strdup ("timed out");
+          msg = g_strdup (timed_out_text (j));
         else
           msg = nfc_failure_message (se, j->fmt);
         if (msg == NULL)
@@ -627,6 +678,33 @@ step_finished (StepIO *io)
         g_free (msg);
         return;
       }
+    {
+      /* upscayl-bin said 0 but wrote nothing: say why, from what it printed */
+      const char *up_out = upscayl_output (j, argv);
+      GStatBuf st;
+
+      if (up_out != NULL && !(g_stat (up_out, &st) == 0 && S_ISREG (st.st_mode) && st.st_size > 0))
+        {
+          char *cmd = join_argv (argv);
+          char *se = tail_text (&io->tail[1], STEP_KEEP_BYTES, FALSE);
+          char *log_se = tail_text (&io->tail[1], LOG_ERR_BYTES, TRUE);
+
+          msg = nfc_failure_message (se, j->fmt);
+          if (msg == NULL)
+            msg = g_strdup ("the Upscale backend produced no image");
+          nfc_log ("FAIL %s -> %s (no output)\n  cmd: %s\n  stderr:\n%s", j->src, j->key, cmd,
+                   log_se);
+          g_free (cmd);
+          g_free (se);
+          g_free (log_se);
+          g_byte_array_unref (io->tail[0].data);
+          g_byte_array_unref (io->tail[1].data);
+          g_free (io);
+          attempt_failed (j, msg);
+          g_free (msg);
+          return;
+        }
+    }
   }
   g_byte_array_unref (io->tail[0].data);
   g_byte_array_unref (io->tail[1].data);
@@ -753,7 +831,10 @@ run_step (Job *j)
   j->pgid = nfc_subprocess_pgid (j->proc);
   g_clear_object (&j->cancel);
   j->cancel = g_cancellable_new ();
-  j->timeout_id = g_timeout_add_seconds (timeout_secs (j->cat, j->src_size),
+  j->timeout_id = g_timeout_add_seconds (timeout_secs (j->cat, j->src_size,
+                                                       j->upscale != NULL
+                                                         ? nfc_upscale_timeout_secs (j->out_w, j->out_h)
+                                                         : 0),
                                          step_timeout, j);
   step_start_io (j);
 }
@@ -781,6 +862,7 @@ run_step (Job *j)
 static GQueue admit_queue = G_QUEUE_INIT; /* Job *, FIFO, jobs with queued == TRUE */
 static guint64 reserved_bytes = 0;        /* sum of est over reserved jobs */
 static guint n_reserved = 0;
+static guint n_gpu = 0;                   /* running Upscale jobs: at most one (the GPU slot) */
 static guint pump_idle_id = 0, pump_timer_id = 0;
 
 static void admission_pump (void);
@@ -807,6 +889,8 @@ admission_reserve (Job *j)
   j->reserved = TRUE;
   reserved_bytes += j->est;
   n_reserved++;
+  if (j->upscale != NULL)
+    n_gpu++;
 }
 
 static void
@@ -817,6 +901,8 @@ admission_release (Job *j)
   j->reserved = FALSE;
   reserved_bytes -= MIN (reserved_bytes, j->est);
   n_reserved--;
+  if (j->upscale != NULL)
+    n_gpu--;
   /* a freed reservation may let a waiting job start; not from inside the
    * callback chain of the job that just ended */
   if (!g_queue_is_empty (&admit_queue) && pump_idle_id == 0)
@@ -843,14 +929,28 @@ admission_pump (void)
   budget = nfc_admission_budget_bytes ();
   while (!g_queue_is_empty (&admit_queue) && !shutting_down)
     {
-      Job *j = g_queue_peek_head (&admit_queue);
+      Job *pick = NULL;
 
-      if (!nfc_admission_allows (j->pixels, j->est, reserved_bytes, n_reserved, budget))
+      /* FIFO, except that an Upscale job waiting for the GPU slot does not hold
+       * up the jobs behind it; a job that does not fit in memory does (it would
+       * starve otherwise). Scanned afresh each time: job_start may end its job at
+       * once and, through its callback, queue new ones. */
+      for (GList *l = admit_queue.head; l != NULL; l = l->next)
+        {
+          Job *j = l->data;
+
+          if (j->upscale != NULL && n_gpu > 0)
+            continue;
+          if (nfc_admission_allows (j->pixels, j->est, reserved_bytes, n_reserved, budget))
+            pick = j;
+          break;
+        }
+      if (pick == NULL)
         break;
-      g_queue_pop_head (&admit_queue);
-      j->queued = FALSE;
-      admission_reserve (j);
-      job_start (j); /* may end the job at once: that only schedules a pump */
+      g_queue_remove (&admit_queue, pick);
+      pick->queued = FALSE;
+      admission_reserve (pick);
+      job_start (pick); /* may end the job at once: that only schedules a pump */
     }
   if (!g_queue_is_empty (&admit_queue) && pump_timer_id == 0)
     pump_timer_id = g_timeout_add_seconds (PUMP_RETRY_SECS, pump_timer_cb, NULL);
@@ -862,6 +962,20 @@ admission_submit (Job *j)
 {
   NfcImageInfo *info = j->have_info ? &j->info : NULL;
 
+  if (j->upscale != NULL)
+    {
+      /* always queued: the GPU is one resource; the memory is the picture the
+       * passes make, and its pixels (not the source's) decide where the work
+       * directory goes and whether the job may be held back */
+      guint f = nfc_upscale_chain_factor (j->upscale);
+
+      j->est = nfc_upscale_peak_bytes (j->upscale, j->info.width, j->info.height, j->key);
+      j->pixels = j->info.width * f * j->info.height * f;
+      j->queued = TRUE;
+      g_queue_push_tail (&admit_queue, j);
+      admission_pump ();
+      return;
+    }
   j->est = nfc_estimate_peak_bytes (j->fmt, j->key, info);
   j->pixels = info != NULL ? info->width * info->height : 0;
   if (j->fmt != NULL && g_str_equal (j->fmt, "svg"))
@@ -883,6 +997,34 @@ admission_submit (Job *j)
 static void
 probe_finished (Job *j)
 {
+  /* Upscale: the result must fit the limits; a WEBP too big for WebP becomes PNG */
+  if (j->upscale != NULL)
+    {
+      guint64 ow, oh;
+      NfcUpscaleTarget t;
+
+      if (!j->have_info)
+        {
+          job_fail (j, "cannot read the size of the image");
+          return;
+        }
+      if (!nfc_upscale_output_size (j->upscale, j->info.width, j->info.height, &ow, &oh))
+        {
+          job_skip_upscale (j, ow, oh);
+          return;
+        }
+      j->out_w = ow;
+      j->out_h = oh;
+      if (nfc_upscale_target (j->cat, j->fmt, ow, oh, &t))
+        {
+          g_free (j->key);
+          g_free (j->ext);
+          j->key = g_strdup (t.key);
+          j->ext = g_strdup (t.ext);
+        }
+      admission_submit (j);
+      return;
+    }
   /* Resize: the preset must make the picture smaller, else there is nothing to do */
   if (j->resize != NULL && j->have_info &&
       !nfc_resize_output_size (j->resize, j->info.width, j->info.height, NULL, NULL))
@@ -1031,7 +1173,10 @@ job_start (Job *j)
       j->produced = g_strdup (j->hidden);
     }
   /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
-  if (j->resize != NULL)
+  if (j->upscale != NULL)
+    j->attempts = nfc_build_attempts_upscale (j->fmt, j->key, j->upscale, j->src, j->produced,
+                                              j->workdir, NULL);
+  else if (j->resize != NULL)
     j->attempts = nfc_build_attempts_resize (j->cat, j->fmt, j->key, j->resize, j->src,
                                              j->produced, j->workdir,
                                              j->have_info ? &j->info : NULL, NULL);
@@ -1060,7 +1205,7 @@ nfc_convert_file_preset_async (NfcCategory cat, const char *fmt, const char *key
                                NfcPreset preset, const char *ext, const char *src_in,
                                GAsyncReadyCallback callback, gpointer user_data)
 {
-  NfcConvertOptions opts = { preset, NULL, NFC_REFERENCE_NONE, NULL };
+  NfcConvertOptions opts = { preset, NULL, NFC_REFERENCE_NONE, NULL, NULL };
 
   nfc_convert_file_opts_async (cat, fmt, key, ext, src_in, &opts, callback, user_data);
 }
@@ -1089,6 +1234,7 @@ nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
   if (opts != NULL)
     {
       j->resize = opts->resize;
+      j->upscale = opts->upscale;
       if (opts->name_suffix != NULL && *opts->name_suffix != '\0')
         {
           /* a file name is at most 255 bytes: the suffix, the extension and a
@@ -1320,6 +1466,7 @@ typedef struct {
   NfcPreset preset;
   gboolean compress;      /* nfc_batch_run_compress: key/ext/cat are per file */
   const NfcResizePreset *resize; /* nfc_batch_run_resize: key/ext/cat are per file */
+  const NfcUpscalePreset *upscale; /* nfc_batch_run_upscale: key/ext are per file */
   guint n, next, running, finished, max_workers;
   char **paths, **fmts;
   GPtrArray *results;
@@ -1508,6 +1655,120 @@ resize_message (Batch *b, GString *body, const char **icon)
   return "Nothing to resize";
 }
 
+/* The extension of a path, lower case, as a format key ("png", "jpg", "webp") */
+static char *
+path_format_key (const char *path)
+{
+  const char *dot = strrchr (path, '.');
+  char *k;
+
+  if (dot == NULL)
+    return g_strdup ("");
+  k = g_ascii_strdown (dot + 1, -1);
+  if (g_str_equal (k, "jpeg"))
+    {
+      g_free (k);
+      return g_strdup ("jpg");
+    }
+  return k;
+}
+
+/* The notification of an upscale batch: what was made (with the sizes for one
+ * file), what was too big, what failed. Returns the title; body is filled; *icon
+ * is static. The sizes are those of the output file itself (its header), which
+ * knows the EXIF rotation the size probe of the source does not. */
+static const char *
+upscale_message (Batch *b, GString *body, const char **icon)
+{
+  const NfcUpscalePreset *p = b->upscale;
+  guint good = 0, skipped = 0, bad = 0;
+
+  for (guint i = 0; i < b->n; i++)
+    {
+      NfcResult *r = b->results->pdata[i];
+
+      if (r->ok)
+        good++;
+      else if (r->skipped)
+        skipped++;
+      else
+        bad++;
+    }
+  if (good == 1)
+    for (guint i = 0; i < b->n; i++)
+      {
+        NfcResult *r = b->results->pdata[i];
+        char *from, *to, *fmt;
+        guint32 ow = 0, oh = 0;
+        gboolean capped = FALSE;
+
+        if (!r->ok)
+          continue;
+        from = g_path_get_basename (r->path);
+        to = g_path_get_basename (r->output);
+        g_string_append_printf (body, "%s → %s", from, to);
+        fmt = path_format_key (r->output);
+        if (!nfc_header_read_file (r->output, fmt, &ow, &oh))
+          ow = oh = 0; /* no header found: the size the probe saw, below */
+        if (ow > 0 && ow % p->factor == 0 && oh % p->factor == 0)
+          g_string_append_printf (body, ", %u×%u → %u×%u", ow / p->factor, oh / p->factor, ow, oh);
+        else if (r->src_w > 0)
+          {
+            guint64 sw, sh;
+
+            nfc_upscale_output_size (p, r->src_w, r->src_h, &sw, &sh);
+            g_string_append_printf (body, ", %" G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT " → %"
+                                    G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT,
+                                    r->src_w, r->src_h, sw, sh);
+          }
+        capped = g_str_equal (b->fmts[i], "webp") && g_str_equal (fmt, "png");
+        if (capped)
+          g_string_append (body, " (saved as PNG: WEBP is limited to 16383 px)");
+        g_free (from);
+        g_free (to);
+        g_free (fmt);
+      }
+  else if (good > 1 && good == b->n)
+    g_string_append_printf (body, "Upscaled %u files %s", good, p->label);
+  else if (good > 1)
+    g_string_append_printf (body, "Upscaled %u of %u files %s", good, b->n, p->label);
+
+  if (skipped == 1)
+    for (guint i = 0; i < b->n; i++)
+      {
+        NfcResult *r = b->results->pdata[i];
+
+        if (r->skipped)
+          {
+            char *base = g_path_get_basename (r->path);
+
+            if (body->len)
+              g_string_append_c (body, '\n');
+            g_string_append_printf (body, "%s is %s", base, r->error);
+            g_free (base);
+          }
+      }
+  else if (skipped > 1)
+    {
+      if (body->len)
+        g_string_append_c (body, '\n');
+      g_string_append_printf (body, "%u files are too big to upscale %s", skipped, p->label);
+    }
+  append_failures (b, body);
+  if (bad > 0)
+    {
+      *icon = "dialog-error-symbolic";
+      return "Upscale failed";
+    }
+  if (good > 0)
+    {
+      *icon = "object-select-symbolic";
+      return "Upscale complete";
+    }
+  *icon = "dialog-information-symbolic";
+  return "Nothing to upscale";
+}
+
 /* The notification of a compress batch: what was made, what was already as small
  * as it gets, what failed. Returns the title; body is filled; *icon is static. */
 static const char *
@@ -1620,7 +1881,14 @@ batch_finish (Batch *b)
     if (((NfcResult *) b->results->pdata[i])->ok)
       good++;
 
-  if (b->resize != NULL)
+  if (b->upscale != NULL)
+    {
+      const char *icon;
+      const char *title = upscale_message (b, body, &icon);
+
+      notifier_send (b->notifier, title, body->str, icon, "normal");
+    }
+  else if (b->resize != NULL)
     {
       const char *icon;
       const char *title = resize_message (b, body, &icon);
@@ -1718,8 +1986,9 @@ batch_item_complete (BatchItem *it, char *output, const GError *error)
   if (!r->ok)
     {
       r->error = g_strdup (error ? error->message : "conversion failed");
-      r->skipped = error != NULL && g_error_matches (error, NFC_CONVERT_ERROR,
-                                                     NFC_CONVERT_ERROR_NOT_SMALLER);
+      r->skipped = error != NULL &&
+                   (g_error_matches (error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER) ||
+                    g_error_matches (error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_TOO_BIG));
     }
   if (b->compress)
     {
@@ -1759,9 +2028,11 @@ batch_item_unsupported (gpointer data)
 {
   BatchItem *it = data;
   GError *error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                                       it->batch->resize != NULL
-                                         ? "this format cannot be resized"
-                                         : "this format cannot be compressed");
+                                       it->batch->upscale != NULL
+                                         ? "this format cannot be upscaled"
+                                         : it->batch->resize != NULL
+                                           ? "this format cannot be resized"
+                                           : "this format cannot be compressed");
 
   batch_item_complete (data, NULL, error);
   g_error_free (error);
@@ -1778,11 +2049,27 @@ batch_pump (Batch *b)
       it->batch = b;
       it->index = b->next++;
       b->running++;
+      if (b->upscale != NULL)
+        {
+          NfcUpscaleTarget ut;
+          char *suffix = g_strdup_printf (" (%s)", b->upscale->key);
+          NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, NULL, b->upscale };
+
+          /* the key/ext are the nominal ones: the job switches a WEBP that WebP
+           * cannot hold to PNG once it knows the size */
+          if (!nfc_upscale_target (b->cat, b->fmts[it->index], 0, 0, &ut))
+            g_idle_add (batch_item_unsupported, it);
+          else
+            nfc_convert_file_opts_async (b->cat, b->fmts[it->index], ut.key, ut.ext,
+                                         b->paths[it->index], &o, batch_item_done, it);
+          g_free (suffix); /* copied by the job */
+          continue;
+        }
       if (b->resize != NULL)
         {
           NfcResizeTarget rt;
           char *suffix = g_strdup_printf (" (%s)", b->resize->name);
-          NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, b->resize };
+          NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, b->resize, NULL };
 
           if (!nfc_resize_target (b->cat, b->fmts[it->index], &rt))
             g_idle_add (batch_item_unsupported, it);
@@ -1795,7 +2082,7 @@ batch_pump (Batch *b)
       if (b->compress)
         {
           NfcCompressTarget ct;
-          NfcConvertOptions o = { b->preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL };
+          NfcConvertOptions o = { b->preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL, NULL };
 
           if (!nfc_compress_target (b->cat, b->fmts[it->index], &ct))
             {
@@ -1820,7 +2107,8 @@ nfc_batch_run (NfcCategory cat, const char *key, const char *label, const char *
 }
 
 static void
-batch_start (gboolean compress, const NfcResizePreset *resize, NfcCategory cat,
+batch_start (gboolean compress, const NfcResizePreset *resize, const NfcUpscalePreset *upscale,
+             NfcCategory cat,
              const char *key, NfcPreset preset,
              const char *label, const char *ext, const char *const *paths,
              const char *const *fmts, guint n, NfcBatchDone done, gpointer user_data)
@@ -1849,6 +2137,7 @@ batch_start (gboolean compress, const NfcResizePreset *resize, NfcCategory cat,
     *sp = '\0';
   b->compress = compress;
   b->resize = resize;
+  b->upscale = upscale;
   b->preset = ((guint) preset < NFC_PRESET_N && (compress || nfc_target_has_presets (cat, key)))
                 ? preset : NFC_PRESET_BEST;
   b->suffix = b->preset == NFC_PRESET_BEST ? g_strdup ("")
@@ -1872,7 +2161,7 @@ batch_start (gboolean compress, const NfcResizePreset *resize, NfcCategory cat,
       r->path = g_strdup (paths[i]);
       g_ptr_array_add (b->results, r);
     }
-  b->max_workers = workers_for (cat, n);
+  b->max_workers = upscale != NULL ? 1 : workers_for (cat, n); /* the GPU takes one at a time */
   b->done = done;
   b->user_data = user_data;
 
@@ -1885,12 +2174,14 @@ batch_start (gboolean compress, const NfcResizePreset *resize, NfcCategory cat,
   else
     what = g_strdup_printf ("%u files", n);
   {
-    char *body = resize != NULL ? (n == 1 ? g_strdup_printf ("%s (%s)", what, resize->name)
-                                          : g_strdup_printf ("%s to %s", what, resize->name))
+    char *body = upscale != NULL ? g_strdup_printf ("%s (%s)", what, upscale->label)
+                 : resize != NULL ? (n == 1 ? g_strdup_printf ("%s (%s)", what, resize->name)
+                                            : g_strdup_printf ("%s to %s", what, resize->name))
                  : compress ? g_strdup_printf ("%s%s", what, b->suffix)
                             : g_strdup_printf ("%s to %s", what, b->short_label);
 
-    notifier_send (b->notifier, resize != NULL ? "Resizing…" : compress ? "Compressing…" : "Converting…",
+    notifier_send (b->notifier, upscale != NULL ? "Upscaling…" : resize != NULL ? "Resizing…"
+                                : compress ? "Compressing…" : "Converting…",
                    body, "view-refresh-symbolic", "normal");
     g_free (body);
   }
@@ -1903,7 +2194,7 @@ nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset, const 
                       const char *ext, const char *const *paths, const char *const *fmts,
                       guint n, NfcBatchDone done, gpointer user_data)
 {
-  batch_start (FALSE, NULL, cat, key, preset, label, ext, paths, fmts, n, done, user_data);
+  batch_start (FALSE, NULL, NULL, cat, key, preset, label, ext, paths, fmts, n, done, user_data);
 }
 
 void
@@ -1911,7 +2202,7 @@ nfc_batch_run_compress (NfcCategory cat, NfcPreset preset, const char *const *pa
                         const char *const *fmts, guint n, NfcBatchDone done,
                         gpointer user_data)
 {
-  batch_start (TRUE, NULL, cat, "", preset, "Compress", "", paths, fmts, n, done, user_data);
+  batch_start (TRUE, NULL, NULL, cat, "", preset, "Compress", "", paths, fmts, n, done, user_data);
 }
 
 void
@@ -1938,5 +2229,33 @@ nfc_batch_run_resize (NfcCategory cat, const char *preset_key, const char *const
       g_ptr_array_unref (results);
       return;
     }
-  batch_start (FALSE, p, cat, "", NFC_PRESET_BEST, "Resize", "", paths, fmts, n, done, user_data);
+  batch_start (FALSE, p, NULL, cat, "", NFC_PRESET_BEST, "Resize", "", paths, fmts, n, done, user_data);
+}
+
+void
+nfc_batch_run_upscale (const char *preset_key, const char *const *paths, const char *const *fmts,
+                       guint n, NfcBatchDone done, gpointer user_data)
+{
+  const NfcUpscalePreset *p = nfc_upscale_preset_from_key (preset_key);
+
+  if (p == NULL)
+    {
+      /* nothing to run: every file failed */
+      GPtrArray *results = g_ptr_array_new_with_free_func ((GDestroyNotify) result_free);
+
+      for (guint i = 0; i < n && paths != NULL; i++)
+        {
+          NfcResult *r = g_new0 (NfcResult, 1);
+
+          r->path = g_strdup (paths[i]);
+          r->error = g_strdup ("unknown upscale preset");
+          g_ptr_array_add (results, r);
+        }
+      if (done != NULL)
+        done (results, user_data);
+      g_ptr_array_unref (results);
+      return;
+    }
+  batch_start (FALSE, NULL, p, NFC_CAT_IMAGE, "", NFC_PRESET_BEST, "Upscale", "", paths, fmts, n,
+               done, user_data);
 }

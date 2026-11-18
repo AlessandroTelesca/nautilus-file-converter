@@ -11,6 +11,7 @@
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1369,7 +1370,7 @@ compress_sync (NfcCategory cat, const char *fmt, NfcPreset preset, const char *s
                gboolean *skipped, char **err)
 {
   NfcCompressTarget t;
-  NfcConvertOptions o = { preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL };
+  NfcConvertOptions o = { preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL, NULL };
   Wait w = { g_main_loop_new (NULL, FALSE), NULL, NULL };
   char *out;
 
@@ -1579,7 +1580,7 @@ test_keep_smaller (const char *dir)
     }
 
   /* the general mechanism: an explicit reference size, no name suffix */
-  opts = (NfcConvertOptions) { NFC_PRESET_BEST, NULL, 1, NULL };
+  opts = (NfcConvertOptions) { NFC_PRESET_BEST, NULL, 1, NULL, NULL };
   w = (Wait) { g_main_loop_new (NULL, FALSE), NULL, NULL };
   nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", gfx, &opts, on_done, &w);
   g_main_loop_run (w.loop);
@@ -2016,7 +2017,7 @@ resize_sync (NfcCategory cat, const char *fmt, const char *rs_key, const char *s
   NfcResizeTarget t;
   const NfcResizePreset *rs = nfc_resize_preset_from_key (cat, rs_key);
   char *suffix = rs != NULL ? g_strdup_printf (" (%s)", rs->name) : NULL;
-  NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, rs };
+  NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, rs, NULL };
   ResizeWait w = { g_main_loop_new (NULL, FALSE), NULL, NULL, 0, 0 };
   char *out;
 
@@ -2629,6 +2630,694 @@ test_resize (void)
   g_free (dir);
 }
 
+/* ---- Upscale ----
+ *
+ * Real runs of Upscayl's backend on tiny pictures (the GPU is shared with the desktop:
+ * nothing here is bigger than 128 x 96, and no output above 512 x 384, except the
+ * one 4200 x 4 strip of the WEBP-cap check), gated on a working backend: no
+ * upscayl-bin, no models, no Vulkan device (NFC_TEST_SKIP_GPU=1 skips them too) means
+ * the rows say SKIPPED. The failure messages, the timeout and the one-job-at-a-time
+ * rule are tested with a fake upscayl-bin and always run. */
+
+typedef struct {
+  GMainLoop *loop;
+  char *out;
+  GError *error;
+  guint pending;
+} UpWait;
+
+static void
+up_on_done (GObject *o, GAsyncResult *res, gpointer data)
+{
+  UpWait *w = data;
+
+  (void) o;
+  /* the loop ends with the last of `pending` jobs; the result kept is the last one's */
+  g_free (w->out);
+  g_clear_error (&w->error);
+  w->out = nfc_convert_file_finish (res, &w->error);
+  if (--w->pending == 0)
+    g_main_loop_quit (w->loop);
+}
+
+/* what the batch does for one file: the nominal target, the name suffix, the preset.
+ * *skipped: the result would be too big (nothing made). */
+static char *
+upscale_sync (const char *fmt, const char *up_key, const char *src, gboolean *skipped, char **err)
+{
+  NfcUpscaleTarget t;
+  const NfcUpscalePreset *p = nfc_upscale_preset_from_key (up_key);
+  char *suffix = p != NULL ? g_strdup_printf (" (%s)", p->key) : NULL;
+  NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, NULL, p };
+  UpWait w = { g_main_loop_new (NULL, FALSE), NULL, NULL, 1 };
+  char *out;
+
+  *skipped = FALSE;
+  if (err != NULL)
+    *err = NULL;
+  if (p == NULL || !nfc_upscale_target (NFC_CAT_IMAGE, fmt, 0, 0, &t))
+    {
+      g_main_loop_unref (w.loop);
+      g_free (suffix);
+      if (err != NULL)
+        *err = g_strdup ("not upscalable");
+      return NULL;
+    }
+  nfc_convert_file_opts_async (NFC_CAT_IMAGE, fmt, t.key, t.ext, src, &o, up_on_done, &w);
+  g_main_loop_run (w.loop);
+  g_main_loop_unref (w.loop);
+  g_free (suffix);
+  out = w.out;
+  *skipped = w.error != NULL && g_error_matches (w.error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_TOO_BIG);
+  if (err != NULL)
+    *err = w.error ? g_strdup (w.error->message) : NULL;
+  g_clear_error (&w.error);
+  return out;
+}
+
+/* does the real backend work here? Tries one 2x pass on a 16 x 12 picture. NULL if it
+ * does, else why not (g_free). */
+static char *
+upscale_unavailable (void)
+{
+  char *d, *in, *out, *scale = NULL, *r = NULL;
+  gint status = 0;
+
+  if (g_getenv ("NFC_TEST_SKIP_GPU") != NULL)
+    return g_strdup ("NFC_TEST_SKIP_GPU is set");
+  if (nfc_tools.upscayl == NULL || nfc_tools.upscale_models == NULL)
+    return g_strdup ("no upscayl-bin with models found");
+  if (!nfc_upscale_available (NFC_CAT_IMAGE, "png"))
+    return g_strdup ("ImageMagick cannot write PNG here");
+  d = P ("up-probe");
+  g_mkdir_with_parents (d, 0755);
+  in = g_build_filename (d, "in.png", NULL);
+  out = g_build_filename (d, "out.png", NULL);
+  scale = g_strdup ("2");
+  if (!run (d, NULL, "magick", "-size", "16x12", "gradient:red-blue", "in.png", NULL))
+    r = g_strdup ("cannot make the probe picture");
+  else
+    {
+      char *argv[] = { nfc_tools.upscayl, "-i", in, "-o", out, "-m", nfc_tools.upscale_models, "-n",
+                       nfc_tools.upscale_model, "-s", scale, NULL };
+      char *so = NULL, *se = NULL;
+      gboolean ok = g_spawn_sync (d, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL, NULL, NULL, NULL, &se,
+                                  &status, NULL);
+
+      if (!ok || !g_spawn_check_wait_status (status, NULL) || !non_empty (out))
+        {
+          char *m = se != NULL ? nfc_failure_message (se, NULL) : NULL;
+
+          r = g_strdup_printf ("the backend does not run here (%s)", m ? m : "no output");
+          g_free (m);
+        }
+      g_free (so);
+      g_free (se);
+    }
+  g_free (scale);
+  g_free (in);
+  g_free (out);
+  g_free (d);
+  return r;
+}
+
+/* the size of the picture and whether it is upright: "WxH" of the first frame (identify) */
+static char *
+im_size (const char *path)
+{
+  char *out = NULL, *r;
+
+  if (!run (NULL, &out, "magick", "identify", "-ping", "-format", "%wx%h", path, NULL) || out == NULL)
+    {
+      g_free (out);
+      return g_strdup ("(identify failed)");
+    }
+  r = g_strdup (g_strstrip (out));
+  g_free (out);
+  return r;
+}
+
+/* Upscale src_name (alone in `dir`) with up_key: named want_name, a real file of
+ * want_ext's type, exactly want_dims, the source untouched, nothing else left behind. */
+static void
+check_upscale (const char *dir, const char *src_name, const char *up_key, const char *want_name,
+               const char *want_ext, const char *want_dims, char *(*extra) (const char *, const char *))
+{
+  char *src = g_build_filename (dir, src_name, NULL), *before = checksum_of (src);
+  char *label = g_strdup_printf ("upscale %s", up_key), *err = NULL, *out, *detail = NULL, *left;
+  gboolean skipped, pass = FALSE;
+  NfcFormat f;
+
+  if (!nfc_classify (src, NULL, &f) || !nfc_upscale_target (f.cat, f.fmt, 0, 0, NULL))
+    {
+      add_row (src_name, label, FALSE, "not upscalable");
+      goto out;
+    }
+  if (!nfc_upscale_available (f.cat, f.fmt))
+    {
+      add_row (src_name, label, TRUE, "not offered by this system: SKIPPED");
+      goto out;
+    }
+  out = upscale_sync (f.fmt, up_key, src, &skipped, &err);
+  if (out == NULL)
+    detail = g_strdup_printf ("%s%s", skipped ? "SKIPPED: " : "", err ? err : "failed");
+  else
+    {
+      char *base = g_path_get_basename (out), *bad = NULL, *d = im_size (out);
+
+      if (!g_str_equal (base, want_name))
+        bad = g_strdup_printf ("named %s, expected %s", base, want_name);
+      else if (!g_str_equal (d, want_dims))
+        bad = g_strdup_printf ("is %s, expected %s", d, want_dims);
+      else if (!non_empty (out))
+        bad = g_strdup ("empty");
+      else
+        bad = check_type (want_ext, out);
+      if (bad == NULL)
+        {
+          char *after = checksum_of (src);
+
+          if (g_strcmp0 (before, after) != 0)
+            bad = g_strdup ("the original changed");
+          g_free (after);
+        }
+      if (bad == NULL && extra != NULL)
+        bad = extra (src, out);
+      pass = bad == NULL;
+      detail = bad != NULL ? bad : g_strdup_printf ("%s %s, %" G_GINT64_FORMAT " bytes", base, d,
+                                                    file_size (out));
+      g_free (base);
+      g_free (d);
+    }
+  left = unexpected_entries (dir, (const char *const[]) { src_name, want_name, NULL });
+  if (left[0] != '\0')
+    {
+      char *d2 = g_strdup_printf ("%s (left behind: %s)", detail ? detail : "", left);
+
+      g_free (detail);
+      detail = d2;
+      pass = FALSE;
+    }
+  g_free (left);
+  add_row (src_name, label, pass, detail);
+  g_free (detail);
+  g_free (out);
+out:
+  g_free (err);
+  g_free (label);
+  g_free (before);
+  g_free (src);
+}
+
+/* a JPG result is 4:4:4 */
+static char *
+extra_jpg_444 (const char *src, const char *out)
+{
+  char *sf = NULL, *r = NULL;
+
+  (void) src;
+  if (!run (NULL, &sf, "magick", "identify", "-format", "%[jpeg:sampling-factor]", out, NULL) ||
+      sf == NULL || !g_str_equal (g_strstrip (sf), "1x1,1x1,1x1"))
+    r = g_strdup_printf ("chroma sampling is %s, expected 4:4:4", sf ? sf : "?");
+  g_free (sf);
+  return r;
+}
+
+/* the picture is the source's, enlarged: its mean colour stays within 4 % and it is not blank */
+static char *
+extra_same_picture (const char *src, const char *out)
+{
+  char *a = NULL, *b = NULL, *r = NULL;
+  double ma, mb;
+
+  if (!run (NULL, &a, "magick", src, "-background", "white", "-alpha", "remove", "-colorspace", "Gray",
+            "-format", "%[fx:mean]", "info:", NULL) ||
+      !run (NULL, &b, "magick", out, "-background", "white", "-alpha", "remove", "-colorspace", "Gray",
+            "-format", "%[fx:mean]", "info:", NULL))
+    r = g_strdup ("cannot measure the pictures");
+  else
+    {
+      ma = g_ascii_strtod (a, NULL);
+      mb = g_ascii_strtod (b, NULL);
+      if ((ma > mb ? ma - mb : mb - ma) > 0.04)
+        r = g_strdup_printf ("mean brightness %.3f became %.3f", ma, mb);
+    }
+  g_free (a);
+  g_free (b);
+  return r;
+}
+
+/* ---- fake upscayl-bin: failures, timeout and kill, one job at a time ---- */
+
+static char *
+write_fake (const char *dir, const char *name, const char *body)
+{
+  char *p = g_build_filename (dir, name, NULL);
+  char *content = g_strconcat ("#!/bin/sh\n", body, NULL);
+
+  g_file_set_contents (p, content, -1, NULL);
+  g_chmod (p, 0755);
+  g_free (content);
+  return p;
+}
+
+/* the first line of the failure message of upscaling src with the fake backend `fake` */
+static char *
+fake_upscale_error (const char *fake, const char *src, gboolean *produced)
+{
+  char *err = NULL, *out;
+  gboolean skipped;
+  char *saved = nfc_tools.upscayl;
+
+  nfc_tools.upscayl = (char *) fake;
+  out = upscale_sync ("png", "2x", src, &skipped, &err);
+  nfc_tools.upscayl = saved;
+  *produced = out != NULL;
+  g_free (out);
+  return err;
+}
+
+static void
+test_upscale_fake (void)
+{
+  char *dir = P ("up-fake"), *src;
+  char *saved_models = nfc_tools.upscale_models, *saved_model = nfc_tools.upscale_model;
+  struct {
+    const char *name, *body, *want;
+  } f[] = {
+    { "no Vulkan device",
+      "echo 'vkCreateInstance failed -9' >&2\necho 'vkCreateInstance failed -9' >&2\n"
+      "echo '🚨 Error: Invalid GPU Device' >&2\nexit 255\n",
+      "no usable GPU" },
+    { "out of VRAM",
+      "echo '[0 AMD Radeon RX 9070 XT (RADV GFX1201)]  queueC=1[4]  queueG=0[1]' >&2\n"
+      "echo 'vkAllocateMemory failed -2' >&2\nexit 255\n",
+      "the GPU ran out of memory" },
+    { "device lost", "echo 'vkQueueSubmit failed -4' >&2\nexit 134\n", "the GPU stopped responding" },
+    { "unreadable input (exit 0, no output)",
+      "echo '✨ Using the default scale x4' >&2\necho \"🚨 Error: Couldn't read the image 'x.png'!\" >&2\nexit 0\n",
+      "could not read the image" },
+    { "model missing (exit 0, no output)",
+      "echo 'fopen /opt/x/models/nosuch.param failed' >&2\necho '🙌 Upscayled Successfully!' >&2\nexit 0\n",
+      "model files are missing" },
+    { "silent (exit 0, no output)", "echo '[0 GPU]  queueC=1' >&2\nexit 0\n", "produced no image" },
+    { "exit 3 and nothing to say", "echo '[0 GPU]  queueC=1[4]' >&2\nexit 3\n", "exit code 3" },
+  };
+
+  g_mkdir_with_parents (dir, 0755);
+  fixture ("up-fake/in.png", run (dir, NULL, "magick", "-size", "32x24", "gradient:red-blue", "in.png", NULL));
+  src = g_build_filename (dir, "in.png", NULL);
+  nfc_tools.upscale_models = (char *) "/nonexistent/models";
+  nfc_tools.upscale_model = (char *) "model";
+  for (guint i = 0; i < G_N_ELEMENTS (f); i++)
+    {
+      char *name = g_strdup_printf ("fake%u", i);
+      char *p = write_fake (dir, name, f[i].body);
+      gboolean produced;
+      char *err = fake_upscale_error (p, src, &produced);
+      char *left = unexpected_entries (dir, (const char *const[]) { "in.png", "fake0", "fake1", "fake2", "fake3",
+                                                                    "fake4", "fake5", "fake6", "fake7", "fake8",
+                                                                    "pid", "serial.log", "fake-serial", NULL });
+      gboolean ok = !produced && err != NULL && strstr (err, f[i].want) != NULL && left[0] == '\0';
+
+      add_row ("(fake upscayl-bin)", f[i].name, ok,
+               ok ? err : g_strdup_printf ("message '%s', expected '%s'%s%s", err ? err : "(none)", f[i].want,
+                                           left[0] ? ", left behind: " : "", left));
+      g_free (left);
+      g_free (err);
+      g_free (p);
+      g_free (name);
+    }
+
+  /* a hung backend is killed with everything it started when the step times out */
+  {
+    char *pidf = g_build_filename (dir, "pid", NULL);
+    char *body = g_strdup_printf ("sleep 600 &\necho $! > '%s'\nwait\n", pidf);
+    char *p = write_fake (dir, "fake7", body);
+    gboolean produced;
+    char *err, *pids = NULL;
+    gboolean alive = TRUE, ok;
+
+    g_setenv ("NFC_TEST_TIMEOUT_SECS", "2", TRUE);
+    err = fake_upscale_error (p, src, &produced);
+    g_unsetenv ("NFC_TEST_TIMEOUT_SECS");
+    if (g_file_get_contents (pidf, &pids, NULL, NULL))
+      {
+        long pid = strtol (pids, NULL, 10);
+
+        for (int i = 0; i < 50 && pid > 1 && alive; i++)
+          {
+            alive = kill ((pid_t) pid, 0) == 0;
+            if (alive)
+              g_usleep (100000);
+          }
+        if (alive && pid > 1)
+          kill ((pid_t) pid, SIGKILL);
+      }
+    ok = !produced && err != NULL && strstr (err, "timed out") != NULL && pids != NULL && !alive;
+    add_row ("(fake upscayl-bin)", "timeout kills the process group", ok,
+             ok ? err : g_strdup_printf ("message '%s', child %s", err ? err : "(none)",
+                                         pids ? (alive ? "still alive" : "dead") : "never started"));
+    g_free (err);
+    g_free (pids);
+    g_free (body);
+    g_free (p);
+    g_free (pidf);
+  }
+
+  /* one Upscale job at a time, whichever batch it comes from: two jobs started at
+   * once run one after the other (S E S E, never S S E E) */
+  {
+    char *logf = g_build_filename (dir, "serial.log", NULL);
+    char *body = g_strdup_printf ("in=; out=\nwhile [ $# -gt 0 ]; do case \"$1\" in -i) in=\"$2\"; shift;; "
+                                  "-o) out=\"$2\"; shift;; esac; shift; done\n"
+                                  "echo S >> '%s'\nsleep 1\ncp \"$in\" \"$out\"\necho E >> '%s'\n", logf, logf);
+    char *p = write_fake (dir, "fake-serial", body);
+    char *src2 = g_build_filename (dir, "in2.png", NULL), *log_text = NULL;
+    NfcUpscaleTarget t;
+    const NfcUpscalePreset *preset = nfc_upscale_preset_from_key ("2x");
+    NfcConvertOptions o = { NFC_PRESET_BEST, " (2x)", NFC_REFERENCE_NONE, NULL, preset };
+    UpWait w = { g_main_loop_new (NULL, FALSE), NULL, NULL, 2 };
+    char *saved = nfc_tools.upscayl;
+    gboolean ok;
+
+    fixture ("up-fake/in2.png", run (dir, NULL, "magick", "-size", "32x24", "gradient:green-blue", "in2.png", NULL));
+    g_assert_true (nfc_upscale_target (NFC_CAT_IMAGE, "png", 0, 0, &t));
+    nfc_tools.upscayl = p;
+    nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", t.key, t.ext, src, &o, up_on_done, &w);
+    nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", t.key, t.ext, src2, &o, up_on_done, &w);
+    g_main_loop_run (w.loop); /* until both jobs have ended */
+    nfc_tools.upscayl = saved;
+    g_free (w.out);
+    g_clear_error (&w.error);
+    g_file_get_contents (logf, &log_text, NULL, NULL);
+    ok = log_text != NULL && strcmp (log_text, "S\nE\nS\nE\n") == 0;
+    add_row ("(fake upscayl-bin)", "one Upscale job at a time", ok,
+             ok ? "S E S E" : (log_text ? log_text : "no log"));
+    g_free (log_text);
+    g_main_loop_unref (w.loop);
+    g_free (src2);
+    g_free (p);
+    g_free (body);
+    g_free (logf);
+  }
+  nfc_tools.upscale_models = saved_models;
+  nfc_tools.upscale_model = saved_model;
+  g_free (src);
+  g_free (dir);
+}
+
+/* the texts of the Upscale notifications; `real`: the cases that run the backend */
+static void
+test_upscale_notifications (const char *dir, gboolean real)
+{
+  char *ndir = g_dir_make_tmp ("nfc-notify-XXXXXX", NULL);
+  char *script = g_build_filename (ndir, "notify-send", NULL);
+  char *log = g_build_filename (ndir, "calls.log", NULL);
+  char *content = g_strdup_printf ("#!/bin/sh\necho \"$@\" >> '%s'\necho 4242\n", log);
+  char *saved = nfc_tools.notify;
+  struct {
+    const char *label, *preset;
+    const char *files[4];   /* "tiny" (64x48), "big" (9000x9000), "strip" (4200x4 WEBP) or "bad" each */
+    gboolean gpu;
+    const char *want[4];
+    const char *unwanted;
+  } c[] = {
+    { "one file", "4x", { "tiny", NULL }, TRUE,
+      { " -- Upscaling… f0.png (4×)",
+        " -- Upscale complete f0.png → f0 (4x).png, 64×48 → 256×192", NULL, NULL },
+      "too big" },
+    { "two files", "2x", { "tiny", "tiny", NULL }, TRUE,
+      { " -- Upscaling… 2 files (2×)", " -- Upscale complete Upscaled 2 files 2×", NULL, NULL }, "too big" },
+    { "too big", "4x", { "big", NULL }, FALSE,
+      { " -- Upscaling… f0.png (4×)",
+        " -- Nothing to upscale f0.png is too big to upscale 4× (36000×36000 px; the limit is 32768 px per "
+        "side or 400 megapixels)", NULL, NULL },
+      "Upscale failed" },
+    { "two too big", "8x", { "big", "big", NULL }, FALSE,
+      { " -- Nothing to upscale 2 files are too big to upscale 8×", NULL, NULL, NULL }, "Upscale failed" },
+    { "one good, one too big", "4x", { "tiny", "big", NULL }, TRUE,
+      { " -- Upscale complete f0.png → f0 (4x).png, 64×48 → 256×192", "\nf1.png is too big to upscale 4×",
+        NULL, NULL }, "Upscale failed" },
+    { "one good, one broken", "2x", { "tiny", "bad", NULL }, TRUE,
+      { " -- Upscale failed f0.png → f0 (2x).png, 64×48 → 128×96", "\nFailed: f1.png — ", NULL, NULL },
+      "too big" },
+    { "broken", "3x", { "bad", NULL }, FALSE,
+      { " -- Upscale failed Failed: f0.png — ", NULL, NULL, NULL }, "Upscale complete" },
+    { "WEBP beyond WebP's limit", "4x", { "strip", NULL }, TRUE,
+      { " -- Upscale complete f0.webp → f0 (4x).png, 4200×4 → 16800×16 (saved as PNG: WEBP is limited to "
+        "16383 px)", NULL, NULL, NULL }, "Upscale failed" },
+  };
+
+  g_file_set_contents (script, content, -1, NULL);
+  g_chmod (script, 0755);
+  nfc_tools.notify = script;
+  for (guint k = 0; k < G_N_ELEMENTS (c); k++)
+    {
+      char *sub = g_strdup_printf ("%s/un%u", dir, k);
+      char *paths[5] = { NULL }, *fmts[5] = { NULL }, *logged = NULL;
+      guint n = 0;
+      gboolean pass = FALSE;
+      GString *miss = g_string_new (NULL);
+
+      if (c[k].gpu != FALSE && !real)
+        {
+          add_row ("(notifications)", c[k].label, TRUE, "Upscale: SKIPPED (no usable backend)");
+          g_string_free (miss, TRUE);
+          g_free (sub);
+          continue;
+        }
+      g_mkdir_with_parents (sub, 0755);
+      for (; c[k].files[n] != NULL; n++)
+        {
+          gboolean strip = g_str_equal (c[k].files[n], "strip");
+          char *name = g_strdup_printf ("f%u.%s", n, strip ? "webp" : "png");
+
+          paths[n] = g_build_filename (sub, name, NULL);
+          fmts[n] = (char *) (strip ? "webp" : "png");
+          if (g_str_equal (c[k].files[n], "tiny"))
+            run (sub, NULL, "magick", "-seed", "3", "-size", "64x48", "plasma:fractal", name, NULL);
+          else if (g_str_equal (c[k].files[n], "big"))
+            run (sub, NULL, "magick", "-size", "9000x9000", "xc:red", name, NULL);
+          else if (strip)
+            run (sub, NULL, "magick", "-size", "4200x4", "gradient:red-blue", "WEBP:f0.webp", NULL);
+          else
+            g_file_set_contents (paths[n], "this is not a png", -1, NULL);
+          g_free (name);
+        }
+      g_remove (log);
+      {
+        const char *pp[5] = { paths[0], paths[1], paths[2], paths[3], NULL };
+        const char *ff[5] = { fmts[0], fmts[1], fmts[2], fmts[3], NULL };
+
+        nfc_batch_run_upscale (c[k].preset, pp, ff, n, NULL, NULL);
+      }
+      for (int i = 0; i < 2500 && !pass; i++)
+        {
+          g_main_context_iteration (NULL, FALSE);
+          g_usleep (20000);
+          g_clear_pointer (&logged, g_free);
+          if (g_file_get_contents (log, &logged, NULL, NULL))
+            pass = strstr (logged, "Upscale complete") != NULL ||
+                   strstr (logged, "Upscale failed") != NULL ||
+                   strstr (logged, "Nothing to upscale") != NULL;
+        }
+      if (!pass)
+        g_string_append (miss, "no final notification; ");
+      for (guint i = 0; pass && i < 4 && c[k].want[i] != NULL; i++)
+        if (strstr (logged, c[k].want[i]) == NULL)
+          {
+            g_string_append_printf (miss, "missing '%s'; ", c[k].want[i]);
+            pass = FALSE;
+          }
+      if (pass && c[k].unwanted != NULL && strstr (logged, c[k].unwanted) != NULL)
+        {
+          g_string_append_printf (miss, "unexpected '%s'; ", c[k].unwanted);
+          pass = FALSE;
+        }
+      add_row ("(notifications)", c[k].label, pass, pass ? "Upscale notification texts" : (miss->len ? miss->str : "?"));
+      if (!pass && logged != NULL)
+        g_printerr ("--- notify log of '%s':\n%s\n", c[k].label, logged);
+      g_string_free (miss, TRUE);
+      g_free (logged);
+      for (guint i = 0; i < n; i++)
+        g_free (paths[i]);
+      g_free (sub);
+    }
+  g_free (content);
+  g_free (log);
+  g_free (script);
+  nfc_tools.notify = saved;
+  g_free (ndir);
+}
+
+/* A JPEG carrying the EXIF orientation 6 (rotate 90 clockwise to view): magick cannot
+ * write the tag without an EXIF profile to put it in, so the minimal APP1 segment
+ * (a TIFF header and one IFD entry) is spliced in after the SOI marker. */
+static gboolean
+make_rotated_jpg (const char *dir, const char *name)
+{
+  static const guchar app1[] = {
+    0xFF, 0xE1, 0x00, 0x22, 'E', 'x', 'i', 'f', 0, 0,
+    'M', 'M', 0x00, 0x2A, 0x00, 0x00, 0x00, 0x08,   /* big endian TIFF, IFD0 at 8 */
+    0x00, 0x01,                                     /* one entry */
+    0x01, 0x12, 0x00, 0x03, 0x00, 0x00, 0x00, 0x01, 0x00, 0x06, 0x00, 0x00, /* Orientation = 6 */
+    0x00, 0x00, 0x00, 0x00                          /* no next IFD */
+  };
+  char *plain = g_build_filename (dir, "plain.jpg", NULL), *path = g_build_filename (dir, name, NULL);
+  char *data = NULL;
+  gsize len = 0;
+  gboolean ok = run (dir, NULL, "magick", "-seed", "6", "-size", "64x48", "plasma:fractal", "-quality", "92",
+                     "plain.jpg", NULL) && g_file_get_contents (plain, &data, &len, NULL) && len > 2;
+
+  if (ok)
+    {
+      GByteArray *a = g_byte_array_new ();
+
+      g_byte_array_append (a, (const guint8 *) data, 2);
+      g_byte_array_append (a, app1, sizeof app1);
+      g_byte_array_append (a, (const guint8 *) data + 2, len - 2);
+      ok = g_file_set_contents (path, (const char *) a->data, a->len, NULL);
+      g_byte_array_unref (a);
+    }
+  g_unlink (plain);
+  g_free (data);
+  g_free (plain);
+  g_free (path);
+  return ok;
+}
+
+static void
+test_upscale (void)
+{
+  char *dir = P ("upscale"), *why = upscale_unavailable ();
+  char *saved_notify = nfc_tools.notify;
+
+  g_mkdir_with_parents (dir, 0755);
+  nfc_tools.notify = NULL; /* no real notifications from the test */
+  test_upscale_fake ();
+  if (why != NULL)
+    {
+      g_print ("Upscale: real runs SKIPPED: %s\n", why);
+      add_row ("(upscale)", "real runs with upscayl-bin", TRUE, g_strdup_printf ("SKIPPED: %s", why));
+    }
+  else
+    {
+      struct {
+        const char *sub, *name, *up, *want_name, *want_ext, *want_dims;
+        char *(*extra) (const char *, const char *);
+      } c[] = {
+        /* one pass: -s N */
+        { "u2", "pic.png", "2x", "pic (2x).png", "png", "256x192", extra_same_picture },
+        { "u3", "pic.png", "3x", "pic (3x).png", "png", "384x288", extra_same_picture },
+        { "u4", "pic.png", "4x", "pic (4x).png", "png", "512x384", extra_same_picture },
+        /* chains: 5x = 3x, 2x, then 5/6; 6x = 3x, 2x; 8x = 4x, 2x */
+        { "u5", "small.png", "5x", "small (5x).png", "png", "320x240", extra_same_picture },
+        { "u6", "small.png", "6x", "small (6x).png", "png", "384x288", extra_same_picture },
+        { "u8", "small.png", "8x", "small (8x).png", "png", "512x384", extra_same_picture },
+        /* the format follows the source (JPG, WEBP with alpha), anything else is PNG */
+        { "j2", "photo.jpg", "2x", "photo (2x).jpg", "jpg", "256x192", extra_jpg_444 },
+        { "w2", "sticker.webp", "2x", "sticker (2x).webp", "webp", "128x96", extra_alpha_kept },
+        { "a2", "alpha.png", "2x", "alpha (2x).png", "png", "128x96", extra_alpha_kept },
+        { "f2", "pic.avif", "2x", "pic (2x).png", "png", "128x96", NULL },
+        { "b2", "pic.bmp", "2x", "pic (2x).png", "png", "128x96", NULL },
+        { "t2", "pic.tiff", "2x", "pic (2x).png", "png", "128x96", NULL },
+        { "g2", "pic.gif", "2x", "pic (2x).png", "png", "128x96", NULL },
+        /* EXIF orientation applied: stored 64x48, shown 48x64 */
+        { "r2", "rot.jpg", "2x", "rot (2x).jpg", "jpg", "96x128", NULL },
+        /* CMYK and 16-bit sources */
+        { "c2", "cmyk.jpg", "2x", "cmyk (2x).jpg", "jpg", "128x96", NULL },
+        { "d2", "deep.png", "2x", "deep (2x).png", "png", "128x96", NULL },
+        { "k2", "gray.png", "2x", "gray (2x).png", "png", "128x96", NULL },
+      };
+
+#define SUB(i) g_build_filename (dir, c[i].sub, NULL)
+#define MK(i, what, ...) do { char *d_ = SUB (i); fixture (what, run (d_, NULL, __VA_ARGS__, NULL)); g_free (d_); } while (0)
+      for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+        {
+          char *sub = SUB (i);
+
+          g_mkdir_with_parents (sub, 0755);
+          g_free (sub);
+        }
+      MK (0, "u2/pic.png", "magick", "-seed", "7", "-size", "128x96", "plasma:fractal", "pic.png");
+      MK (1, "u3/pic.png", "magick", "-seed", "7", "-size", "128x96", "plasma:fractal", "pic.png");
+      MK (2, "u4/pic.png", "magick", "-seed", "7", "-size", "128x96", "plasma:fractal", "pic.png");
+      MK (3, "u5/small.png", "magick", "-seed", "5", "-size", "64x48", "plasma:fractal", "small.png");
+      MK (4, "u6/small.png", "magick", "-seed", "5", "-size", "64x48", "plasma:fractal", "small.png");
+      MK (5, "u8/small.png", "magick", "-seed", "5", "-size", "64x48", "plasma:fractal", "small.png");
+      MK (6, "j2/photo.jpg", "magick", "-seed", "9", "-size", "128x96", "plasma:fractal", "-quality", "92", "photo.jpg");
+      MK (7, "w2/sticker.webp", "magick", "-size", "64x48", "xc:none", "-fill", "orange", "-draw",
+          "circle 32,24 32,4", "WEBP:sticker.webp");
+      MK (8, "a2/alpha.png", "magick", "-size", "64x48", "xc:none", "-fill", "blue", "-draw", "circle 32,24 32,4",
+          "alpha.png");
+      MK (9, "f2/pic.avif", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+          "testsrc2=d=1:s=64x48:r=1", "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", "8", "-still-picture", "1",
+          "-f", "avif", "pic.avif");
+      MK (10, "b2/pic.bmp", "magick", "-seed", "4", "-size", "64x48", "plasma:fractal", "BMP:pic.bmp");
+      MK (11, "t2/pic.tiff", "magick", "-seed", "4", "-size", "64x48", "plasma:fractal", "TIFF:pic.tiff");
+      MK (12, "g2/pic.gif", "magick", "-seed", "4", "-size", "64x48", "plasma:fractal", "GIF:pic.gif");
+      {
+        char *d_ = SUB (13);
+
+        fixture ("r2/rot.jpg", make_rotated_jpg (d_, "rot.jpg"));
+        g_free (d_);
+      }
+      MK (14, "c2/cmyk.jpg", "magick", "-seed", "8", "-size", "64x48", "plasma:fractal", "-colorspace", "CMYK",
+          "-quality", "92", "cmyk.jpg");
+      MK (15, "d2/deep.png", "magick", "-seed", "2", "-size", "64x48", "plasma:fractal", "-depth", "16", "deep.png");
+      MK (16, "k2/gray.png", "magick", "-seed", "2", "-size", "64x48", "plasma:fractal", "-colorspace", "Gray",
+          "gray.png");
+      for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+        {
+          char *sub = SUB (i);
+
+          check_upscale (sub, c[i].name, c[i].up, c[i].want_name, c[i].want_ext, c[i].want_dims, c[i].extra);
+          g_free (sub);
+        }
+#undef MK
+#undef SUB
+
+      /* the source of the 8x chain is the picture itself: no leftover in the cache dir either */
+      /* naming: a second upscale does not overwrite the first */
+      {
+        char *sub = g_build_filename (dir, "u2", NULL), *src = g_build_filename (sub, "pic.png", NULL);
+        gboolean skipped;
+        char *o = upscale_sync ("png", "2x", src, &skipped, NULL);
+        char *b = o ? g_path_get_basename (o) : NULL;
+
+        add_row ("pic.png", "upscale naming", g_strcmp0 (b, "pic (2x) (1).png") == 0, b ? b : "failed");
+        g_free (b);
+        g_free (o);
+        g_free (src);
+        g_free (sub);
+      }
+    }
+  /* a result beyond the limits: nothing runs, nothing is made, a plain message (no backend needed) */
+  {
+    char *sub = g_build_filename (dir, "big", NULL), *src = g_build_filename (sub, "wide.png", NULL);
+    gboolean skipped;
+    char *err = NULL, *out, *left;
+
+    g_mkdir_with_parents (sub, 0755);
+    fixture ("big/wide.png", run (sub, NULL, "magick", "-size", "9000x100", "xc:red", "wide.png", NULL));
+    out = upscale_sync ("png", "4x", src, &skipped, &err);
+    left = unexpected_entries (sub, (const char *const[]) { "wide.png", NULL });
+    add_row ("wide.png (9000x100)", "upscale 4x (36000 px)", out == NULL && skipped && left[0] == '\0' &&
+             err != NULL && strstr (err, "too big to upscale 4× (36000×400 px;") != NULL,
+             err ? err : "unexpectedly done");
+    g_free (left);
+    g_free (err);
+    g_free (out);
+    g_free (src);
+    g_free (sub);
+  }
+  test_upscale_notifications (dir, why == NULL);
+  nfc_tools.notify = saved_notify;
+  g_free (why);
+  g_free (dir);
+}
+
 int
 main (void)
 {
@@ -2675,11 +3364,21 @@ main (void)
   tmpdir = P ("xdg-cache");
   g_setenv ("XDG_CACHE_HOME", tmpdir, TRUE);
   g_free (tmpdir);
+  /* and the config file (upscale-model) of the user */
+  tmpdir = P ("xdg-config");
+  g_setenv ("XDG_CONFIG_HOME", tmpdir, TRUE);
+  g_free (tmpdir);
   rows = g_ptr_array_new ();
   nfc_tools_init ();
   g_print ("tools: magick=%s ffmpeg=%s soffice=%s notify-send=%s\n",
            nfc_tools.magick, nfc_tools.ffmpeg, nfc_tools.soffice, nfc_tools.notify);
   nfc_probe_ensure ();
+  /* NFC_TEST_ONLY=upscale: only the Upscale checks (the rest takes minutes) */
+  if (g_strcmp0 (g_getenv ("NFC_TEST_ONLY"), "upscale") == 0)
+    {
+      test_upscale ();
+      goto table;
+    }
 
   /* ---------------- fixtures ---------------- */
   fixture ("test.png", run (work, NULL, "magick", "-size", "64x64", "xc:red", "test.png", NULL));
@@ -2788,6 +3487,7 @@ main (void)
   test_presets ();
   test_compress ();
   test_resize ();
+  test_upscale ();
   test_large_image ();
   test_pdf_page_size ();
   check_many ("test.mov", k_mov);
@@ -2874,7 +3574,8 @@ main (void)
     lines = g_strsplit (log != NULL ? log : "", "\n", -1);
     for (char **l = lines; *l; l++)
       if (strstr (*l, "size probe failed") != NULL && strstr (*l, "bad.png") == NULL &&
-          strstr (*l, "corrupt.png") == NULL && strstr (*l, "/nt4/") == NULL && strstr (*l, "/rn6/") == NULL)
+          strstr (*l, "corrupt.png") == NULL && strstr (*l, "/nt4/") == NULL && strstr (*l, "/rn6/") == NULL &&
+          strstr (*l, "/un5/") == NULL && strstr (*l, "/un6/") == NULL)
         {
           g_printerr ("%s\n", *l);
           bad++;
@@ -2892,6 +3593,7 @@ main (void)
   }
 
   /* ---------------- table ---------------- */
+table:
   {
     int w0 = 0, w1 = 0, pass = 0;
 

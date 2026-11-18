@@ -2,7 +2,8 @@
  *
  * Select files, right-click, "Convert to" > <format> [> <quality preset>], or
  * "Compress" > <quality preset> (a smaller copy in the same format), or
- * "Resize" > <size> (a smaller copy at a given pixel size). All
+ * "Resize" > <size> (a smaller copy at a given pixel size), or "Upscale" > 2× .. 8×
+ * (an AI-enlarged copy, made by Upscayl's backend). All
  * real work happens in nfc-core.c / nfc-convert.c.
  */
 #include <nautilus-extension.h>
@@ -34,6 +35,7 @@ typedef struct {
   NfcPreset preset;
   gboolean compress; /* Compress (key, label, ext unused) instead of Convert to */
   char *resize_key;  /* Resize to this preset (NfcResizePreset.key); NULL: not a resize */
+  char *upscale_key; /* Upscale by this preset (NfcUpscalePreset.key); NULL: not an upscale */
   char *key, *label, *ext;
   GPtrArray *paths; /* char *, owned */
   GPtrArray *fmts;  /* static strings */
@@ -46,6 +48,7 @@ activate_data_free (gpointer data, GClosure *closure G_GNUC_UNUSED)
 
   g_free (d->key);
   g_free (d->resize_key);
+  g_free (d->upscale_key);
   g_free (d->label);
   g_free (d->ext);
   g_ptr_array_unref (d->paths);
@@ -60,7 +63,10 @@ on_activate (NautilusMenuItem *item G_GNUC_UNUSED, gpointer user_data)
 
   if (d == NULL || d->paths->len == 0)
     return;
-  if (d->resize_key != NULL)
+  if (d->upscale_key != NULL)
+    nfc_batch_run_upscale (d->upscale_key, (const char *const *) d->paths->pdata,
+                           (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
+  else if (d->resize_key != NULL)
     nfc_batch_run_resize (d->cat, d->resize_key, (const char *const *) d->paths->pdata,
                           (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
   else if (d->compress)
@@ -212,6 +218,46 @@ resize_item_new (const NfcSelection *sel)
   return top;
 }
 
+/* The "Upscale" entry: a submenu 2× / 3× / 4× / 5× / 6× / 8× (item names
+ * "FileConverter::Upscale::<key>", e.g. "...::4x") of the presets whose result fits
+ * the limits. The tooltip says the exact size when one file of known size is
+ * selected. */
+static NautilusMenuItem *
+upscale_item_new (const NfcSelection *sel)
+{
+  NautilusMenuItem *top = nautilus_menu_item_new ("FileConverter::Upscale", "Upscale",
+                                                  "Make an AI-upscaled copy next to the original "
+                                                  "(Upscayl, runs on the GPU)", NULL);
+  NautilusMenu *sub = nautilus_menu_new ();
+  gboolean one = sel->paths->len == 1 && sel->dims != NULL && sel->dims->len == 1;
+
+  for (guint k = 0; k < sel->upscale->len; k++)
+    {
+      const NfcUpscalePreset *p = sel->upscale->pdata[k];
+      char *name = g_strdup_printf ("FileConverter::Upscale::%s", p->key);
+      const NfcDims *d = one ? &g_array_index (sel->dims, NfcDims, 0) : NULL;
+      char *tip = nfc_upscale_tooltip (p, d != NULL ? d->width : 0, d != NULL ? d->height : 0);
+      NautilusMenuItem *item = nautilus_menu_item_new (name, p->label, tip, NULL);
+      ActivateData *data = g_new0 (ActivateData, 1);
+
+      data->cat = sel->cat;
+      data->upscale_key = g_strdup (p->key);
+      data->key = g_strdup ("");
+      data->label = g_strdup ("Upscale");
+      data->ext = g_strdup ("");
+      activate_data_copy_selection (data, sel);
+      g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), data,
+                             activate_data_free, 0);
+      nautilus_menu_append_item (sub, item);
+      g_object_unref (item);
+      g_free (tip);
+      g_free (name);
+    }
+  nautilus_menu_item_set_submenu (top, sub);
+  g_object_unref (sub);
+  return top;
+}
+
 /* Runs on the Nautilus main thread: it must never wait. nfc_analyze_selection
  * only stats the selected files and consults capability probes that run in
  * background threads; targets whose probe is still running are left out (see
@@ -279,6 +325,8 @@ nfc_provider_get_file_items (NautilusMenuProvider *provider G_GNUC_UNUSED, GList
     result = g_list_append (result, compress_item_new (&sel));
   if (ok && sel.resize != NULL && sel.resize->len > 0)
     result = g_list_append (result, resize_item_new (&sel));
+  if (ok && sel.upscale != NULL && sel.upscale->len > 0)
+    result = g_list_append (result, upscale_item_new (&sel));
   nfc_selection_clear (&sel);
   /* explicit loop over n: an invalid entry in the middle leaves NULL holes, where
    * g_strfreev() would stop and leak every later entry */

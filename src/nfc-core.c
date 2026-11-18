@@ -18,7 +18,7 @@
 #include "nfc-header.h"
 #include "nfc-util.h"
 
-NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL, NULL };
+NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL };
 
 /* -------------------------------------------------------------------------
  * Tool discovery
@@ -47,6 +47,27 @@ find_decode_helper (void)
   return NULL;
 }
 
+
+/* The Upscale backend: NFC_UPSCAYL_BIN (tests; set but not executable means none),
+ * else Upscayl's own install, else upscayl-bin on the PATH. NULL if absent. */
+static char *
+find_upscayl (void)
+{
+  const char *env = g_getenv ("NFC_UPSCAYL_BIN");
+
+  if (env != NULL && *env != '\0')
+    return g_file_test (env, G_FILE_TEST_IS_EXECUTABLE) ? g_strdup (env) : NULL;
+  if (g_file_test ("/opt/Upscayl/resources/bin/upscayl-bin", G_FILE_TEST_IS_EXECUTABLE))
+    return g_strdup ("/opt/Upscayl/resources/bin/upscayl-bin");
+  return g_find_program_in_path ("upscayl-bin");
+}
+
+static char *
+upscale_config_path (void)
+{
+  return g_build_filename (g_get_user_config_dir (), "nautilus-file-converter", "config", NULL);
+}
+
 void
 nfc_tools_init (void)
 {
@@ -60,12 +81,29 @@ nfc_tools_init (void)
       g_free (nfc_tools.notify);
       g_free (nfc_tools.decode);
       g_free (nfc_tools.ffprobe);
+      g_free (nfc_tools.upscayl);
+      g_free (nfc_tools.upscale_models);
+      g_free (nfc_tools.upscale_model);
       nfc_tools.magick = find_first ("magick", "convert");
       nfc_tools.ffmpeg = find_first ("ffmpeg", NULL);
       nfc_tools.soffice = find_first ("soffice", "libreoffice");
       nfc_tools.notify = find_first ("notify-send", NULL);
       nfc_tools.decode = find_decode_helper ();
       nfc_tools.ffprobe = find_first ("ffprobe", NULL);
+      /* Upscayl: the binary, its models and (read once, here) the configured
+       * model; without usable models there is no Upscale entry */
+      nfc_tools.upscayl = find_upscayl ();
+      nfc_tools.upscale_models = NULL;
+      nfc_tools.upscale_model = NULL;
+      if (nfc_tools.upscayl != NULL)
+        {
+          char *config = upscale_config_path ();
+
+          if (!nfc_upscale_resolve (nfc_tools.upscayl, config, &nfc_tools.upscale_models,
+                                    &nfc_tools.upscale_model))
+            g_clear_pointer (&nfc_tools.upscayl, g_free);
+          g_free (config);
+        }
       g_once_init_leave (&once, 1);
     }
 }
@@ -918,6 +956,232 @@ nfc_resize_target (NfcCategory cat, const char *fmt, NfcResizeTarget *out)
   return FALSE;
 }
 
+/* ---- Upscale ---- */
+
+static const NfcUpscalePreset upscale_presets[] = {
+  { "2x", "2×", 2, { 2, 0 } },
+  { "3x", "3×", 3, { 3, 0 } },
+  { "4x", "4×", 4, { 4, 0 } },
+  /* no integer product: 3x then 2x is 6x, shrunk to 5x by the final step */
+  { "5x", "5×", 5, { 3, 2 } },
+  { "6x", "6×", 6, { 3, 2 } },
+  { "8x", "8×", 8, { 4, 2 } },
+};
+
+const NfcUpscalePreset *
+nfc_upscale_presets (guint *n)
+{
+  if (n != NULL)
+    *n = G_N_ELEMENTS (upscale_presets);
+  return upscale_presets;
+}
+
+const NfcUpscalePreset *
+nfc_upscale_preset_from_key (const char *key)
+{
+  if (key == NULL)
+    return NULL;
+  for (guint i = 0; i < G_N_ELEMENTS (upscale_presets); i++)
+    if (g_str_equal (upscale_presets[i].key, key))
+      return &upscale_presets[i];
+  return NULL;
+}
+
+guint
+nfc_upscale_chain_factor (const NfcUpscalePreset *p)
+{
+  if (p == NULL)
+    return 0;
+  return p->pass[0] * (p->pass[1] != 0 ? p->pass[1] : 1);
+}
+
+gboolean
+nfc_upscale_output_size (const NfcUpscalePreset *p, guint64 w, guint64 h, guint64 *ow, guint64 *oh)
+{
+  guint64 nw, nh;
+
+  if (p == NULL || w == 0 || h == 0)
+    return FALSE;
+  /* bounded, so that the products below cannot overflow */
+  nw = MIN (w, (guint64) 1 << 31) * p->factor;
+  nh = MIN (h, (guint64) 1 << 31) * p->factor;
+  if (ow != NULL)
+    *ow = nw;
+  if (oh != NULL)
+    *oh = nh;
+  if (MAX (nw, nh) > NFC_UPSCALE_MAX_SIDE)
+    return FALSE;
+  return nw * nh <= NFC_UPSCALE_MAX_PIXELS;
+}
+
+char *
+nfc_upscale_tooltip (const NfcUpscalePreset *p, guint64 w, guint64 h)
+{
+  guint64 ow, oh;
+
+  if (p == NULL)
+    return g_strdup ("");
+  if (nfc_upscale_output_size (p, w, h, &ow, &oh))
+    return g_strdup_printf ("Make an AI-upscaled copy at %" G_GUINT64_FORMAT " × %" G_GUINT64_FORMAT
+                            " px (Upscayl, runs on the GPU)", ow, oh);
+  return g_strdup_printf ("Make an AI-upscaled copy %u times as wide and tall "
+                          "(Upscayl, runs on the GPU)", p->factor);
+}
+
+/* WebP stores at most 16383 pixels per side */
+#define WEBP_MAX_SIDE 16383
+
+gboolean
+nfc_upscale_target (NfcCategory cat, const char *fmt, guint64 ow, guint64 oh, NfcUpscaleTarget *out)
+{
+  static const struct {
+    const char *fmt, *key;
+  } map[] = {
+    { "png", "png" }, { "jpg", "jpg" }, { "webp", "webp" },
+    /* no encoder of their own here (or not worth one): PNG */
+    { "avif", "png" }, { "heic", "png" }, { "bmp", "png" }, { "tiff", "png" }, { "gif", "png" },
+  };
+
+  if (cat != NFC_CAT_IMAGE || fmt == NULL)
+    return FALSE;
+  for (guint i = 0; i < G_N_ELEMENTS (map); i++)
+    if (g_str_equal (map[i].fmt, fmt))
+      {
+        if (out != NULL)
+          {
+            out->key = map[i].key;
+            out->capped = g_str_equal (map[i].key, "webp") &&
+                          (ow > WEBP_MAX_SIDE || oh > WEBP_MAX_SIDE);
+            if (out->capped)
+              out->key = "png";
+            out->ext = out->key;
+          }
+        return TRUE;
+      }
+  return FALSE;
+}
+
+char *
+nfc_upscale_config_model (const char *text)
+{
+  char **lines;
+  char *model = NULL;
+
+  if (text == NULL)
+    return NULL;
+  lines = g_strsplit (text, "\n", -1);
+  for (char **l = lines; *l != NULL; l++)
+    {
+      char *s = g_strstrip (*l);
+      char *eq;
+
+      if (*s == '\0' || *s == '#' || (eq = strchr (s, '=')) == NULL)
+        continue;
+      *eq = '\0';
+      if (g_str_equal (g_strstrip (s), "upscale-model"))
+        {
+          char *v = g_strstrip (eq + 1);
+
+          g_free (model);
+          model = *v != '\0' ? g_strdup (v) : NULL;
+        }
+    }
+  g_strfreev (lines);
+  return model;
+}
+
+/* A model name is a plain file name stem: never a path */
+static gboolean
+upscale_model_present (const char *dir, const char *name)
+{
+  gboolean ok = *name != '\0' && *name != '.' && strlen (name) <= 100;
+
+  for (const char *c = name; ok && *c != '\0'; c++)
+    ok = g_ascii_isalnum (*c) || *c == '-' || *c == '_' || *c == '.';
+  if (ok)
+    {
+      char *param = g_strconcat (name, ".param", NULL);
+      char *bin = g_strconcat (name, ".bin", NULL);
+      char *pp = g_build_filename (dir, param, NULL);
+      char *bp = g_build_filename (dir, bin, NULL);
+
+      ok = g_file_test (pp, G_FILE_TEST_IS_REGULAR) && g_file_test (bp, G_FILE_TEST_IS_REGULAR);
+      g_free (pp);
+      g_free (bp);
+      g_free (param);
+      g_free (bin);
+    }
+  return ok;
+}
+
+gboolean
+nfc_upscale_resolve (const char *bin, const char *config_path, char **models, char **model)
+{
+  char *real, *bindir, *dir, *text = NULL, *want = NULL, *chosen = NULL;
+
+  *models = NULL;
+  *model = NULL;
+  if (bin == NULL)
+    return FALSE;
+  real = realpath (bin, NULL);
+  bindir = g_path_get_dirname (real != NULL ? real : bin);
+  free (real);
+  dir = g_build_filename (bindir, "..", "models", NULL);
+  g_free (bindir);
+  *models = g_canonicalize_filename (dir, NULL);
+  g_free (dir);
+  if (!g_file_test (*models, G_FILE_TEST_IS_DIR))
+    {
+      nfc_log ("Upscale: no models directory at %s: Upscale is not offered", *models);
+      g_clear_pointer (models, g_free);
+      return FALSE;
+    }
+  if (config_path != NULL && g_file_get_contents (config_path, &text, NULL, NULL))
+    want = nfc_upscale_config_model (text);
+  g_free (text);
+  if (want != NULL)
+    {
+      if (upscale_model_present (*models, want))
+        chosen = g_strdup (want);
+      else
+        nfc_log ("Upscale: upscale-model=%s in %s is not an installed model (%s/%s.param and "
+                 ".bin): using %s", want, config_path, *models, want, NFC_UPSCALE_DEFAULT_MODEL);
+    }
+  g_free (want);
+  if (chosen == NULL && upscale_model_present (*models, NFC_UPSCALE_DEFAULT_MODEL))
+    chosen = g_strdup (NFC_UPSCALE_DEFAULT_MODEL);
+  if (chosen == NULL)
+    {
+      nfc_log ("Upscale: model %s is not in %s: Upscale is not offered",
+               NFC_UPSCALE_DEFAULT_MODEL, *models);
+      g_clear_pointer (models, g_free);
+      return FALSE;
+    }
+  *model = chosen;
+  return TRUE;
+}
+
+#define UPSCALE_BASE_BYTES ((guint64) 1024 * 1024 * 1024) /* upscayl-bin alone: ~1 GiB RSS */
+
+guint64
+nfc_upscale_peak_bytes (const NfcUpscalePreset *p, guint64 w, guint64 h, const char *key)
+{
+  NfcImageInfo info = { 0 };
+  guint f = nfc_upscale_chain_factor (p);
+
+  info.width = MIN (w, (guint64) 1 << 20) * f;
+  info.height = MIN (h, (guint64) 1 << 20) * f;
+  return nfc_estimate_peak_bytes ("png", key, &info) + UPSCALE_BASE_BYTES;
+}
+
+guint
+nfc_upscale_timeout_secs (guint64 ow, guint64 oh)
+{
+  guint64 mp = (MIN (ow, (guint64) 1 << 20) * MIN (oh, (guint64) 1 << 20) + 999999) / 1000000;
+
+  return (guint) MIN (120 + 4 * mp, (guint64) 2 * 3600);
+}
+
 #define T(k, l, e) { k, l, e }
 static const NfcTarget image_targets[] = {
   T ("png", "PNG", "png"), T ("jpg", "JPG", "jpg"), T ("webp", "WEBP", "webp"),
@@ -1185,6 +1449,27 @@ nfc_resize_available (NfcCategory cat, const char *fmt)
   return target_avail (t.cat, need) == AV_YES;
 }
 
+gboolean
+nfc_upscale_available (NfcCategory cat, const char *fmt)
+{
+  NfcUpscaleTarget t;
+
+  nfc_tools_init ();
+  if (nfc_tools.upscayl == NULL || nfc_tools.upscale_models == NULL ||
+      nfc_tools.upscale_model == NULL || nfc_tools.magick == NULL)
+    return FALSE;
+  if (!nfc_upscale_target (cat, fmt, 0, 0, &t))
+    return FALSE;
+  /* a HEIC/AVIF source is decoded by the helper (GdkPixbuf) */
+  if (is_pixbuf_src (fmt) && pixbuf_can_read (fmt) != AV_YES)
+    return FALSE;
+  /* the result is written by ImageMagick: PNG always (the WEBP cap, the other
+   * sources), and the source's own format for JPG and WEBP */
+  if (im_can_write ("PNG") != AV_YES)
+    return FALSE;
+  return g_str_equal (t.key, "png") || im_can_write (im_format_name (t.key)) == AV_YES;
+}
+
 /* -------------------------------------------------------------------------
  * Selection analysis
  * ---------------------------------------------------------------------- */
@@ -1199,6 +1484,7 @@ nfc_selection_clear (NfcSelection *sel)
   g_clear_pointer (&sel->targets, g_ptr_array_unref);
   g_clear_pointer (&sel->dims, g_array_unref);
   g_clear_pointer (&sel->resize, g_ptr_array_unref);
+  g_clear_pointer (&sel->upscale, g_ptr_array_unref);
   sel->can_compress = FALSE;
 }
 
@@ -1231,6 +1517,33 @@ resize_presets_for (NfcCategory cat, const GArray *dims)
 
           any = d->width == 0 || d->height == 0 ||
                 nfc_resize_output_size (&all[k], d->width, d->height, NULL, NULL);
+        }
+      if (any)
+        g_ptr_array_add (out, (gpointer) &all[k]);
+    }
+  return out;
+}
+
+/* The Upscale presets to offer: those whose result fits the limits for at least
+ * one file; a file of unknown size counts as fitting everything (the job reads
+ * the real size and skips what is too big). */
+static GPtrArray *
+upscale_presets_for (const GArray *dims)
+{
+  GPtrArray *out = g_ptr_array_new ();
+  guint n;
+  const NfcUpscalePreset *all = nfc_upscale_presets (&n);
+
+  for (guint k = 0; k < n; k++)
+    {
+      gboolean any = dims == NULL || dims->len == 0;
+
+      for (guint i = 0; dims != NULL && i < dims->len && !any; i++)
+        {
+          const NfcDims *d = &g_array_index (dims, NfcDims, i);
+
+          any = d->width == 0 || d->height == 0 ||
+                nfc_upscale_output_size (&all[k], d->width, d->height, NULL, NULL);
         }
       if (any)
         g_ptr_array_add (out, (gpointer) &all[k]);
@@ -1357,8 +1670,19 @@ nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel)
     if (all)
       sel->resize = resize_presets_for (cat, sel->dims);
   }
+  /* Upscale: every selected file an image the backend can take, and a preset
+   * whose result fits the limits for one of them */
+  {
+    gboolean all = TRUE;
+
+    for (guint i = 0; i < sel->fmts->len && all; i++)
+      all = nfc_upscale_available (cat, sel->fmts->pdata[i]);
+    if (all)
+      sel->upscale = upscale_presets_for (sel->dims);
+  }
   ok = sel->targets->len > 0 || sel->can_compress ||
-       (sel->resize != NULL && sel->resize->len > 0);
+       (sel->resize != NULL && sel->resize->len > 0) ||
+       (sel->upscale != NULL && sel->upscale->len > 0);
 
 out:
   g_clear_pointer (&first, g_ptr_array_unref);
@@ -2148,6 +2472,139 @@ add_resize_video_attempts (GPtrArray *attempts, const char *key, const char *src
   return FALSE;
 }
 
+/* One `upscayl-bin` pass: in -> out (PNG), the model's output scaled to `scale`
+ * times the input (the backend resizes the 4x result itself). */
+static char **
+upscayl_step (const char *in, const char *out, guint scale)
+{
+  GPtrArray *a = av_new ();
+  char *s = g_strdup_printf ("%u", scale);
+
+  av_add (a, nfc_tools.upscayl, "-i", in, "-o", out, "-m", nfc_tools.upscale_models,
+          "-n", nfc_tools.upscale_model, "-s", s, "-f", "png", NULL);
+  g_free (s);
+  return av_done (a);
+}
+
+GPtrArray *
+nfc_build_attempts_upscale (const char *fmt, const char *key, const NfcUpscalePreset *p,
+                            const char *src_in, const char *out, const char *workdir,
+                            gboolean *needs_decode)
+{
+  GPtrArray *attempts, *a;
+  GPtrArray *at;
+  char *src, *in_png, *last, *arg, *o;
+  const char *imname;
+  guint chain;
+
+  if (needs_decode != NULL)
+    *needs_decode = FALSE;
+  if (fmt == NULL || key == NULL || p == NULL || src_in == NULL || out == NULL || workdir == NULL)
+    return NULL;
+  if (nfc_tools.upscayl == NULL || nfc_tools.upscale_models == NULL ||
+      nfc_tools.upscale_model == NULL || nfc_tools.magick == NULL)
+    return NULL;
+  imname = im_format_name (key);
+  if (imname == NULL || !(g_str_equal (key, "png") || g_str_equal (key, "jpg") ||
+                          g_str_equal (key, "webp")))
+    return NULL;
+  if (!nfc_upscale_target (NFC_CAT_IMAGE, fmt, 0, 0, NULL))
+    return NULL;
+  chain = nfc_upscale_chain_factor (p);
+  src = g_canonicalize_filename (src_in, NULL);
+  attempts = attempts_new ();
+  at = attempt_new ();
+
+  /* 1. a PNG the backend reads: what it gets is always 8-bit, upright, with a
+   * colour type it knows */
+  if (is_pixbuf_src (fmt))
+    {
+      /* nfc-decode <src> <workdir>/decoded.png: orientation applied, 8-bit RGB(A) */
+      if (nfc_tools.decode == NULL)
+        goto fail;
+      in_png = g_build_filename (workdir, "decoded.png", NULL);
+      a = av_new ();
+      av_add (a, nfc_tools.decode, src, in_png, NULL);
+      g_ptr_array_add (at, av_done (a));
+      if (needs_decode != NULL)
+        *needs_decode = TRUE;
+    }
+  else
+    {
+      const char *coder = im_input_coder (fmt);
+
+      if (coder == NULL)
+        goto fail;
+      in_png = g_build_filename (workdir, "in.png", NULL);
+      a = av_new ();
+      av_add (a, nfc_tools.magick, "-quiet", NULL);
+      im_limits (a);
+      arg = im_path_arg (coder, src, "[0]");
+      o = im_path_arg ("PNG", in_png, NULL);
+      av_add (a, arg, "-auto-orient", "-depth", "8", o, NULL);
+      g_free (arg);
+      g_free (o);
+      g_ptr_array_add (at, av_done (a));
+    }
+
+  /* 2. the passes */
+  last = g_build_filename (workdir, "up1.png", NULL);
+  g_ptr_array_add (at, upscayl_step (in_png, last, p->pass[0]));
+  if (p->pass[1] != 0)
+    {
+      char *next = g_build_filename (workdir, "up2.png", NULL);
+
+      g_ptr_array_add (at, upscayl_step (last, next, p->pass[1]));
+      g_free (last);
+      last = next;
+    }
+
+  /* 3. the result: exact size, the Best settings of the output format */
+  a = av_new ();
+  av_add (a, nfc_tools.magick, "-quiet", NULL);
+  im_limits (a);
+  arg = im_path_arg ("PNG", last, "[0]"); /* the [0] also makes ImageMagick read "%%" as "%" */
+  av_add (a, arg, NULL);
+  g_free (arg);
+  if (chain != p->factor)
+    {
+      /* 6x -> 5x: Lanczos, by an exact ratio (the size rounds to the integer) */
+      char *pct = g_strdup_printf ("%.10f%%", 100.0 * p->factor / chain);
+
+      av_add (a, "-filter", "Lanczos", "-resize", pct, NULL);
+      g_free (pct);
+    }
+  if (g_str_equal (key, "jpg"))
+    {
+      im_flatten (a);
+      av_add (a, "-quality", photo_source (fmt) ? "95" : "99", "-sampling-factor", "4:4:4", NULL);
+    }
+  else if (g_str_equal (key, "webp"))
+    {
+      av_add (a, "-resize", "16383x16383>", NULL);
+      if (photo_source (fmt))
+        av_add (a, "-quality", "90", "-define", "webp:method=6",
+                "-define", "webp:use-sharp-yuv=true", NULL);
+      else
+        av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
+    }
+  o = im_path_arg (imname, out, NULL);
+  av_add (a, o, NULL);
+  g_free (o);
+  g_ptr_array_add (at, av_done (a));
+  g_ptr_array_add (attempts, at);
+  g_free (in_png);
+  g_free (last);
+  g_free (src);
+  return attempts;
+
+fail:
+  g_ptr_array_unref (at);
+  g_ptr_array_unref (attempts);
+  g_free (src);
+  return NULL;
+}
+
 static GPtrArray *build_attempts (NfcCategory cat, const char *fmt, const char *key,
                                   NfcPreset preset, const NfcResizePreset *rs,
                                   const char *src_in, const char *out, const char *workdir,
@@ -2732,7 +3189,11 @@ static const char *const known_cause[] = {
   "error while opening decoder", "decoderpluginerror", "loadingerror", "unknown decoder",
   "no such file", "permission denied", "invalid data found", "not a jpeg",
   "improper image header", "cache resources exhausted", "no space left", "memory allocation",
-  "cannot allocate memory", "out of memory", "unable to open", "corrupt", "truncated", NULL
+  "cannot allocate memory", "out of memory", "unable to open", "corrupt", "truncated",
+  /* upscayl-bin (Vulkan / ncnn) */
+  "vkcreateinstance failed", "invalid gpu device", "vkallocatememory failed",
+  "vkcreatebuffer failed", "vkqueuesubmit failed", "vkwaitforfences failed",
+  "device_lost", "couldn't read the image", "unknown model dir", ".param failed", ".bin failed", NULL
 };
 static const char *const generic_cause[] = { "error", "failed", "unable", NULL };
 
@@ -2817,6 +3278,23 @@ truncated_copy (const char *s)
   return g_strdup (s);
 }
 
+/* Lines that are not a message about what happened: upscayl-bin lists its Vulkan
+ * devices ("[0 AMD Radeon ...]  queueC=1[4] ...") and chats about its progress. */
+static gboolean
+ignorable_line (const char *s)
+{
+  static const char *const prefixes[] = {
+    "WARNING: radv", "🚀", "✨", "🏞", "🙌", NULL
+  };
+
+  if (s[0] == '[' && g_ascii_isdigit (s[1]))
+    return TRUE;
+  for (const char *const *p = prefixes; *p != NULL; p++)
+    if (g_str_has_prefix (s, *p))
+      return TRUE;
+  return FALSE;
+}
+
 char *
 nfc_failure_message (const char *text, const char *src_fmt)
 {
@@ -2837,7 +3315,7 @@ nfc_failure_message (const char *text, const char *src_fmt)
       char *lower;
       int rank;
 
-      if (*s == '\0')
+      if (*s == '\0' || ignorable_line (s))
         continue;
       lower = g_ascii_strdown (s, -1);
       rank = line_has_any (lower, known_cause) ? 3 : line_has_any (lower, generic_cause) ? 2 : 1;
@@ -2876,6 +3354,19 @@ nfc_failure_message (const char *text, const char *src_fmt)
     }
   else if (strstr (lb, "cache resources exhausted") != NULL)
     res = g_strdup ("image too large for available memory");
+  /* the Upscale backend (upscayl-bin: ncnn on Vulkan) */
+  else if (strstr (lb, "vkcreateinstance failed") != NULL || strstr (lb, "invalid gpu device") != NULL)
+    res = g_strdup ("no usable GPU: Upscale needs a Vulkan-capable graphics card and driver");
+  else if (strstr (lb, "vkallocatememory failed") != NULL || strstr (lb, "vkcreatebuffer failed") != NULL)
+    res = g_strdup ("the GPU ran out of memory (try a smaller image or a lower scale)");
+  else if (strstr (lb, "vkqueuesubmit failed") != NULL || strstr (lb, "vkwaitforfences failed") != NULL ||
+           strstr (lb, "device_lost") != NULL)
+    res = g_strdup ("the GPU stopped responding (try again, or a lower scale)");
+  else if (strstr (lb, "unknown model dir") != NULL || strstr (lb, ".param failed") != NULL ||
+           strstr (lb, ".bin failed") != NULL)
+    res = g_strdup ("the Upscale model files are missing (check upscale-model in the config)");
+  else if (strstr (lb, "couldn't read the image") != NULL)
+    res = g_strdup ("the Upscale backend could not read the image");
   else if (strstr (lb, "no space left on device") != NULL)
     res = g_strdup ("disk full");
   else

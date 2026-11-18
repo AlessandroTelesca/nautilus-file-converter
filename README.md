@@ -8,7 +8,8 @@ Balanced, Small; see "Quality presets" below). A second entry, "Compress"
 (High, Balanced, Small), makes a smaller copy of a JPG, WEBP, AVIF, MP4, WebM or
 GIF in the same format (see "Compress" below), and "Resize" (1080p, 720p, 50 %, ...;
 only sizes smaller than the file) makes a copy at a smaller pixel size (see "Resize"
-below).
+below). With Upscayl installed a further entry, "Upscale" (2×, 3×, 4×, 5×, 6×, 8×), makes
+an AI-enlarged copy of an image on the GPU (see "Upscale" below).
 
 Written in C against `libnautilus-extension-4` (Nautilus 43+ / GTK 4) and built
 with meson. There is no scripting-language runtime involved: no Python, no
@@ -336,6 +337,10 @@ sudo dnf install ImageMagick ffmpeg libreoffice libnotify
 * `ImageMagick` (`magick`, or `convert` for IM6): image conversion
 * `ffmpeg` (the full build, e.g. from RPM Fusion, for libx264/libmp3lame/libopus...)
 * `libreoffice` (provides `soffice`): documents
+* `Upscayl` (optional, for Upscale only): its backend `upscayl-bin` and models, from the
+  [release RPM](https://github.com/upscayl/upscayl/releases) (`/opt/Upscayl`) or anywhere
+  `upscayl-bin` is on the `PATH` with a `models` directory beside its `bin` directory;
+  a Vulkan-capable GPU and driver
 * `libnotify` (`notify-send`): result notifications, replaced in place using
   `--print-id` / `--replace-id`
 * HEIC/AVIF input needs a GdkPixbuf HEIF loader (used by `nfc-decode`). On Fedora 44 `gdk-pixbuf2`
@@ -475,6 +480,112 @@ the main thread or crash the process:
 * **Decoding untrusted HEIC/AVIF** happens in the `nfc-decode` process, never
   inside Nautilus.
 
+### Upscale
+
+With [Upscayl](https://upscayl.org) installed the menu has a last entry, **Upscale**
+(item names `FileConverter::Upscale::<key>`): **2×, 3×, 4×, 5×, 6×, 8×** (keys `2x 3x 4x
+5x 6x 8x`). Every selected image becomes a copy that many times as wide and tall,
+named `photo (4x).png` (the normal no-overwrite publishing: `photo (4x) (1).png` if
+that exists), made by Upscayl's own backend, `upscayl-bin` (Real-ESRGAN through
+ncnn/Vulkan, so it needs a GPU with a Vulkan driver; a CPU Vulkan device such as
+llvmpipe works too, a few times slower than the GPU in a quick test). Nothing in the
+menu talks to the GPU: the entry is only a menu item until it is clicked.
+
+* **When it is offered.** `upscayl-bin` is looked up once, when the module loads:
+  `$NFC_UPSCAYL_BIN` (tests), then Upscayl's install
+  (`/opt/Upscayl/resources/bin/upscayl-bin`), then `upscayl-bin` on the `PATH`. Its
+  models are `<bindir>/../models` (`<name>.param` + `<name>.bin`). No binary, no
+  models directory or no usable model: no Upscale entry, and the rest of the menu is
+  untouched. Images only: PNG, JPG, WEBP, AVIF, HEIC, BMP, TIFF and GIF (its first
+  frame); not SVG (vector: nothing to enlarge), not ICO, no video.
+* **Model.** `upscayl-standard-4x` by default. To use another installed one create
+  `$XDG_CONFIG_HOME/nautilus-file-converter/config` (`~/.config/...`), a plain
+  `key=value` file with `#` comments:
+
+  ```
+  upscale-model=remacri-4x
+  ```
+
+  The name must be a model whose `.param` and `.bin` files exist in the models
+  directory (`digital-art-4x`, `high-fidelity-4x`, `remacri-4x`, `ultramix-balanced-4x`,
+  `ultrasharp-4x`, `upscayl-lite-4x`, `upscayl-standard-4x` with Upscayl 2.15); anything
+  else is logged and ignored (the default is used). The file is read once, with the
+  tool paths: restart Nautilus after editing it.
+* **How the scales are made.** One pass is `upscayl-bin -s N`: the 4× model enlarges
+  four times and the backend resizes that to N. For 2× and 3× this was compared with a
+  4× pass shrunk by ImageMagick's Lanczos (against ground truth made by shrinking
+  real pictures: SSIM and PSNR were better for `-s N` on two of three images at 2× and
+  all three at 3×, by eye
+  they are indistinguishable), so the simpler one-process form is used. The bigger
+  factors chain passes, the second one on the first one's output: **6× = 3× then 2×,
+  8× = 4× then 2×**. **5×** has no integer product: it is made as 6× and shrunk by
+  5/6 with Lanczos. Against the alternatives (one 4× pass stretched by 1.25, which is
+  also what `-s 5` does inside the backend, and 8× shrunk) 6× → 5× kept the most
+  detail (Laplacian variance 18 against 9.5 on the photo, whose original is 29.3;
+  100 against 8.7 on a text screenshot) at a PSNR about 1 dB lower, for the price of a
+  second pass. The sizes are exact (`width × factor`), the passes never round.
+* **Input.** An ImageMagick step first writes the first frame as an upright 8-bit PNG
+  (`-auto-orient`, which the backend does not apply to JPG and WEBP, and which also
+  takes care of CMYK, 16-bit, palette and gray files); the backend itself reads only
+  JPG, PNG and WEBP. HEIC and AVIF are decoded by `nfc-decode` as for every other
+  conversion. The result of the passes is written by ImageMagick at the Best settings
+  of its format.
+* **Output format.** The source's own for JPG (q95 4:4:4, flattened on white), PNG and
+  WEBP (as in Resize: lossy q90 for a WEBP, which counts as a photo); a transparent
+  WEBP or PNG **keeps its alpha** (the backend upscales the alpha channel separately:
+  checked on a transparent sticker, the result's alpha matches a Lanczos enlargement of
+  the original's to 53 dB PSNR). HEIC, AVIF, BMP, TIFF and GIF become PNG. A WEBP
+  whose result would exceed WebP's 16383 px per side becomes a PNG as well, and the
+  notification says so. Embedded colour profiles are not carried over (the backend
+  drops them; the result is plain sRGB).
+* **Limits.** An Upscale never makes a picture wider or taller than **32768 px or
+  larger than 400 megapixels**, and the entry only offers the scales within that for
+  the selected pictures, using the header sizes the Resize entry reads (5000×4000 offers
+  2×, 3×, 4×; 640×480 offers all six). With several files a scale is offered when it
+  fits at least one; where no size is known (TIFF, a damaged file) every scale is
+  shown, and the job reads the real size first: a file that would be too big is skipped,
+  not failed ("photo.png is too big to upscale 8× (40000×32000 px; the limit is 32768
+  px per side or 400 megapixels)"), and nothing runs for it.
+* **One at a time.** The GPU is one resource: at most **one Upscale job runs at a time**,
+  whichever batch it belongs to (the others wait in the admission queue of "Memory"
+  below; a waiting Upscale job does not hold up the other conversions), and a batch
+  upscales its files one after the other. The jobs go through the same memory
+  admission: peak memory is estimated as the picture the passes make (6× for 5×) times
+  the B/px of the output format, plus 1 GiB for `upscayl-bin` itself (measured about 1.0
+  GiB resident for a small picture and 1.3 GiB for a 5120×3840 result; the backend
+  keeps the full 4× image of its last pass in memory, about 3.6 B per pixel of it).
+  Intermediate PNGs of a result of 25 MP or more live in the disk-backed work
+  directory like other big jobs.
+* **Timeout.** Per step (the prepare, each pass, the final encode): 120 s plus 4 s per
+  output megapixel, at most 2 hours (measured about 3 s per megapixel of a pass's
+  *input* on an RX 9070 XT, so an 8× pass of a result at the 400 MP limit takes about
+  5 minutes there). On a timeout the process group is killed like any other step and the
+  job fails with "timed out (the GPU may be busy or too slow)".
+* **Failures.** `upscayl-bin` exits 0 after most of its errors (unreadable input, a
+  missing model) and only prints them, so the runner treats a pass that wrote nothing
+  as failed and reads its message: "no usable GPU: Upscale needs a Vulkan-capable
+  graphics card and driver" (`vkCreateInstance failed`, `Invalid GPU Device`), "the GPU
+  ran out of memory (try a smaller image or a lower scale)" (`vkAllocateMemory
+  failed`), "the GPU stopped responding", "the Upscale model files are missing (check
+  upscale-model in the config)", "the Upscale backend could not read the image". The
+  lines it prints about every Vulkan device are ignored.
+* **Notifications**: "Upscaling… photo.png (4×)", then "photo.png → photo (4x).png,
+  640×480 → 2560×1920" (the sizes of the files themselves, so an EXIF-rotated photo is
+  right), or "Upscaled 3 files 4×", plus a line for each file that was too big and
+  "Failed: ..." lines.
+
+Measured on a Radeon RX 9070 XT (RADV), 640×480 source, whole pass chain: 2× 1.9 s,
+3× 2.0 s, 4× 2.2 s, 5× 11.7 s, 6× 10.7 s, 8× 16.9 s (a 128×96 source: 0.7 s for
+2×–4×, 1.8 s for 5×/6×, 2.2 s for 8×); about 1.2 GiB of VRAM (a 1.7 GiB desktop was
+already using it), 1.0 to 1.3 GiB RSS.
+
+For features that reuse this: `NfcConvertOptions.upscale` makes a job an Upscale (it
+probes the size, ends with `NFC_CONVERT_ERROR_TOO_BIG` before running anything when the
+result is too big, switches a WEBP that WebP cannot hold to PNG, and takes the GPU slot);
+`nfc_upscale_output_size` is the one rule for "what size, and does it fit";
+`nfc_build_attempts_upscale` builds the steps; `nfc_upscale_resolve` finds the models and
+the configured model; `NfcSelection.upscale` holds the scales to offer.
+
 ### Memory: admission and temp files
 
 One 200 megapixel image needs 6 to 8 GB while it converts, and the runner starts
@@ -523,7 +634,7 @@ ffmpeg is eventually killed). On a timeout the step is cancelled, the whole
 process group is killed with SIGKILL (LibreOffice's `soffice` is a wrapper
 script whose `soffice.bin` child would otherwise keep running and hold the
 pipes open), the temp files are removed, and the job fails with "timed out"
-(no fallback attempt follows a timeout). `NFC_TEST_TIMEOUT_SECS` and
+(no fallback attempt follows a timeout; Upscale steps have their own, see "Upscale"). `NFC_TEST_TIMEOUT_SECS` and
 `NFC_TEST_PROBE_TIMEOUT_SECS` override the timeouts; they exist for the tests
 and are only honoured when set.
 
@@ -673,6 +784,28 @@ meson test -C build
   lossy / lossless / extended and BMP files, plus random bytes; under ASan nothing
   may read out of bounds), and `robustness` checks that the header read neither
   blocks on a FIFO nor reads more than 64 KiB of a 100 GiB file.
+  Upscale: `core-logic` covers the tool discovery (a fake install found through
+  `NFC_UPSCAYL_BIN`, the model of a config file in `XDG_CONFIG_HOME`), the config
+  parser and the model validation (valid, unknown, a path, empty, a missing `.bin`,
+  missing default), the scale rule (640×480 offers all six, 5000×4000 only 2×–4×, the
+  exact 400 MP and 32768 px boundaries, no overflow), the output format (PNG for
+  AVIF/HEIC/BMP/TIFF/GIF, the WEBP → PNG switch at 16383 px) and the argv of every
+  scale (pass chains, the 5/6 shrink, JPG/WEBP encoders, paths with `%`), the memory
+  estimate, the timeout and the failure messages for `upscayl-bin`'s own texts.
+  `module-load-and-menu` checks the entry with a fake `upscayl-bin` (every scale for
+  640×480 with its labels and exact sizes in the tooltips, hidden scales for 5000×4000, 3840×2160
+  and a 4100 px strip, none for 20000×20, a selection, an unreadable file, BMP/TIFF/GIF/WEBP; absent
+  for SVG, ICO, video, audio, a document, a folder, mixed selections; always after
+  Resize) and `module-no-upscayl` / `module-no-models` that nothing appears without the binary or the
+  models. `conversions` runs the **real** `upscayl-bin` on tiny pictures (2×/3×/4× on
+  128×96, 5×/6×/8× on 64×48, a JPG, a transparent WEBP and PNG, AVIF/BMP/TIFF/GIF to
+  PNG, an EXIF-rotated JPG, CMYK, 16-bit and gray sources, the `(2x) (1)` naming), checking
+  exact size, real type and nothing left behind, and with a fake `upscayl-bin` the failure
+  texts (no Vulkan device, out of VRAM, unreadable input and missing model with exit 0, silent
+  exit 0), the timeout kills the process group, and two jobs at once run one after the other.
+  These rows say SKIPPED, and pass, when there is no `upscayl-bin`, no working Vulkan device
+  (a probe picture is upscaled first) or `NFC_TEST_SKIP_GPU` is set.
+  `NFC_TEST_ONLY=upscale` runs just these (the rest takes minutes).
 
 ## License
 
