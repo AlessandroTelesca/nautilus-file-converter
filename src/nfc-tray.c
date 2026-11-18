@@ -37,6 +37,7 @@
 #define THROTTLE_MS     500   /* at most one update this often */
 #define REGISTER_TIMEOUT_MS 10000
 #define MAX_JOB_LINES   8
+#define MAX_CALL_ITEMS  4096  /* the longest id, name or event list a menu call may bring */
 
 /* dbusmenu item ids */
 #define ID_ROOT         0
@@ -139,6 +140,8 @@ typedef struct {
   GDBusConnection *conn;    /* from the bus_acquired callback */
   guint sni_reg, menu_reg;
   gboolean name_owned, watcher_present, registered, registering;
+  guint watcher_gen;        /* bumped when the watcher or our name changes: a registration
+                             * made under an older one counts for nothing */
   GCancellable *cancel;     /* the RegisterStatusNotifierItem call */
   char *tooltip;            /* the tooltip text */
   GPtrArray *lines;         /* char *: the job lines of the menu (at most MAX_JOB_LINES) */
@@ -188,6 +191,15 @@ item_unref (gpointer data)
 }
 
 /* ---- the menu ---- */
+
+/* a string variant of text that may hold any bytes (a file name from an old zip): a
+ * variant string must be valid UTF-8, and a bad one makes GLib complain and the item
+ * malformed */
+static GVariant *
+string_variant (const char *text)
+{
+  return g_variant_new_take_string (g_utf8_make_valid (text != NULL ? text : "", -1));
+}
 
 /* a dbusmenu label: "_" introduces a mnemonic there, a file name keeps its own */
 static char *
@@ -260,7 +272,7 @@ menu_props (const Item *it, gint32 id)
       else
         raw = g_strdup (g_ptr_array_index (it->lines, id - ID_FIRST_JOB));
       label = menu_label (raw);
-      g_variant_builder_add (&b, "{sv}", "label", g_variant_new_string (label));
+      g_variant_builder_add (&b, "{sv}", "label", string_variant (label));
       g_variant_builder_add (&b, "{sv}", "enabled", g_variant_new_boolean (id == ID_CANCEL_ALL));
       g_free (label);
       g_free (raw);
@@ -331,28 +343,50 @@ menu_method_call (GDBusConnection *conn G_GNUC_UNUSED, const char *sender G_GNUC
     {
       GVariantBuilder out;
       GVariant *want = g_variant_get_child_value (params, 0);
-      GArray *all = menu_ids (it);
-      gint32 root = ID_ROOT;
+      GVariant *names = g_variant_get_child_value (params, 1);
       gsize n = g_variant_n_children (want);
 
+      /* the menu has a dozen items: a longer list is a client gone wrong, and every
+       * entry of it would cost a reply tree */
+      if (n > MAX_CALL_ITEMS || g_variant_n_children (names) > MAX_CALL_ITEMS)
+        {
+          g_variant_unref (want);
+          g_variant_unref (names);
+          g_dbus_method_invocation_return_error (inv, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+                                                 "too many ids or property names");
+          return;
+        }
       g_variant_builder_init (&out, G_VARIANT_TYPE ("a(ia{sv})"));
       if (n == 0) /* none named: all of them */
         {
+          GArray *all = menu_ids (it);
+          gint32 root = ID_ROOT;
+
           g_variant_builder_add (&out, "(i@a{sv})", root, menu_props (it, root));
           for (guint i = 0; i < all->len; i++)
             g_variant_builder_add (&out, "(i@a{sv})", g_array_index (all, gint32, i),
                                    menu_props (it, g_array_index (all, gint32, i)));
+          g_array_free (all, TRUE);
         }
-      for (gsize i = 0; i < n; i++)
+      else
         {
-          gint32 id;
+          /* each item at most once, in the order first named: the reply never has
+           * more entries than the menu has items */
+          gboolean seen[ID_CANCEL_ALL + 1] = { FALSE };
 
-          g_variant_get_child (want, i, "i", &id);
-          if (menu_id_valid (it, id))
-            g_variant_builder_add (&out, "(i@a{sv})", id, menu_props (it, id));
+          for (gsize i = 0; i < n; i++)
+            {
+              gint32 id;
+
+              g_variant_get_child (want, i, "i", &id);
+              if (!menu_id_valid (it, id) || seen[id])
+                continue;
+              seen[id] = TRUE;
+              g_variant_builder_add (&out, "(i@a{sv})", id, menu_props (it, id));
+            }
         }
-      g_array_free (all, TRUE);
       g_variant_unref (want);
+      g_variant_unref (names);
       g_dbus_method_invocation_return_value (inv, g_variant_new ("(a(ia{sv}))", &out));
     }
   else if (g_str_equal (method, "GetProperty"))
@@ -394,27 +428,29 @@ menu_method_call (GDBusConnection *conn G_GNUC_UNUSED, const char *sender G_GNUC
       gint32 id;
       const char *event;
       GVariant *events = g_variant_get_child_value (params, 0);
-      GArray *todo = g_array_new (FALSE, FALSE, sizeof (gint32));
-      GPtrArray *names = g_ptr_array_new_with_free_func (g_free);
+      gboolean cancel = FALSE;
 
+      if (g_variant_n_children (events) > MAX_CALL_ITEMS)
+        {
+          g_variant_unref (events);
+          g_dbus_method_invocation_return_error (inv, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+                                                 "too many events");
+          return;
+        }
       g_variant_builder_init (&errs, G_VARIANT_TYPE ("ai"));
       g_variant_iter_init (&iter, events);
       while (g_variant_iter_next (&iter, "(i&s@vu)", &id, &event, NULL, NULL))
         {
-          if (menu_id_valid (it, id))
-            {
-              g_array_append_val (todo, id);
-              g_ptr_array_add (names, g_strdup (event));
-            }
-          else
+          if (!menu_id_valid (it, id))
             g_variant_builder_add (&errs, "i", id);
+          else if (id == ID_CANCEL_ALL && g_str_equal (event, "clicked"))
+            cancel = TRUE; /* once, however often it was sent */
         }
+      /* answer first: cancelling may end jobs, and so end this item */
       g_dbus_method_invocation_return_value (inv, g_variant_new ("(ai)", &errs));
-      for (guint i = 0; i < todo->len; i++)
-        menu_handle_event (g_array_index (todo, gint32, i), names->pdata[i]);
-      g_array_free (todo, TRUE);
-      g_ptr_array_unref (names);
       g_variant_unref (events);
+      if (cancel)
+        nfc_cancel_all ();
     }
   else if (g_str_equal (method, "AboutToShow"))
     {
@@ -496,8 +532,8 @@ sni_get_property (GDBusConnection *conn G_GNUC_UNUSED, const char *sender G_GNUC
       g_str_equal (prop, "AttentionIconPixmap"))
     return empty_pixmaps ();
   if (g_str_equal (prop, "ToolTip"))
-    return g_variant_new ("(s@a(iiay)ss)", TRAY_ICON, empty_pixmaps (), TRAY_TITLE,
-                          it->tooltip != NULL ? it->tooltip : "");
+    return g_variant_new ("(s@a(iiay)s@s)", TRAY_ICON, empty_pixmaps (), TRAY_TITLE,
+                          string_variant (it->tooltip));
   return NULL;
 }
 
@@ -528,7 +564,7 @@ item_emit (Item *it, const char *path, const char *iface, const char *signal, GV
 static gboolean
 item_apply (Item *it, const NfcActivity *a)
 {
-  char *tooltip = g_strdup (a != NULL && a->summary != NULL ? a->summary : "");
+  char *tooltip = g_utf8_make_valid (a != NULL && a->summary != NULL ? a->summary : "", -1);
   GPtrArray *lines = g_ptr_array_new_with_free_func (g_free);
   guint more = 0;
   gboolean layout_changed;
@@ -536,7 +572,7 @@ item_apply (Item *it, const NfcActivity *a)
   if (a != NULL && a->lines != NULL)
     {
       for (guint i = 0; i < a->lines->len && i < MAX_JOB_LINES; i++)
-        g_ptr_array_add (lines, g_strdup (g_ptr_array_index (a->lines, i)));
+        g_ptr_array_add (lines, g_utf8_make_valid (g_ptr_array_index (a->lines, i), -1));
       more = a->lines->len > MAX_JOB_LINES ? a->lines->len - MAX_JOB_LINES : 0;
       more += a->n_unstarted;
     }
@@ -586,22 +622,43 @@ menu_refresh (Item *it)
 
 /* ---- the bus ---- */
 
+/* a RegisterStatusNotifierItem call, and the watcher it was meant for */
+typedef struct {
+  Item *it;
+  guint gen;                /* it->watcher_gen when the call was made */
+} Registration;
+
+static void item_maybe_register (Item *it);
+
 static void
 register_done (GObject *source, GAsyncResult *res, gpointer data)
 {
-  Item *it = data;
+  Registration *reg = data;
+  Item *it = reg->it;
   GError *error = NULL;
   GVariant *v = g_dbus_connection_call_finish (G_DBUS_CONNECTION (source), res, &error);
+  gboolean current = reg->gen == it->watcher_gen;
 
   it->registering = FALSE;
   if (v != NULL)
     {
       g_variant_unref (v);
-      it->registered = TRUE;
+      /* an answer from a watcher that has since been replaced says nothing about
+       * the one there now */
+      if (current)
+        it->registered = TRUE;
     }
   else if (!it->dead && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
     nfc_log ("tray: the StatusNotifierWatcher refused the icon: %s", error->message);
   g_clear_error (&error);
+  /* the watcher changed while this call was out (watcher_appeared could not start a
+   * call of its own then): tell the one that is there now */
+  if (!current)
+    {
+      it->registered = FALSE;
+      item_maybe_register (it);
+    }
+  g_free (reg);
   item_unref (it);
 }
 
@@ -609,15 +666,20 @@ register_done (GObject *source, GAsyncResult *res, gpointer data)
 static void
 item_maybe_register (Item *it)
 {
+  Registration *reg;
+
   if (it->dead || it->conn == NULL || !it->name_owned || !it->watcher_present ||
       it->registered || it->registering)
     return;
+  reg = g_new0 (Registration, 1);
+  reg->it = item_ref (it);
+  reg->gen = it->watcher_gen;
   it->registering = TRUE;
   g_dbus_connection_call (it->conn, WATCHER_NAME, WATCHER_PATH, WATCHER_IFACE,
                           "RegisterStatusNotifierItem",
                           g_variant_new ("(s)", it->bus_name), NULL,
                           G_DBUS_CALL_FLAGS_NO_AUTO_START, REGISTER_TIMEOUT_MS, it->cancel,
-                          register_done, item_ref (it));
+                          register_done, reg);
 }
 
 static void
@@ -654,6 +716,7 @@ name_lost (GDBusConnection *conn G_GNUC_UNUSED, const char *name G_GNUC_UNUSED, 
 
   it->name_owned = FALSE;
   it->registered = FALSE;
+  it->watcher_gen++;
 }
 
 static void
@@ -664,6 +727,7 @@ watcher_appeared (GDBusConnection *conn G_GNUC_UNUSED, const char *name G_GNUC_U
 
   it->watcher_present = TRUE;
   it->registered = FALSE; /* a new watcher knows nothing */
+  it->watcher_gen++;
   item_maybe_register (it);
 }
 
@@ -675,6 +739,7 @@ watcher_vanished (GDBusConnection *conn G_GNUC_UNUSED, const char *name G_GNUC_U
 
   it->watcher_present = FALSE;
   it->registered = FALSE;
+  it->watcher_gen++;
 }
 
 static void

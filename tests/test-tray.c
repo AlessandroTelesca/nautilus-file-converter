@@ -16,10 +16,18 @@
  *  - no watcher: nothing happens, the jobs still work; a watcher that appears
  *    later gets the item
  *  - tray=false (text and file): nothing is put on the bus
+ *  - file names that are not UTF-8 (two of them running at once, and one alone): the
+ *    tooltip, the menu labels and everything sent are valid UTF-8, the layout is
+ *    well formed, nothing crashes and GLib raises no critical
+ *  - menu calls cannot be amplified: ids named twice are answered once, absurdly long
+ *    lists are refused (GetGroupProperties, EventGroup), fast and without memory growth
+ *  - the watcher replaced while a registration is pending: the item registers with
+ *    the new one (once the old one has answered or died)
  */
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <gio/gio.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -128,7 +136,10 @@ bus_call_err (const char *dest, const char *path, const char *iface, const char 
                           G_DBUS_CALL_FLAGS_NONE, 5000, NULL, call_cb, &c);
   SPIN_UNTIL (c.done, 10000);
   if (err != NULL)
-    g_propagate_error (err, c.err);
+    {
+      if (c.err != NULL)
+        g_propagate_error (err, c.err);
+    }
   else
     {
       g_assert_no_error (c.err);
@@ -206,7 +217,7 @@ watcher_got_name (GDBusConnection *c G_GNUC_UNUSED, const char *n G_GNUC_UNUSED,
 }
 
 static void
-watcher_start (void)
+watcher_start_flags (GBusNameOwnerFlags flags)
 {
   g_assert_false (watcher_up);
   if (watcher_info == NULL)
@@ -218,10 +229,16 @@ watcher_start (void)
   g_assert_cmpuint (watcher_reg, !=, 0);
   watcher_name_got = FALSE;
   watcher_own = g_bus_own_name_on_connection (test_conn, WATCHER_NAME,
-                                              G_BUS_NAME_OWNER_FLAGS_NONE, watcher_got_name, NULL,
+                                              flags, watcher_got_name, NULL,
                                               NULL, NULL);
   SPIN_UNTIL (watcher_name_got, 5000);
   watcher_up = TRUE;
+}
+
+static void
+watcher_start (void)
+{
+  watcher_start_flags (G_BUS_NAME_OWNER_FLAGS_NONE);
 }
 
 static void
@@ -370,28 +387,37 @@ set_ffmpeg (const char *secs)
   g_free (body);
 }
 
-/* mp4 -> mkv of the files datadir/<prefix><i>.mp4 */
+/* mp4 -> mkv of the files datadir/<names[i]> (any bytes) */
 static void
-start_batch (const char *prefix, guint n, BatchResult *res)
+start_batch_names (const char *const *names, guint n, BatchResult *res)
 {
   const char **paths = g_new0 (const char *, n + 1), **fmts = g_new0 (const char *, n + 1);
   char **owned = g_new0 (char *, n + 1);
 
   for (guint i = 0; i < n; i++)
     {
-      char *name = g_strdup_printf ("%s%u.mp4", prefix, i + 1);
-
-      owned[i] = B (datadir, name);
+      owned[i] = B (datadir, names[i]);
       g_assert_true (g_file_set_contents (owned[i], "x", -1, NULL));
       paths[i] = owned[i];
       fmts[i] = "mp4";
-      g_free (name);
     }
   memset (res, 0, sizeof *res);
   nfc_batch_run (NFC_CAT_VIDEO, "mkv", "MKV", "mkv", paths, fmts, n, batch_done, res);
   g_strfreev (owned);
   g_free (paths);
   g_free (fmts);
+}
+
+/* mp4 -> mkv of the files datadir/<prefix><i>.mp4 */
+static void
+start_batch (const char *prefix, guint n, BatchResult *res)
+{
+  char **names = g_new0 (char *, n + 1);
+
+  for (guint i = 0; i < n; i++)
+    names[i] = g_strdup_printf ("%s%u.mp4", prefix, i + 1);
+  start_batch_names ((const char *const *) names, n, res);
+  g_strfreev (names);
 }
 
 #define WAIT_BATCH(r, ms) SPIN_UNTIL ((r)->done, (ms))
@@ -768,6 +794,445 @@ test_menu_protocol (void)
   test_end ();
 }
 
+/* ---- file names that are not UTF-8 ---- */
+
+static void
+assert_item_valid (const char *name, const char *expect_tooltip)
+{
+  GPtrArray *items = menu_items (name);   /* asserts every item has a label (or is a separator) */
+  char *text = item_tooltip_text (name);
+  GVariant *r, *arr;
+  GVariantIter iter;
+  GVariant *entry;
+
+  g_assert_true (g_utf8_validate (text, -1, NULL));
+  if (expect_tooltip != NULL)
+    g_assert_cmpstr (text, ==, expect_tooltip);
+  g_free (text);
+  for (guint i = 0; i < items->len; i++)
+    {
+      const MenuItem *m = items->pdata[i];
+
+      if (m->label != NULL)
+        g_assert_true (g_utf8_validate (m->label, -1, NULL));
+    }
+  g_ptr_array_unref (items);
+
+  /* the same through the other calls */
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                g_variant_new ("(@ai@as)", g_variant_new_fixed_array (G_VARIANT_TYPE_INT32, NULL, 0, 4),
+                               g_variant_new_strv (NULL, 0)));
+  arr = g_variant_get_child_value (r, 0);
+  g_variant_iter_init (&iter, arr);
+  while ((entry = g_variant_iter_next_value (&iter)) != NULL)
+    {
+      GVariant *props;
+      const char *label;
+
+      g_variant_get (entry, "(i@a{sv})", NULL, &props);
+      if (g_variant_lookup (props, "label", "&s", &label))
+        g_assert_true (g_utf8_validate (label, -1, NULL));
+      g_variant_unref (props);
+      g_variant_unref (entry);
+    }
+  g_variant_unref (arr);
+  g_variant_unref (r);
+}
+
+/* two bad names at once (the menu lines are sorted: g_utf8_collate crashed on them),
+ * then one alone (a malformed item without its label, and GLib criticals) */
+static void
+test_non_utf8_names (void)
+{
+  const char *two[] = { "bad\xff\xfename.mp4", "caf\xe9.mp4" };
+  const char *one[] = { "solo\xe9\xff.mp4" };
+  BatchResult a;
+  char *name;
+  GPtrArray *items;
+  gboolean seen_bad = FALSE, seen_cafe = FALSE;
+
+  set_ffmpeg ("30");
+  test_begin (TRUE);
+  start_batch_names (two, 2, &a);
+  SPIN_UNTIL (N_REGS () == 1, 5000);
+  name = g_strdup (g_ptr_array_index (registered, 0));
+  for (int i = 0; i < 100; i++)   /* both jobs are running */
+    {
+      items = menu_items (name);
+      if (items->len >= 4)
+        break;
+      g_ptr_array_unref (items);
+      items = NULL;
+      spin_for (50);
+    }
+  g_assert_nonnull (items);
+  g_assert_cmpuint (items->len, ==, 4);  /* two jobs, the separator, Cancel all */
+  for (guint i = 0; i < 2; i++)
+    {
+      const char *l = ((MenuItem *) items->pdata[i])->label;
+
+      g_assert_nonnull (l);
+      g_assert_true (g_utf8_validate (l, -1, NULL));
+      /* the display name: invalid bytes shown as U+FFFD, the rest as it is */
+      seen_bad |= g_str_equal (l, "bad\xef\xbf\xbd\xef\xbf\xbd" "name.mp4 \xe2\x86\x92 MKV");
+      seen_cafe |= g_str_equal (l, "caf\xef\xbf\xbd.mp4 \xe2\x86\x92 MKV");
+    }
+  g_assert_true (seen_bad);
+  g_assert_true (seen_cafe);
+  g_ptr_array_unref (items);
+  assert_item_valid (name, "Converting 2 files to MKV\xe2\x80\xa6");
+  /* new jobs while it is shown: the tooltip and the layout are updated */
+  spin_for (700);
+  assert_item_valid (name, NULL);
+  nfc_cancel_all ();
+  WAIT_BATCH (&a, 20000);
+  batch_result_clear (&a);
+  SPIN_UNTIL (!name_has_owner (name), 5000);
+  g_free (name);
+
+  /* one file alone */
+  start_batch_names (one, 1, &a);
+  SPIN_UNTIL (N_REGS () == 2, 5000);
+  name = g_strdup (g_ptr_array_index (registered, 1));
+  assert_item_valid (name, "Converting solo\xef\xbf\xbd\xef\xbf\xbd.mp4 to MKV\xe2\x80\xa6");
+  items = menu_items (name);
+  g_assert_cmpuint (items->len, ==, 3);
+  g_assert_cmpstr (((MenuItem *) items->pdata[0])->label, ==,
+                   "solo\xef\xbf\xbd\xef\xbf\xbd.mp4 \xe2\x86\x92 MKV");
+  g_ptr_array_unref (items);
+  nfc_cancel_all ();
+  WAIT_BATCH (&a, 20000);
+  batch_result_clear (&a);
+  g_free (name);
+  test_end ();
+}
+
+/* ---- menu calls that could be amplified ---- */
+
+/* the peak resident memory since it was last reset (Linux: clear_refs 5), in kB */
+static long
+peak_rss_kb (gboolean reset)
+{
+  char *t = NULL;
+  long kb = 0;
+
+  if (reset)
+    {
+      int fd = open ("/proc/self/clear_refs", O_WRONLY);
+
+      if (fd >= 0)
+        {
+          if (write (fd, "5", 1) != 1)
+            kb = -1;
+          close (fd);
+        }
+    }
+  if (g_file_get_contents ("/proc/self/status", &t, NULL, NULL))
+    {
+      const char *p = strstr (t, "VmHWM:");
+
+      if (p != NULL)
+        kb = atol (p + 6);
+      g_free (t);
+    }
+  return kb;
+}
+
+static GVariant *
+id_array (gint32 id, gsize n, gint32 mod)
+{
+  gint32 *ids = g_new (gint32, n);
+  GVariant *v;
+
+  for (gsize i = 0; i < n; i++)
+    ids[i] = mod > 0 ? (gint32) (i % mod) : id;
+  v = g_variant_new_fixed_array (G_VARIANT_TYPE_INT32, ids, n, 4);
+  g_free (ids);
+  return v;
+}
+
+static GVariant *
+name_array (gsize n)
+{
+  GVariantBuilder b;
+
+  g_variant_builder_init (&b, G_VARIANT_TYPE ("as"));
+  for (gsize i = 0; i < n; i++)
+    g_variant_builder_add (&b, "s", "label");
+  return g_variant_builder_end (&b);
+}
+
+static GVariant *
+events_array (gsize n, gint32 mod, const char *event)
+{
+  GVariantBuilder b;
+
+  g_variant_builder_init (&b, G_VARIANT_TYPE ("a(isvu)"));
+  for (gsize i = 0; i < n; i++)
+    g_variant_builder_add (&b, "(isvu)", (gint32) (i % mod), event, g_variant_new_int32 (0), 0u);
+  return g_variant_builder_end (&b);
+}
+
+static void
+assert_invalid_args (GVariant *r, GError **err)
+{
+  g_assert_null (r);
+  g_assert_error (*err, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS);
+  g_clear_error (err);
+}
+
+static void
+test_menu_flood (void)
+{
+  BatchResult a;
+  char *name;
+  GPtrArray *items;
+  GVariant *r, *arr;
+  GError *err = NULL;
+  guint real_items;
+  gint64 t0;
+  long before, peak;
+  gboolean sanitized = g_getenv ("NFC_TEST_SANITIZED") != NULL;
+  gboolean valid[20] = { FALSE };
+  guint bad_events = 0;
+
+  set_ffmpeg ("30");
+  test_begin (TRUE);
+  start_batch ("flood", 2, &a);
+  SPIN_UNTIL (N_REGS () == 1, 5000);
+  name = g_strdup (g_ptr_array_index (registered, 0));
+  items = menu_items (name);
+  real_items = items->len + 1;   /* and the root */
+  valid[0] = TRUE;
+  for (guint i = 0; i < items->len; i++)
+    valid[((MenuItem *) items->pdata[i])->id] = TRUE;
+  g_ptr_array_unref (items);
+
+  /* a million times the same id: refused at once, no memory, no stall */
+  before = peak_rss_kb (TRUE);
+  t0 = g_get_monotonic_time ();
+  r = bus_call_err (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                    g_variant_new ("(@ai@as)", id_array (11, 1000000, 0), g_variant_new_strv (NULL, 0)),
+                    &err);
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, (sanitized ? 2000 : 200) * 1000);
+  if (r != NULL)  /* answered instead of refused: then each item once at most */
+    {
+      arr = g_variant_get_child_value (r, 0);
+      g_assert_cmpuint (g_variant_n_children (arr), <=, real_items);
+      g_variant_unref (arr);
+      g_variant_unref (r);
+      g_clear_error (&err);
+    }
+  else
+    assert_invalid_args (NULL, &err);
+  peak = peak_rss_kb (FALSE);
+  if (!sanitized && before > 0)
+    g_assert_cmpint (peak - before, <, 50 * 1024);   /* the baseline was 2.2 GB */
+
+  /* the longest accepted list, all the same id: that item once */
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                g_variant_new ("(@ai@as)", id_array (11, 4096, 0), g_variant_new_strv (NULL, 0)));
+  arr = g_variant_get_child_value (r, 0);
+  g_assert_cmpuint (g_variant_n_children (arr), ==, 1);
+  g_variant_unref (arr);
+  g_variant_unref (r);
+  /* ids that are mostly unknown, every real one named many times: each once, in the
+   * order first named, the unknown ones left out */
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                g_variant_new ("(@ai@as)", id_array (0, 4096, 40), g_variant_new_strv (NULL, 0)));
+  arr = g_variant_get_child_value (r, 0);
+  g_assert_cmpuint (g_variant_n_children (arr), ==, real_items);
+  {
+    GHashTable *seen = g_hash_table_new (g_direct_hash, g_direct_equal);
+    GVariantIter iter;
+    GVariant *entry;
+
+    g_variant_iter_init (&iter, arr);
+    while ((entry = g_variant_iter_next_value (&iter)) != NULL)
+      {
+        gint32 id;
+
+        g_variant_get (entry, "(i@a{sv})", &id, NULL);
+        g_assert_true (g_hash_table_add (seen, GINT_TO_POINTER (id + 1)));
+        g_variant_unref (entry);
+      }
+    g_hash_table_unref (seen);
+  }
+  g_variant_unref (arr);
+  g_variant_unref (r);
+  /* no ids named: all of them, as before */
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                g_variant_new ("(@ai@as)", id_array (0, 0, 0), g_variant_new_strv (NULL, 0)));
+  arr = g_variant_get_child_value (r, 0);
+  g_assert_cmpuint (g_variant_n_children (arr), ==, real_items);
+  g_variant_unref (arr);
+  g_variant_unref (r);
+
+  /* one more than the limit: refused; so is a property filter that long */
+  r = bus_call_err (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                    g_variant_new ("(@ai@as)", id_array (11, 4097, 0), g_variant_new_strv (NULL, 0)),
+                    &err);
+  assert_invalid_args (r, &err);
+  r = bus_call_err (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                    g_variant_new ("(@ai@as)", id_array (11, 1, 0), name_array (5000)), &err);
+  assert_invalid_args (r, &err);
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "GetGroupProperties",
+                g_variant_new ("(@ai@as)", id_array (11, 1, 0), name_array (4096)));
+  g_variant_unref (r);
+
+  /* EventGroup: 20000 events are refused; 4096 harmless ones are answered, with the
+   * unknown ids as errors, and cancel nothing */
+  t0 = g_get_monotonic_time ();
+  r = bus_call_err (name, MENU_PATH, MENU_IFACE, "EventGroup",
+                    g_variant_new ("(@a(isvu))", events_array (20000, 12, "hovered")), &err);
+  assert_invalid_args (r, &err);
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, (sanitized ? 2000 : 500) * 1000);
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "EventGroup",
+                g_variant_new ("(@a(isvu))", events_array (4096, 20, "hovered")));
+  arr = g_variant_get_child_value (r, 0);
+  /* ids 0..19: those that are no item are errors */
+  for (guint i = 0; i < 4096; i++)
+    if (!valid[i % 20])
+      bad_events++;
+  g_assert_cmpuint (bad_events, >, 0);
+  g_assert_cmpuint (g_variant_n_children (arr), ==, bad_events);
+  g_variant_unref (arr);
+  g_variant_unref (r);
+  g_assert_false (a.done);
+
+  /* a flood of "Cancel all" clicks cancels once (and ends everything) */
+  r = bus_call (name, MENU_PATH, MENU_IFACE, "EventGroup",
+                g_variant_new ("(@a(isvu))", events_array (4000, 12, "clicked")));
+  g_variant_unref (r);
+  WAIT_BATCH (&a, 20000);
+  g_assert_cmpuint (a.ok, ==, 0);
+  batch_result_clear (&a);
+  g_free (name);
+  test_end ();
+}
+
+/* ---- the watcher replaced while a registration is pending ---- */
+
+/* a StatusNotifierWatcher on its own connection that holds the registration calls
+ * unanswered until told */
+typedef struct {
+  GDBusConnection *conn;
+  guint reg, own;
+  gboolean got_name;
+  GPtrArray *held;     /* GDBusMethodInvocation *, unanswered */
+} SilentWatcher;
+
+static void
+silent_method (GDBusConnection *c G_GNUC_UNUSED, const char *sender G_GNUC_UNUSED,
+               const char *p G_GNUC_UNUSED, const char *i G_GNUC_UNUSED,
+               const char *m G_GNUC_UNUSED, GVariant *params G_GNUC_UNUSED,
+               GDBusMethodInvocation *inv, gpointer data)
+{
+  SilentWatcher *w = data;
+
+  g_ptr_array_add (w->held, inv);
+}
+
+static const GDBusInterfaceVTable silent_vtable = { silent_method, watcher_prop, NULL, { 0 } };
+
+static void
+silent_got_name (GDBusConnection *c G_GNUC_UNUSED, const char *n G_GNUC_UNUSED, gpointer data)
+{
+  ((SilentWatcher *) data)->got_name = TRUE;
+}
+
+static void
+silent_start (SilentWatcher *w)
+{
+  GError *err = NULL;
+
+  memset (w, 0, sizeof *w);
+  w->held = g_ptr_array_new ();
+  w->conn = g_dbus_connection_new_for_address_sync (g_getenv ("DBUS_SESSION_BUS_ADDRESS"),
+                                                    G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT |
+                                                    G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION,
+                                                    NULL, NULL, &err);
+  g_assert_no_error (err);
+  if (watcher_info == NULL)
+    watcher_info = g_dbus_node_info_new_for_xml (watcher_xml, NULL);
+  w->reg = g_dbus_connection_register_object (w->conn, "/StatusNotifierWatcher",
+                                              watcher_info->interfaces[0], &silent_vtable, w,
+                                              NULL, NULL);
+  g_assert_cmpuint (w->reg, !=, 0);
+  w->own = g_bus_own_name_on_connection (w->conn, WATCHER_NAME,
+                                         G_BUS_NAME_OWNER_FLAGS_ALLOW_REPLACEMENT,
+                                         silent_got_name, NULL, w, NULL);
+  SPIN_UNTIL (w->got_name, 5000);
+}
+
+/* A goes: its connection closes (what its held calls get is an error from the bus) */
+static void
+silent_die (SilentWatcher *w)
+{
+  g_dbus_connection_close_sync (w->conn, NULL, NULL);
+  for (guint i = 0; i < w->held->len; i++)
+    g_object_unref (w->held->pdata[i]);
+  g_ptr_array_unref (w->held);
+  g_object_unref (w->conn);
+}
+
+/* A is replaced by B while the call to A is unanswered. Then A either dies
+ * (die = TRUE) or answers OK late: the item must register with B either way, and
+ * A's answer must not count as B's. */
+static void
+swap_watcher_while_registering (gboolean die)
+{
+  SilentWatcher A;
+  BatchResult a;
+  guint before_b;
+
+  set_ffmpeg ("30");
+  silent_start (&A);
+  nfc_tray_start (TRUE);
+  start_batch ("swap", 1, &a);
+  SPIN_UNTIL (A.held->len == 1, 5000);     /* the call to A is pending */
+  spin_for (200);
+
+  /* B takes the name over */
+  watcher_start_flags (G_BUS_NAME_OWNER_FLAGS_REPLACE);
+  spin_for (700);
+  /* the item cannot tell B while its call to A is out (one at a time) */
+  g_assert_cmpuint (N_REGS (), ==, 0);
+  g_assert_true (nfc_tray_is_shown ());
+  before_b = N_REGS ();
+
+  if (die)
+    {
+      silent_die (&A);
+    }
+  else
+    {
+      g_dbus_method_invocation_return_value (g_ptr_array_index (A.held, 0), NULL);
+      g_ptr_array_remove_index (A.held, 0);
+    }
+  SPIN_UNTIL (N_REGS () == before_b + 1, 8000);   /* told B, once */
+  spin_for (700);
+  g_assert_cmpuint (N_REGS (), ==, before_b + 1);
+  if (!die)
+    silent_die (&A);
+  nfc_cancel_all ();
+  WAIT_BATCH (&a, 20000);
+  batch_result_clear (&a);
+  test_end ();
+}
+
+static void
+test_swap_watcher_a_dies (void)
+{
+  swap_watcher_while_registering (TRUE);
+}
+
+static void
+test_swap_watcher_a_answers (void)
+{
+  swap_watcher_while_registering (FALSE);
+}
+
 static void
 count_signal (GDBusConnection *c G_GNUC_UNUSED, const char *s G_GNUC_UNUSED,
               const char *p G_GNUC_UNUSED, const char *i G_GNUC_UNUSED, const char *n G_GNUC_UNUSED,
@@ -842,6 +1307,10 @@ main (int argc, char **argv)
   g_test_add_func ("/tray/no-watcher-then-watcher", test_no_watcher_then_watcher);
   g_test_add_func ("/tray/disabled", test_disabled);
   g_test_add_func ("/tray/menu-protocol", test_menu_protocol);
+  g_test_add_func ("/tray/non-utf8-names", test_non_utf8_names);
+  g_test_add_func ("/tray/menu-flood", test_menu_flood);
+  g_test_add_func ("/tray/watcher-swap-a-dies", test_swap_watcher_a_dies);
+  g_test_add_func ("/tray/watcher-swap-a-answers", test_swap_watcher_a_answers);
   rc = g_test_run ();
 
   g_dbus_connection_close_sync (test_conn, NULL, NULL);

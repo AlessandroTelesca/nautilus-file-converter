@@ -3075,9 +3075,15 @@ nfc_publish_with_mode (const char *tmp_path, const char *directory, const char *
       /* "name (1)" .. "name (9999)" taken: give up rather than loop on and on */
       if (n >= NFC_MAX_NAME_TRIES)
         {
+          /* a GError message is shown to people: file names as display names */
+          char *dstem = g_filename_display_name (stem);
+          char *ddir = g_filename_display_name (directory);
+
           g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS,
                        "cannot create %s.%s in %s: the first %u names are all taken",
-                       stem, ext, directory, (guint) NFC_MAX_NAME_TRIES);
+                       dstem, ext, ddir, (guint) NFC_MAX_NAME_TRIES);
+          g_free (dstem);
+          g_free (ddir);
           break;
         }
       name = nfc_candidate_name (stem, ext, n);
@@ -3127,10 +3133,12 @@ nfc_publish_with_mode (const char *tmp_path, const char *directory, const char *
     failed:
       {
         int e = errno;
+        char *dcand = g_filename_display_name (cand);
 
         g_set_error (error, G_IO_ERROR, g_io_error_from_errno (e),
-                     "cannot create %s: %s (link: %s)", cand, g_strerror (e),
+                     "cannot create %s: %s (link: %s)", dcand, g_strerror (e),
                      link_errno ? g_strerror (link_errno) : "not tried");
+        g_free (dcand);
         g_free (cand);
         break;
       }
@@ -3299,13 +3307,17 @@ char *
 nfc_failure_message (const char *text, const char *src_fmt)
 {
   char **lines;
-  char *best = NULL, *lb, *res = NULL;
+  char *best = NULL, *lb, *res = NULL, *valid;
   int best_rank = 0, n;
   char *lower_best = NULL;
 
   if (text == NULL)
     return NULL;
-  lines = g_strsplit (text, "\n", -1);
+  /* a tool's output may hold any bytes (a Latin-1 file name it echoes): the message goes
+   * to a notification, so it is valid UTF-8 from here on */
+  valid = g_utf8_make_valid (text, -1);
+  lines = g_strsplit (valid, "\n", -1);
+  g_free (valid);
   n = (int) g_strv_length (lines);
   /* rank 3: a known cause, 2: error/failed/unable, 1: any non-empty line; the
    * last line of the best rank wins */

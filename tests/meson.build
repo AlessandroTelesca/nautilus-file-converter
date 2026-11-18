@@ -68,8 +68,18 @@ dbus_run_session = find_program('dbus-run-session', required: false)
 if dbus_run_session.found()
   tray_env = environment()
   tray_env.set('NFC_TEST_PRIVATE_BUS', '1')
+  tray_env.set('G_DEBUG', 'fatal-criticals')
   test('tray-icon', dbus_run_session, args: ['--', test_tray], timeout: 240,
     env: tray_env, is_parallel: false)
 else
   message('dbus-run-session not found: the tray-icon test is skipped')
 endif
+
+# File names that are not UTF-8: converted with their bytes, shown as display names;
+# any GLib critical fails it.
+test_utf8 = executable('test-utf8', 'test-utf8.c',
+  dependencies: core_dep,
+)
+utf8_env = environment()
+utf8_env.set('G_DEBUG', 'fatal-criticals')
+test('utf8-names', test_utf8, timeout: 240, env: utf8_env, is_parallel: false)

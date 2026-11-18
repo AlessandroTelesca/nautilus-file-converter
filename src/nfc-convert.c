@@ -234,11 +234,14 @@ static void
 job_fail (Job *j, const char *msg)
 {
   GTask *task = j->task;
+  char *valid = g_utf8_make_valid (msg != NULL && *msg ? msg : "conversion failed", -1);
 
   job_cleanup_files (j);
   task_keep_dims (j);
-  g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s",
-                           msg != NULL && *msg ? msg : "conversion failed");
+  /* the message ends up in a notification and a menu: always valid UTF-8, whatever bytes a
+   * tool printed or a file name held */
+  g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s", valid);
+  g_free (valid);
   j->task = NULL;
   job_free (j);
   g_object_unref (task);
@@ -1482,8 +1485,11 @@ notifier_send (Notifier *n, const char *title, const char *body, const char *ico
   if (nfc_tools.notify == NULL)
     return;
   m = g_new0 (NotifyMsg, 1);
-  m->title = g_strdup (title);
-  m->body = g_strdup (body);
+  /* notify-send hands these to D-Bus as strings: they must be valid UTF-8, whatever a
+   * file name or a tool's message held (the texts are built from display names, this
+   * is the last line of defence) */
+  m->title = g_utf8_make_valid (title, -1);
+  m->body = g_utf8_make_valid (body, -1);
   m->icon = g_strdup (icon);
   m->urgency = g_strdup (urgency);
   if (n->busy)
@@ -1603,7 +1609,7 @@ append_failures (Batch *b, GString *body)
       bad++;
       if (shown >= 3)
         continue;
-      base = g_path_get_basename (r->path);
+      base = g_filename_display_basename (r->path);
       if (body->len)
         g_string_append_c (body, '\n');
       g_string_append_printf (body, "Failed: %s — %s", base, r->error);
@@ -1646,8 +1652,8 @@ resize_message (Batch *b, GString *body, const char **icon)
         if (!r->ok)
           continue;
         {
-          char *from = g_path_get_basename (r->path);
-          char *to = g_path_get_basename (r->output);
+          char *from = g_filename_display_basename (r->path);
+          char *to = g_filename_display_basename (r->output);
 
           g_string_append_printf (body, "%s → %s", from, to);
           g_free (from);
@@ -1670,7 +1676,7 @@ resize_message (Batch *b, GString *body, const char **icon)
 
         if (r->skipped)
           {
-            char *base = g_path_get_basename (r->path);
+            char *base = g_filename_display_basename (r->path);
 
             if (body->len)
               g_string_append_c (body, '\n');
@@ -1748,8 +1754,8 @@ upscale_message (Batch *b, GString *body, const char **icon)
 
         if (!r->ok)
           continue;
-        from = g_path_get_basename (r->path);
-        to = g_path_get_basename (r->output);
+        from = g_filename_display_basename (r->path);
+        to = g_filename_display_basename (r->output);
         g_string_append_printf (body, "%s → %s", from, to);
         fmt = path_format_key (r->output);
         if (!nfc_header_read_file (r->output, fmt, &ow, &oh))
@@ -1784,7 +1790,7 @@ upscale_message (Batch *b, GString *body, const char **icon)
 
         if (r->skipped)
           {
-            char *base = g_path_get_basename (r->path);
+            char *base = g_filename_display_basename (r->path);
 
             if (body->len)
               g_string_append_c (body, '\n');
@@ -1846,8 +1852,8 @@ compress_message (Batch *b, GString *body, const char **icon)
 
           if (r->ok)
             {
-              char *from = g_path_get_basename (r->path);
-              char *to = g_path_get_basename (r->output);
+              char *from = g_filename_display_basename (r->path);
+              char *to = g_filename_display_basename (r->output);
               char *suffix = result_suffix (b, i);
 
               g_string_append_printf (body, "%s → %s%s%s", from, to, suffix, saved);
@@ -1870,7 +1876,7 @@ compress_message (Batch *b, GString *body, const char **icon)
 
         if (r->skipped)
           {
-            char *base = g_path_get_basename (r->path);
+            char *base = g_filename_display_basename (r->path);
 
             if (body->len)
               g_string_append_c (body, '\n');
@@ -1891,7 +1897,7 @@ compress_message (Batch *b, GString *body, const char **icon)
 
       if (r->ok || r->skipped)
         continue;
-      base = g_path_get_basename (r->path);
+      base = g_filename_display_basename (r->path);
       if (body->len)
         g_string_append_c (body, '\n');
       g_string_append_printf (body, "Failed: %s — %s", base, r->error);
@@ -1954,8 +1960,8 @@ batch_finish (Batch *b)
       if (b->n == 1)
         {
           NfcResult *r = b->results->pdata[0];
-          char *from = g_path_get_basename (r->path);
-          char *to = g_path_get_basename (r->output);
+          char *from = g_filename_display_basename (r->path);
+          char *to = g_filename_display_basename (r->output);
           char *suffix = result_suffix (b, 0);
 
           g_string_printf (body, "%s → %s%s", from, to, suffix);
@@ -1988,7 +1994,7 @@ batch_finish (Batch *b)
 
           if (r->ok)
             continue;
-          base = g_path_get_basename (r->path);
+          base = g_filename_display_basename (r->path);
           if (body->len)
             g_string_append_c (body, '\n');
           g_string_append_printf (body, "Failed: %s — %s", base, r->error);
@@ -2032,7 +2038,7 @@ batch_item_complete (BatchItem *it, char *output, const GError *error)
   r->ok = r->output != NULL;
   if (!r->ok)
     {
-      r->error = g_strdup (error ? error->message : "conversion failed");
+      r->error = g_utf8_make_valid (error ? error->message : "conversion failed", -1);
       r->skipped = error != NULL &&
                    (g_error_matches (error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER) ||
                     g_error_matches (error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_TOO_BIG));
@@ -2226,7 +2232,7 @@ batch_start (gboolean compress, const NfcResizePreset *resize, const NfcUpscaleP
   b->notifier->sync = g_strdup_printf ("nfc-%08x", g_random_int ());
 
   if (n == 1)
-    what = g_path_get_basename (paths[0]);
+    what = g_filename_display_basename (paths[0]);
   else
     what = g_strdup_printf ("%u files", n);
   {
@@ -2346,7 +2352,7 @@ nfc_activity_clear (NfcActivity *a)
 static char *
 job_line (const Job *j)
 {
-  char *base = g_path_get_basename (j->src);
+  char *base = g_filename_display_basename (j->src);
   char *what, *line;
 
   if (j->upscale != NULL)
@@ -2391,7 +2397,7 @@ activity_summary (guint n_jobs)
 
       if (b->n == 1)
         {
-          char *base = g_path_get_basename (b->paths[0]);
+          char *base = g_filename_display_basename (b->paths[0]);
 
           g_string_append_printf (s, " %s", base);
           g_free (base);
@@ -2429,8 +2435,17 @@ activity_summary (guint n_jobs)
 static gint
 job_line_cmp (gconstpointer a, gconstpointer b)
 {
-  /* stable for the menu: sorted by file name */
-  return g_utf8_collate (*(char *const *) a, *(char *const *) b);
+  const char *x = *(char *const *) a, *y = *(char *const *) b;
+  gint c;
+
+  /* stable for the menu: sorted by file name. The lines are built from display names
+   * and so are valid UTF-8; g_utf8_collate crashes on anything else, so never feed it
+   * a string it would not take */
+  if (g_utf8_validate (x, -1, NULL) && g_utf8_validate (y, -1, NULL))
+    c = g_utf8_collate (x, y);
+  else
+    c = 0;
+  return c != 0 ? c : strcmp (x, y);
 }
 
 gboolean

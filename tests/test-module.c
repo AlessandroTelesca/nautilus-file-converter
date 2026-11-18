@@ -1331,6 +1331,115 @@ test_header_format_menus (void)
 }
 
 
+/* Every name, label and tooltip of the items (and of their submenus) is valid UTF-8:
+ * they are GObject string properties, shown by Nautilus as they are. */
+static guint
+assert_items_valid (GList *items)
+{
+  guint n = 0;
+
+  for (GList *l = items; l; l = l->next)
+    {
+      NautilusMenu *sub = NULL;
+      const char *props[] = { "name", "label", "tip" };
+
+      for (guint p = 0; p < G_N_ELEMENTS (props); p++)
+        {
+          char *v = item_prop (l->data, props[p]);
+
+          if (v != NULL)
+            g_assert_true (g_utf8_validate (v, -1, NULL));
+          g_free (v);
+        }
+      n++;
+      g_object_get (l->data, "menu", &sub, NULL);
+      if (sub != NULL)
+        {
+          GList *sub_items = nautilus_menu_get_items (sub);
+
+          n += assert_items_valid (sub_items);
+          nautilus_menu_item_list_free (sub_items);
+          g_object_unref (sub);
+        }
+    }
+  return n;
+}
+
+/* Files whose names are not UTF-8 (Latin-1 "café", 0xff): the selection is analysed
+ * with the raw bytes of the path, and no item shows them (a menu item's label and
+ * tooltip are UTF-8 properties): all strings are valid, the tooltips still say the
+ * sizes, and nothing is logged as a GLib critical (g_test_init makes them fatal). */
+static void
+test_non_utf8_menus (void)
+{
+  char *magick = g_find_program_in_path ("magick");
+  GList *l, *items;
+  char *names, *labels, *tips;
+  const char *bad_png = "bad\xff\xfe-640.png", *cafe_png = "caf\xe9-4k.png";
+  const char *cafe_mp4 = "caf\xe9.mp4", *bad_jpg = "\xff\xfe-1000.jpg";
+
+  touch (cafe_mp4);
+  if (magick != NULL)
+    {
+      g_assert_true (make_image (magick, bad_png, 640, 480));
+      g_assert_true (make_image (magick, cafe_png, 3840, 2160));
+      g_assert_true (make_image (magick, bad_jpg, 1000, 800));
+    }
+  else
+    {
+      touch (bad_png); touch (cafe_png); touch (bad_jpg);
+    }
+
+  /* one picture: Resize and Upscale tooltips say the sizes */
+  l = sel1 (bad_png, "image/png", FALSE);
+  names = resize_names_wait (l, TRUE, &labels, &tips);
+  g_assert_nonnull (names);
+  g_assert_true (g_utf8_validate (labels, -1, NULL));
+  g_assert_true (g_utf8_validate (tips, -1, NULL));
+  if (magick != NULL)
+    g_assert_nonnull (strstr (tips, "320 × 240 px (aspect ratio kept)")); /* 50% of 640 x 480 */
+  g_free (names); g_free (labels); g_free (tips);
+  names = upscale_names_wait (l, TRUE, &labels, &tips);
+  if (names != NULL) /* an Upscale item is only there with the backend */
+    {
+      g_assert_true (g_utf8_validate (labels, -1, NULL));
+      g_assert_true (g_utf8_validate (tips, -1, NULL));
+      if (magick != NULL)
+        g_assert_nonnull (strstr (tips, "1280 × 960 px")); /* 2x */
+    }
+  g_free (names); g_free (labels); g_free (tips);
+  items = top_items (l);
+  {
+    guint n_valid = assert_items_valid (items);
+
+    g_print ("non-UTF-8 name -> %u menu items, all valid UTF-8\n", n_valid);
+    g_assert_cmpuint (n_valid, >, 2);
+  }
+  free_top (items);
+  g_list_free_full (l, g_object_unref);
+
+  /* a JPG (Compress and Resize), a second picture, a video alone */
+  l = sel1 (bad_jpg, "image/jpeg", FALSE);
+  l = sel_add (l, cafe_png, "image/png");
+  items = top_items (l);
+  assert_items_valid (items);
+  free_top (items);
+  g_list_free_full (l, g_object_unref);
+  l = sel1 (cafe_png, "image/png", FALSE);
+  names = resize_names_wait (l, TRUE, NULL, &tips);
+  g_assert_nonnull (names);
+  if (magick != NULL)
+    g_assert_nonnull (strstr (tips, "2560 × 1440 px (aspect ratio kept)"));
+  g_free (names); g_free (tips);
+  g_list_free_full (l, g_object_unref);
+  l = sel1 (cafe_mp4, "video/mp4", FALSE);
+  items = top_items (l);
+  assert_items_valid (items);
+  free_top (items);
+  g_list_free_full (l, g_object_unref);
+  g_free (magick);
+}
+
 static void
 test_register_and_menu (void)
 {
@@ -1501,6 +1610,7 @@ test_register_and_menu (void)
   test_resize_menus ();
   test_upscale_menus ();
   test_header_format_menus ();
+  test_non_utf8_menus ();
 
   /* no background items */
   {
