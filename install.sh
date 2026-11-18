@@ -28,8 +28,13 @@ meson compile -C "$BUILD_DIR"
 # Installs libnautilus-file-converter.so (Nautilus extension dir) and the
 # nfc-decode helper (libexecdir). --no-rebuild: do not run ninja as root.
 sudo meson install --no-rebuild -C "$BUILD_DIR"
-# meson install writes meson-logs/install-log.txt as root; give it back
-sudo chown "$(id -u):$(id -g)" "$BUILD_DIR/meson-logs/install-log.txt" 2>/dev/null || true
+# meson install writes meson-logs/install-log.txt as root; give it back. Never
+# through a symlink (a planted link there must not make sudo chown its target):
+# a symlink is skipped, and chown -h does not follow one that appears meanwhile.
+LOG="$BUILD_DIR/meson-logs/install-log.txt"
+if [ -e "$LOG" ] && [ ! -L "$LOG" ]; then
+    sudo chown -h "$(id -u):$(id -g)" "$LOG" 2>/dev/null || true
+fi
 
 # The old nautilus-python version (a symlink or a copy) would make the menu
 # appear twice; remove it if present. No sudo needed, it lives in $HOME.

@@ -141,8 +141,15 @@ nfc_provider_get_file_items (NautilusMenuProvider *provider G_GNUC_UNUSED, GList
       g_clear_object (&sub);
     }
   nfc_selection_clear (&sel);
-  g_strfreev (uris);
-  g_strfreev (mimes);
+  /* explicit loop over n: an invalid entry in the middle leaves NULL holes, where
+   * g_strfreev() would stop and leak every later entry */
+  for (guint k = 0; k < n; k++)
+    {
+      g_free (uris[k]);
+      g_free (mimes[k]);
+    }
+  g_free (uris);
+  g_free (mimes);
   g_free (items);
   return result;
 }

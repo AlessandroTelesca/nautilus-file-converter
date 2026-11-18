@@ -27,7 +27,35 @@ case "$LIBEXEC" in
     *)  LIBEXEC_DIR="$PREFIX/$LIBEXEC" ;;
 esac
 
-sudo rm -f -- "$EXT_DIR/libnautilus-file-converter.so" "$LIBEXEC_DIR/nfc-decode"
+# What to remove: the two paths computed above, plus every installed copy that
+# meson recorded in build/meson-logs/install-log.txt (one path per line, after
+# comment lines starting with "#"), so a helper installed under an older prefix
+# is removed too. Only absolute paths whose name is exactly one of the two files
+# this project installs are taken from the log (an allow-list: nothing else in
+# that file is ever removed), and never a path with a ".." component. A symlinked
+# log is not read.
+TARGETS=("$EXT_DIR/libnautilus-file-converter.so" "$LIBEXEC_DIR/nfc-decode")
+LOG="$BUILD_DIR/meson-logs/install-log.txt"
+if [ -f "$LOG" ] && [ ! -L "$LOG" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            /*/libnautilus-file-converter.so | /*/nfc-decode) ;;
+            *) continue ;;
+        esac
+        case "$line" in
+            */../* | */..) continue ;;
+        esac
+        dup=0
+        for t in "${TARGETS[@]}"; do
+            [ "$t" = "$line" ] && dup=1
+        done
+        [ "$dup" -eq 0 ] && TARGETS+=("$line")
+    done < "$LOG"
+fi
+
+sudo rm -f -- "${TARGETS[@]}"
 
 nautilus -q || true
-echo "removed $EXT_DIR/libnautilus-file-converter.so and $LIBEXEC_DIR/nfc-decode. Reopen Files."
+echo "removed:"
+printf '  %s\n' "${TARGETS[@]}"
+echo "Reopen Files."

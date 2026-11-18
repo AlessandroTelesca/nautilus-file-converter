@@ -239,7 +239,7 @@ test_probe_freeze (void)
                   "if [ \"$1\" = -list ]; then\n"
                   "echo '   Format  Module    Mode  Description'\n"
                   "echo '-----------------------------------------'\n"
-                  "for f in 'PNG* PNG' 'JPEG* JPEG' 'WEBP* WEBP' 'ICO* ICO' 'BMP* BMP' 'TIFF* TIFF' 'PDF* PDF'; do\n"
+                  "for f in 'PNG* PNG' 'JPEG* JPEG' 'WEBP* WEBP' 'ICO* ICO' 'BMP* BMP' 'TIFF* TIFF' 'PDF* PDF' 'RSVG* SVG'; do\n"
                   "  echo \"      $f       rw-   fake\"\n"
                   "done\nfi\n");
     g_free (p);
@@ -324,6 +324,20 @@ test_probe_freeze (void)
 
   /* HEIC/AVIF input needs the helper: without it nothing is offered */
   nfc_probe_ensure ();
+  /* SVG input goes through librsvg in-process (RSVG:), never the plain SVG: coder
+   * (which may delegate to Inkscape) */
+  {
+    gboolean dec;
+    GPtrArray *at = nfc_build_attempts (NFC_CAT_IMAGE, "svg", "png", "/s/a.svg", "/o/x.png", "/w", &dec);
+    char **argv;
+
+    g_assert_true (nfc_magick_can_read ("RSVG"));
+    g_assert_nonnull (at);
+    argv = ((GPtrArray *) at->pdata[0])->pdata[0];
+    g_assert_true (g_strv_contains ((const char * const *) argv, "RSVG:/s/a.svg[0]"));
+    g_assert_false (g_strv_contains ((const char * const *) argv, "SVG:/s/a.svg[0]"));
+    g_ptr_array_unref (at);
+  }
   {
     GPtrArray *t = nfc_targets_for (NFC_CAT_IMAGE, "heic");
     guint with_helper = t->len;
@@ -425,6 +439,88 @@ test_ffmpeg_timeout_cleanup (void)
 
   nfc_tools.ffmpeg = saved;
   g_free (err); g_free (out); g_free (src); g_free (script); g_free (outdir);
+}
+
+static gsize
+file_size (const char *p)
+{
+  struct stat st;
+
+  return stat (p, &st) == 0 ? (gsize) st.st_size : 0;
+}
+
+/* peak resident memory of this process in KiB (VmHWM), 0 if unknown */
+static long
+peak_rss_kib (void)
+{
+  char *data = NULL, *p;
+  long v = 0;
+
+  if (g_file_get_contents ("/proc/self/status", &data, NULL, NULL) &&
+      (p = strstr (data, "VmHWM:")) != NULL)
+    v = strtol (p + 6, NULL, 10);
+  g_free (data);
+  return v;
+}
+
+/* a tool that prints 10 MB to stderr (and to stdout) and fails: the job fails
+ * with the LAST stderr line as the message, memory stays bounded, and the log
+ * grows by at most one capped entry (about 64 KiB), not by 10 MB. */
+static void
+test_output_flood (void)
+{
+  char *log = B (g_get_user_cache_dir (), "nautilus-file-converter.log");
+  char *script = B (bindir, "ffmpeg-flood"), *src, *err = NULL, *out;
+  char *saved = nfc_tools.ffmpeg;
+  gsize before, grown;
+  long rss0, rss1;
+  gint64 us;
+
+  /* many short lines, then one endless line, then the real last line */
+  write_script (script,
+                "yes 'noisy stderr line, not the last one' | head -c 5242880 >&2\n"
+                "head -c 5242880 /dev/zero | tr '\\0' 'x' >&2\n"
+                "echo >&2\n"
+                "yes 'noisy stdout line' | head -c 5242880\n"
+                "echo 'the very last stderr line' >&2\n"
+                "exit 1\n");
+  nfc_tools.ffmpeg = script;
+  touch (datadir, "flood.mp4");
+  src = B (datadir, "flood.mp4");
+  before = file_size (log);
+  rss0 = peak_rss_kib ();
+
+  out = convert_sync (NFC_CAT_AUDIO, "mp4", "mp3", src, &err, &us);
+  rss1 = peak_rss_kib ();
+  grown = file_size (log) - before;
+  g_print ("flood: failed in %.2f s: %s; log grew by %" G_GSIZE_FORMAT " bytes; peak RSS +%ld KiB\n",
+           us / 1e6, err ? err : "(no error)", grown, rss1 - rss0);
+  g_assert_null (out);
+  g_assert_cmpstr (err, ==, "the very last stderr line"); /* the toast text */
+  g_assert_cmpuint (grown, >, 1000);                      /* it was logged ... */
+  g_assert_cmpuint (grown, <=, 64 * 1024);                /* ... capped */
+  {
+    char *data = NULL, *tail;
+
+    g_assert_true (g_file_get_contents (log, &data, NULL, NULL));
+    tail = strstr (data + before, "the very last stderr line");
+    g_assert_nonnull (tail);
+    g_assert_nonnull (strstr (data + before, "earlier bytes omitted"));
+    g_free (data);
+  }
+  if (rss0 > 0 && g_getenv ("NFC_TEST_SANITIZED") == NULL)
+    g_assert_cmpint (rss1 - rss0, <, 16 * 1024); /* 10 MB of output kept in memory would exceed it */
+
+  /* a single very long line is shortened in the toast text too */
+  write_script (script, "head -c 2000000 /dev/zero | tr '\\0' 'y' >&2\nexit 1\n");
+  g_free (err);
+  out = convert_sync (NFC_CAT_AUDIO, "mp4", "mp3", src, &err, &us);
+  g_assert_null (out);
+  g_assert_nonnull (err);
+  g_assert_cmpuint (strlen (err), <, 400);
+
+  nfc_tools.ffmpeg = saved;
+  g_free (err); g_free (out); g_free (src); g_free (script); g_free (log);
 }
 
 /* module shutdown: in-flight jobs are killed and their files removed */
@@ -581,6 +677,27 @@ test_log_mode_and_rotation (void)
     g_assert_false (g_file_test (bak2, G_FILE_TEST_EXISTS));
     g_free (bak2);
   }
+  /* one entry is never larger than 64 KiB, and an entry that would push the
+   * file past 1 MiB rotates it first (the file is just below the limit) */
+  {
+    char *huge = g_strnfill (300 * 1024, 'z');
+    char *fill = g_strnfill (1024 * 1024 - 100, 'f');
+    gsize blen;
+
+    g_assert_true (g_file_set_contents (log, fill, -1, NULL));
+    nfc_log ("huge entry: %s", huge);
+    g_assert_true (g_file_get_contents (bak, &data, &blen, NULL));
+    g_assert_cmpuint (blen, ==, 1024 * 1024 - 100); /* the old content was rotated away */
+    g_free (data);
+    g_assert_true (g_file_get_contents (log, &data, &len, NULL));
+    g_assert_cmpuint (len, <=, 64 * 1024);
+    g_assert_cmpuint (len, >, 60 * 1024);
+    g_assert_nonnull (strstr (data, "huge entry"));
+    g_assert_nonnull (strstr (data, "entry truncated"));
+    g_free (data);
+    g_free (huge);
+    g_free (fill);
+  }
   g_string_free (big, TRUE);
   g_free (dir); g_free (log); g_free (bak);
 }
@@ -618,6 +735,7 @@ main (int argc, char **argv)
   g_test_add_func ("/robust/soffice-timeout", test_soffice_timeout);
   g_test_add_func ("/robust/ffmpeg-timeout-cleanup", test_ffmpeg_timeout_cleanup);
   g_test_add_func ("/robust/log-mode-and-rotation", test_log_mode_and_rotation);
+  g_test_add_func ("/robust/output-flood", test_output_flood);
   g_test_add_func ("/robust/cancel-on-shutdown", test_cancel_on_shutdown);
   rc = g_test_run ();
 

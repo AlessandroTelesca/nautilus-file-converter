@@ -341,6 +341,15 @@ test_register_and_menu (void)
   l = g_list_append (NULL, g_object_new (G_TYPE_OBJECT, NULL));
   g_assert_null (menu_labels (l));
   g_list_free_full (l, g_object_unref);
+  /* [valid, invalid, valid]: no menu, and the entries after the invalid one are
+   * freed too (a leak shows in the LeakSanitizer build) */
+  u1 = path_uri ("a.png"); u2 = path_uri ("b.png");
+  l = g_list_append (NULL, fake_new (u1, "image/png", FALSE));
+  l = g_list_append (l, g_object_new (G_TYPE_OBJECT, NULL));
+  l = g_list_append (l, fake_new (u2, "image/png", FALSE));
+  g_assert_null (menu_labels (l));
+  g_list_free_full (l, g_object_unref);
+  g_free (u1); g_free (u2);
 
   /* no background items */
   {

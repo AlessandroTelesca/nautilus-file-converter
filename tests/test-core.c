@@ -217,11 +217,13 @@ test_argv (void)
   g_assert_true (argv_has (((GPtrArray *) at->pdata[0])->pdata[0], "copy"));
   g_assert_true (argv_has (((GPtrArray *) at->pdata[1])->pdata[0], "libx264"));
   g_ptr_array_unref (at);
+  /* (this process never runs the probes, so librsvg is unknown: the svg fallback
+   * MSVG applies; test-robust covers RSVG with a fake magick listing it) */
   /* every input type gets its own explicit coder, never content sniffing */
   {
     const struct { const char *fmt, *in; } c[] = {
       { "jpg", "JPEG:/s/a.x[0]" }, { "webp", "WEBP:/s/a.x[0]" }, { "bmp", "BMP:/s/a.x[0]" },
-      { "gif", "GIF:/s/a.x[0]" }, { "ico", "ICO:/s/a.x[0]" }, { "svg", "SVG:/s/a.x[0]" },
+      { "gif", "GIF:/s/a.x[0]" }, { "ico", "ICO:/s/a.x[0]" }, { "svg", "MSVG:/s/a.x[0]" },
       { "tiff", "TIFF:/s/a.x[0]" },
     };
 

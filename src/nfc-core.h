@@ -75,6 +75,7 @@ void     nfc_probe_ensure (void);
 
 gboolean nfc_have_encoder (const char *name);
 gboolean nfc_magick_can_write (const char *im_format);
+gboolean nfc_magick_can_read (const char *im_format);
 gboolean nfc_pixbuf_can_read (const char *name);
 
 /* ---- classification and targets ---- */

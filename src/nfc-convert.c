@@ -9,6 +9,8 @@
  * Helpers
  * ---------------------------------------------------------------------- */
 
+#define MSG_MAX_BYTES 300 /* longest failure text shown in the toast */
+
 static char *
 last_line (const char *text)
 {
@@ -24,7 +26,19 @@ last_line (const char *text)
 
       if (*s != '\0')
         {
-          res = g_strdup (s);
+          /* one endless line must not become an endless toast: keep the
+           * start, on a UTF-8 character boundary (text is valid UTF-8 here) */
+          if (strlen (s) > MSG_MAX_BYTES)
+            {
+              char *cut = s + MSG_MAX_BYTES;
+
+              while (cut > s && (*cut & 0xC0) == 0x80)
+                cut--;
+              *cut = '\0';
+              res = g_strconcat (s, "…", NULL);
+            }
+          else
+            res = g_strdup (s);
           break;
         }
     }
@@ -261,38 +275,203 @@ finalize_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data)
   }
 }
 
-static void
-step_done (GObject *source, GAsyncResult *res, gpointer data)
-{
-  Job *j = data;
-  GBytes *out = NULL, *errb = NULL;
-  GError *error = NULL;
-  char **argv;
-  GPtrArray *attempt = j->attempts->pdata[j->ai];
+/* -------------------------------------------------------------------------
+ * Running one step: bounded output capture
+ *
+ * A tool may print without limit (a runaway ffmpeg log, a hostile file making a
+ * decoder spew). stdout and stderr are therefore NOT collected with
+ * g_subprocess_communicate (which keeps everything in memory) but read
+ * incrementally into tail buffers that keep only the last STEP_KEEP_BYTES of
+ * each stream: memory stays bounded while the tool runs, and so do the log
+ * entry and the toast. What is logged is capped further (LOG_*_BYTES), so one
+ * failure never writes more than about 64 KiB to the log.
+ * ---------------------------------------------------------------------- */
 
-  argv = attempt->pdata[j->si];
+#define STEP_KEEP_BYTES (64 * 1024) /* retained per stream */
+#define LOG_ERR_BYTES   (48 * 1024) /* logged from stderr */
+#define LOG_OUT_BYTES   (8 * 1024)  /* logged from stdout */
+#define READ_CHUNK      (16 * 1024)
+
+typedef struct {
+  GByteArray *data; /* the last bytes seen: at most 2 * KEEP while reading */
+  guint64 total;    /* all bytes seen */
+} Tail;
+
+typedef struct {
+  Job *j;
+  Tail tail[2]; /* [0] stdout, [1] stderr */
+  int pending;  /* reads + the wait still running */
+  gboolean cancelled;
+  char *io_error;
+} StepIO;
+
+typedef struct {
+  StepIO *io;
+  guint which;
+} StepRead;
+
+static void
+tail_append (Tail *t, const guint8 *p, gsize n)
+{
+  t->total += n;
+  if (n >= STEP_KEEP_BYTES)
+    {
+      g_byte_array_set_size (t->data, 0);
+      p += n - STEP_KEEP_BYTES;
+      n = STEP_KEEP_BYTES;
+    }
+  g_byte_array_append (t->data, p, n);
+  if (t->data->len > 2 * STEP_KEEP_BYTES)
+    g_byte_array_remove_range (t->data, 0, t->data->len - STEP_KEEP_BYTES);
+}
+
+/* the last `max` bytes (at most) as valid UTF-8, with a note when output was
+ * dropped before them */
+static char *
+tail_text (const Tail *t, gsize max, gboolean with_note)
+{
+  gsize n = MIN ((gsize) t->data->len, max);
+  char *text = n == 0 ? g_strdup ("")
+                      : g_utf8_make_valid ((const char *) t->data->data + (t->data->len - n), n);
+
+  if (with_note && t->total > n)
+    {
+      char *r = g_strdup_printf ("[... %" G_GUINT64_FORMAT " earlier bytes omitted]\n%s",
+                                 t->total - n, text);
+
+      g_free (text);
+      return r;
+    }
+  return text;
+}
+
+static void step_finished (StepIO *io);
+
+static void
+step_io_done_one (StepIO *io)
+{
+  if (--io->pending == 0)
+    step_finished (io);
+}
+
+static void
+step_read_cb (GObject *source, GAsyncResult *res, gpointer data)
+{
+  StepRead *r = data;
+  StepIO *io = r->io;
+  GError *error = NULL;
+  GBytes *b = g_input_stream_read_bytes_finish (G_INPUT_STREAM (source), res, &error);
+
+  if (b != NULL && g_bytes_get_size (b) > 0)
+    {
+      gsize n;
+      const guint8 *p = g_bytes_get_data (b, &n);
+
+      tail_append (&io->tail[r->which], p, n);
+      g_bytes_unref (b);
+      g_input_stream_read_bytes_async (G_INPUT_STREAM (source), READ_CHUNK, G_PRIORITY_DEFAULT,
+                                       io->j->cancel, step_read_cb, r);
+      return;
+    }
+  if (b != NULL)
+    g_bytes_unref (b); /* EOF */
+  else if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    io->cancelled = TRUE;
+  else if (io->io_error == NULL)
+    io->io_error = g_strdup (error->message);
+  g_clear_error (&error);
+  g_free (r);
+  step_io_done_one (io);
+}
+
+static void
+step_wait_cb (GObject *source, GAsyncResult *res, gpointer data)
+{
+  StepIO *io = data;
+  GError *error = NULL;
+
+  if (!g_subprocess_wait_finish (G_SUBPROCESS (source), res, &error))
+    {
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        io->cancelled = TRUE;
+      else if (io->io_error == NULL)
+        io->io_error = g_strdup (error->message);
+      g_clear_error (&error);
+    }
+  step_io_done_one (io);
+}
+
+static void
+step_start_io (Job *j)
+{
+  StepIO *io = g_new0 (StepIO, 1);
+  GInputStream *in[2];
+
+  io->j = j;
+  io->tail[0].data = g_byte_array_new ();
+  io->tail[1].data = g_byte_array_new ();
+  io->pending = 3;
+  in[0] = g_subprocess_get_stdout_pipe (j->proc);
+  in[1] = g_subprocess_get_stderr_pipe (j->proc);
+  for (guint i = 0; i < 2; i++)
+    {
+      StepRead *r = g_new0 (StepRead, 1);
+
+      r->io = io;
+      r->which = i;
+      g_input_stream_read_bytes_async (in[i], READ_CHUNK, G_PRIORITY_DEFAULT, j->cancel,
+                                       step_read_cb, r);
+    }
+  g_subprocess_wait_async (j->proc, j->cancel, step_wait_cb, io);
+}
+
+/* Is the step's leader still unreaped? g_subprocess_get_identifier() is NULL
+ * once GLib has reaped it, and from then on j->pgid is a stale number that the
+ * kernel may hand to an unrelated process: kill(-pgid) would hit a stranger's
+ * group. So every kill of the step's group is guarded by this, and none is
+ * repeated after the first (step_timeout and nfc_shutdown kill while the leader
+ * is alive; grandchildren in the group die with that kill). */
+static gboolean
+step_leader_alive (Job *j)
+{
+  return j->proc != NULL && j->pgid > 1 && g_subprocess_get_identifier (j->proc) != NULL;
+}
+
+static void
+step_finished (StepIO *io)
+{
+  Job *j = io->j;
+  GPtrArray *attempt = j->attempts->pdata[j->ai];
+  char **argv = attempt->pdata[j->si];
+  char *msg = NULL;
+
   if (j->timeout_id)
     {
       g_source_remove (j->timeout_id);
       j->timeout_id = 0;
     }
-  if (!g_subprocess_communicate_finish (G_SUBPROCESS (source), res, &out, &errb, &error))
+  if (io->cancelled || io->io_error != NULL)
     {
       /* the step was cancelled (timeout, shutdown) or the pipes broke; a
        * timeout or shutdown is final, no fallback attempt is tried */
       char *cmd = join_argv (argv);
       gboolean final = j->timed_out || j->aborted;
-      char *msg = g_strdup (j->timed_out ? "timed out" : j->aborted ? "cancelled"
-                                                                     : error->message);
+      const char *why = io->io_error != NULL ? io->io_error : "Operation was cancelled";
 
+      msg = g_strdup (j->timed_out ? "timed out" : j->aborted ? "cancelled" : why);
       nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  %s", j->src, j->key,
-               j->timed_out ? "timeout" : j->aborted ? "cancelled" : "I/O error", cmd,
-               error->message);
-      nfc_kill_group (j->pgid); /* nothing of this step may outlive it */
+               j->timed_out ? "timeout" : j->aborted ? "cancelled" : "I/O error", cmd, why);
+      /* a timeout or shutdown already killed the group while the leader was
+       * alive; only a broken pipe leaves it to us */
+      if (!final && step_leader_alive (j))
+        nfc_kill_group (j->pgid);
       j->pgid = 0;
       g_free (cmd);
       g_clear_object (&j->proc);
-      g_clear_error (&error);
+      g_free (io->io_error);
+      g_byte_array_unref (io->tail[0].data);
+      g_byte_array_unref (io->tail[1].data);
+      g_free (io);
       if (final)
         job_fail (j, msg);
       else
@@ -304,17 +483,15 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
   {
     gboolean exited = g_subprocess_get_if_exited (j->proc);
     int status = exited ? g_subprocess_get_exit_status (j->proc) : -1;
-    gsize n1, n2;
-    const char *p1 = out ? g_bytes_get_data (out, &n1) : NULL;
-    const char *p2 = errb ? g_bytes_get_data (errb, &n2) : NULL;
-    char *so = p1 ? g_utf8_make_valid (p1, n1) : g_strdup ("");
-    char *se = p2 ? g_utf8_make_valid (p2, n2) : g_strdup ("");
 
     g_clear_object (&j->proc);
     if (status != 0)
       {
         char *cmd = join_argv (argv);
-        char *msg;
+        char *se = tail_text (&io->tail[1], STEP_KEEP_BYTES, FALSE);
+        char *so = tail_text (&io->tail[0], STEP_KEEP_BYTES, FALSE);
+        char *log_se = tail_text (&io->tail[1], LOG_ERR_BYTES, TRUE);
+        char *log_so = tail_text (&io->tail[0], LOG_OUT_BYTES, TRUE);
         gboolean final = j->timed_out; /* killed by the timeout: final */
 
         msg = j->timed_out ? g_strdup ("timed out") : last_line (se);
@@ -323,12 +500,15 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
         if (msg == NULL)
           msg = g_strdup_printf ("exit code %d", status);
         nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  stderr:\n%s\n  stdout:\n%s",
-                 j->src, j->key, j->timed_out ? "timeout" : "exit status", cmd, se, so);
+                 j->src, j->key, j->timed_out ? "timeout" : "exit status", cmd, log_se, log_so);
         g_free (cmd);
         g_free (so);
         g_free (se);
-        g_bytes_unref (out);
-        g_bytes_unref (errb);
+        g_free (log_so);
+        g_free (log_se);
+        g_byte_array_unref (io->tail[0].data);
+        g_byte_array_unref (io->tail[1].data);
+        g_free (io);
         if (final)
           job_fail (j, msg);
         else
@@ -336,11 +516,10 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
         g_free (msg);
         return;
       }
-    g_free (so);
-    g_free (se);
   }
-  g_bytes_unref (out);
-  g_bytes_unref (errb);
+  g_byte_array_unref (io->tail[0].data);
+  g_byte_array_unref (io->tail[1].data);
+  g_free (io);
   j->si++;
   run_step (j);
 }
@@ -357,7 +536,8 @@ step_timeout (gpointer data)
 
   j->timeout_id = 0;
   j->timed_out = TRUE;
-  nfc_kill_group (j->pgid);
+  if (step_leader_alive (j)) /* the one kill of this step's group, see step_leader_alive() */
+    nfc_kill_group (j->pgid);
   if (j->proc != NULL)
     g_subprocess_force_exit (j->proc);
   if (j->cancel != NULL)
@@ -427,7 +607,7 @@ run_step (Job *j)
   j->cancel = g_cancellable_new ();
   j->timeout_id = g_timeout_add_seconds (timeout_secs (j->cat, j->src_size),
                                          step_timeout, j);
-  g_subprocess_communicate_async (j->proc, NULL, j->cancel, step_done, j);
+  step_start_io (j);
 }
 
 void
@@ -514,7 +694,8 @@ nfc_shutdown (void)
       Job *j = key;
 
       j->aborted = TRUE;
-      nfc_kill_group (j->pgid);
+      if (step_leader_alive (j)) /* see step_leader_alive(): never a stale pgid */
+        nfc_kill_group (j->pgid);
       if (j->cancel != NULL)
         g_cancellable_cancel (j->cancel);
       /* a job in its finalize thread is left alone: it ends within moments and

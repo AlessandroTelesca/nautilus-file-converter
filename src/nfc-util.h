@@ -9,7 +9,8 @@ G_BEGIN_DECLS
 
 /* Append a timestamped line to $XDG_CACHE_HOME/nautilus-file-converter.log.
  * The file is created with mode 0600 (and narrowed if it already exists with
- * wider permissions); above 1 MiB it is rotated to ...log.1 (single backup). */
+ * wider permissions); above 1 MiB (an entry that would push it past) it is rotated to ...log.1
+ * (single backup). A single entry is cut to 64 KiB (head and tail kept). */
 void nfc_log (const char *format, ...) G_GNUC_PRINTF (1, 2);
 
 /* A launcher whose children
@@ -26,7 +27,9 @@ GSubprocessLauncher *nfc_launcher_new (GSubprocessFlags flags);
  * already reaped). */
 pid_t nfc_subprocess_pgid (GSubprocess *proc);
 
-/* SIGKILL every process of group pgid (no-op for pgid <= 1). */
+/* SIGKILL every process of group pgid (no-op for pgid <= 1). Only call it while
+ * the group leader is unreaped (g_subprocess_get_identifier() != NULL): after
+ * GLib has reaped it the pgid is stale and may belong to an unrelated process. */
 void nfc_kill_group (pid_t pgid);
 
 G_END_DECLS

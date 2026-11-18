@@ -81,6 +81,7 @@ static GMutex probe_lock;
 static GCond probe_cond;
 static GHashTable *ff_enc = NULL;    /* ffmpeg encoder names */
 static GHashTable *im_write = NULL;  /* ImageMagick writable format names */
+static GHashTable *im_read = NULL;   /* ImageMagick readable format (coder) names */
 static GHashTable *pb_read = NULL;   /* GdkPixbuf format names */
 
 static guint
@@ -229,6 +230,7 @@ probe_magick (void)
   char **lines;
 
   im_write = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  im_read = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
   if (nfc_tools.magick == NULL)
     return;
   {
@@ -270,6 +272,8 @@ probe_magick (void)
                 (tok[i][1] == 'w' || tok[i][1] == '-') &&
                 (tok[i][2] == '+' || tok[i][2] == '-'))
               mode = tok[i];
+          if (ok && mode != NULL && mode[0] == 'r')
+            g_hash_table_add (im_read, g_strdup (name));
           if (ok && mode != NULL && mode[1] == 'w')
             g_hash_table_add (im_write, name);
           else
@@ -395,6 +399,14 @@ nfc_magick_can_write (const char *im_format)
 {
   return im_format != NULL && nfc_probe_done (NFC_PROBE_MAGICK) &&
          g_hash_table_contains (im_write, im_format);
+}
+
+/* Readable coder names (the "r" column of `magick -list format`), e.g. "RSVG". */
+gboolean
+nfc_magick_can_read (const char *im_format)
+{
+  return im_format != NULL && nfc_probe_done (NFC_PROBE_MAGICK) && im_read != NULL &&
+         g_hash_table_contains (im_read, im_format);
 }
 
 gboolean
@@ -963,14 +975,24 @@ im_escape (const char *s)
 
 /* Explicit input coder, from the classified type: ImageMagick must not pick a
  * coder by sniffing the content (an ".png" that is really PostScript, MVG or
- * MSL would otherwise reach Ghostscript or the script coders). */
+ * MSL would otherwise reach Ghostscript or the script coders).
+ *
+ * SVG: never the plain "SVG:" coder. Depending on the build, ImageMagick
+ * delegates it to an external renderer (Inkscape here: a child process per
+ * conversion that follows some references). "RSVG:" is librsvg in-process (no
+ * helper, much faster, and it does not embed text:/file:// or relative hrefs).
+ * Without librsvg fall back to ImageMagick's own "MSVG:" renderer (IM 7.1.2
+ * refuses explicit coders inside it). No policy.xml is installed. */
 static const char *
 im_input_coder (const char *fmt)
 {
   static const char *map[][2] = {
     { "png", "PNG" }, { "jpg", "JPEG" }, { "webp", "WEBP" }, { "bmp", "BMP" },
-    { "gif", "GIF" }, { "ico", "ICO" }, { "svg", "SVG" }, { "tiff", "TIFF" },
+    { "gif", "GIF" }, { "ico", "ICO" }, { "tiff", "TIFF" },
   };
+
+  if (g_str_equal (fmt, "svg"))
+    return nfc_magick_can_read ("RSVG") ? "RSVG" : "MSVG";
 
   for (guint i = 0; i < G_N_ELEMENTS (map); i++)
     if (g_str_equal (map[i][0], fmt))
@@ -1267,7 +1289,12 @@ rename_noreplace (const char *from, const char *to)
 
 /* Last resort for filesystems that neither link nor know RENAME_NOREPLACE:
  * reserve the name with O_CREAT|O_EXCL (atomic), then rename over our own
- * placeholder. */
+ * placeholder.
+ *
+ * Only the reservation's own EEXIST (the open below) means "name taken, try
+ * the next one": the caller loops on it. rename() over our own placeholder
+ * cannot legitimately fail with EEXIST, but a buggy filesystem may say so; it
+ * is mapped to EIO so the caller fails instead of retrying forever. */
 static int
 reserve_and_rename (const char *from, const char *to)
 {
@@ -1278,7 +1305,7 @@ reserve_and_rename (const char *from, const char *to)
   close (fd);
   if (rename (from, to) != 0)
     {
-      int saved = errno;
+      int saved = errno == EEXIST ? EIO : errno;
 
       unlink (to);
       errno = saved;
@@ -1286,6 +1313,9 @@ reserve_and_rename (const char *from, const char *to)
     }
   return 0;
 }
+
+/* upper bound for the "stem (n).ext" counter in nfc_publish_with_mode */
+#define NFC_MAX_NAME_TRIES 10000
 
 char *
 nfc_publish_with_mode (const char *tmp_path, const char *directory, const char *stem,
@@ -1296,10 +1326,19 @@ nfc_publish_with_mode (const char *tmp_path, const char *directory, const char *
   g_mutex_lock (&name_lock);
   for (guint n = 0;; n++)
     {
-      char *name = nfc_candidate_name (stem, ext, n);
-      char *cand = g_build_filename (directory, name, NULL);
+      char *name, *cand;
       int link_errno = 0;
 
+      /* "name (1)" .. "name (9999)" taken: give up rather than loop on and on */
+      if (n >= NFC_MAX_NAME_TRIES)
+        {
+          g_set_error (error, G_IO_ERROR, G_IO_ERROR_EXISTS,
+                       "cannot create %s.%s in %s: the first %u names are all taken",
+                       stem, ext, directory, (guint) NFC_MAX_NAME_TRIES);
+          break;
+        }
+      name = nfc_candidate_name (stem, ext, n);
+      cand = g_build_filename (directory, name, NULL);
       g_free (name);
       if (mode == NFC_PUBLISH_AUTO)
         {

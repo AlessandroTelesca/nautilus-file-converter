@@ -544,6 +544,59 @@ test_special_names (void)
   rel = g_strdup ("special/txt2/sp ace%20.txt"); copy_to ("test.txt", rel); check_special (rel, "txt", "docx"); g_free (rel);
 }
 
+/* SVG input must neither embed local files through hrefs (file://, text:,
+ * relative paths) nor spawn Inkscape: it is read by librsvg in-process
+ * (RSVG:). The secret is red, the SVG's own rect is blue: any red in the
+ * output means the reference was followed. A fake `inkscape` first in PATH
+ * leaves a marker file if ImageMagick ever delegates to it. */
+static void
+test_svg_hardening (void)
+{
+  char *dir = P ("svgref"), *bin = P ("svgref/bin"), *marker = P ("svgref/inkscape-ran");
+  char *secret = P ("svgref/secret.png"), *svg = P ("svgref/ref.svg"), *out, *px = NULL;
+  char *fake, *content, *old_path = g_strdup (g_getenv ("PATH")), *new_path, *err = NULL;
+  gboolean ok;
+
+  g_mkdir_with_parents (bin, 0755);
+  fake = g_build_filename (bin, "inkscape", NULL);
+  content = g_strdup_printf ("#!/bin/sh\ntouch '%s'\nexit 1\n", marker);
+  g_file_set_contents (fake, content, -1, NULL);
+  g_chmod (fake, 0755);
+  g_free (content);
+  fixture ("svgref/secret.png", run (dir, NULL, "magick", "-size", "40x30", "xc:red", "secret.png", NULL));
+  content = g_strdup_printf (
+    "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" "
+    "width=\"40\" height=\"30\"><rect width=\"40\" height=\"30\" fill=\"blue\"/>"
+    "<image href=\"file://%s\" width=\"40\" height=\"30\"/>"
+    "<image xlink:href=\"text:%s\" width=\"40\" height=\"30\"/>"
+    "<image href=\"secret.png\" width=\"40\" height=\"30\"/>"
+    "<image href=\"../svgref/secret.png\" width=\"40\" height=\"30\"/></svg>",
+    secret, secret);
+  g_file_set_contents (svg, content, -1, NULL);
+  g_free (content);
+
+  /* 1. the secret must not appear (real PATH, so a plain SVG: coder would embed it) */
+  out = convert_sync (NFC_CAT_IMAGE, "svg", "png", "png", svg, &err);
+  ok = out != NULL && run (NULL, &px, "magick", out, "-format", "%[pixel:p{5,5}]", "info:", NULL) &&
+       px != NULL && strstr (px, "0,0,255") != NULL;
+  add_row ("svgref/ref.svg (file://, text:, relative hrefs)", "png", ok,
+           ok ? "no reference embedded (pixel is the SVG's own blue)"
+              : (out ? (px ? px : "magick identify failed") : (err ? err : "conversion failed")));
+  /* 2. no Inkscape: a second conversion with the fake first in PATH */
+  new_path = g_strconcat (bin, ":", old_path, NULL);
+  g_setenv ("PATH", new_path, TRUE);
+  g_free (out);
+  out = convert_sync (NFC_CAT_IMAGE, "svg", "png", "png", svg, NULL);
+  ok = out != NULL;
+  add_row ("svgref/ref.svg (fake inkscape first in PATH)", "png", ok, ok ? "converted" : "conversion failed");
+  ok = !g_file_test (marker, G_FILE_TEST_EXISTS);
+  add_row ("svgref/ref.svg", "inkscape not spawned", ok, ok ? "no marker" : "fake inkscape was run");
+
+  g_setenv ("PATH", old_path, TRUE);
+  g_free (out); g_free (px); g_free (err); g_free (new_path); g_free (old_path);
+  g_free (fake); g_free (dir); g_free (bin); g_free (marker); g_free (secret); g_free (svg);
+}
+
 static void
 test_heic (void)
 {
@@ -709,6 +762,7 @@ main (void)
     g_free (p);
   }
   check_many ("test.svg", k_svg);
+  test_svg_hardening ();
   check_many ("test.gif", k_gif);
   check_many ("test.avif", k_avif);
   check_many ("test.jpg", k_jpg_src);

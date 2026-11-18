@@ -17,7 +17,8 @@
  * Logging
  * ---------------------------------------------------------------------- */
 
-#define NFC_LOG_MAX_BYTES (1024 * 1024)
+#define NFC_LOG_MAX_BYTES   (1024 * 1024)
+#define NFC_LOG_ENTRY_BYTES (64 * 1024) /* longest single entry; the rest is cut */
 
 static GMutex log_lock;
 
@@ -55,6 +56,25 @@ nfc_log (const char *format, ...)
   now = g_date_time_new_now_local ();
   ts = g_date_time_format (now, "%Y-%m-%d %H:%M:%S");
   line = g_strdup_printf ("[%s] %s\n", ts, msg);
+  if (strlen (line) > NFC_LOG_ENTRY_BYTES)
+    {
+      /* never write more than NFC_LOG_ENTRY_BYTES for one entry: keep the head
+       * (what happened) and the tail (usually the useful end of a tool's output),
+       * cutting the middle on UTF-8 character boundaries */
+      const char *note = "\n[... entry truncated ...]\n";
+      gsize total = strlen (line), head = 8 * 1024;
+      gsize tail = NFC_LOG_ENTRY_BYTES - head - strlen (note) - 1;
+      const char *tp = line + total - tail;
+      char *cut;
+
+      while (head > 0 && (line[head] & 0xC0) == 0x80)
+        head--;
+      while (*tp != '\0' && (*tp & 0xC0) == 0x80)
+        tp++;
+      cut = g_strdup_printf ("%.*s%s%s", (int) head, line, note, tp);
+      g_free (line);
+      line = cut;
+    }
   dir = g_strdup (g_get_user_cache_dir ());
   path = g_build_filename (dir, "nautilus-file-converter.log", NULL);
 
@@ -65,7 +85,9 @@ nfc_log (const char *format, ...)
     {
       struct stat st;
 
-      if (fstat (fd, &st) == 0 && st.st_size > NFC_LOG_MAX_BYTES)
+      /* rotate when this entry would push the file past the limit */
+      if (fstat (fd, &st) == 0 && st.st_size > 0 &&
+          (gint64) st.st_size + (gint64) strlen (line) > NFC_LOG_MAX_BYTES)
         {
           /* rotate: one backup, replaced each time */
           char *bak = g_strconcat (path, ".1", NULL);

@@ -9,7 +9,9 @@
  * runs this helper through GSubprocess (with a timeout) and never links
  * gdk-pixbuf itself.
  *
- * Exit status: 0 ok, 1 decode/write error (message on stderr), 2 usage.
+ * Images above 100 megapixels (or 30000 pixels on a side) are refused.
+ *
+ * Exit status: 0 ok, 1 decode/write error or refused (message on stderr), 2 usage.
  */
 #include <gdk-pixbuf/gdk-pixbuf.h>
 #include <stdio.h>
@@ -35,6 +37,13 @@ list_formats (void)
   return 0;
 }
 
+/* A small file can claim an enormous picture (a "decompression bomb"): refuse
+ * above 100 megapixels or 30000 pixels on a side before decoding allocates
+ * anything. There is deliberately no RLIMIT_AS: glycin spawns sandboxed
+ * loader processes that a hard address-space limit would break. */
+#define MAX_PIXELS    ((guint64) 100 * 1000 * 1000)
+#define MAX_DIMENSION 30000
+
 static int
 decode (const char *in, const char *out)
 {
@@ -42,6 +51,18 @@ decode (const char *in, const char *out)
   GdkPixbuf *p, *o;
   gboolean ok;
   int rc = 0;
+  int w = 0, h = 0;
+
+  /* the size comes from the header only (no pixel allocation). If the loader
+   * cannot tell it (NULL format, or 0 x 0) we cannot check, and go on: the
+   * decode below is then bounded only by the caller's timeout. */
+  if (gdk_pixbuf_get_file_info (in, &w, &h) != NULL && w > 0 && h > 0 &&
+      (w > MAX_DIMENSION || h > MAX_DIMENSION || (guint64) w * (guint64) h > MAX_PIXELS))
+    {
+      fprintf (stderr, "refusing %s: image is %d x %d pixels, above the limit of "
+                       "100 megapixels / %d pixels on a side\n", in, w, h, MAX_DIMENSION);
+      return 1;
+    }
 
   p = gdk_pixbuf_new_from_file (in, &error);
   if (p == NULL)
