@@ -289,15 +289,37 @@ test_notifications (void)
   char *dir = g_dir_make_tmp ("nfc-notify-XXXXXX", NULL);
   char *script = g_build_filename (dir, "notify-send", NULL);
   char *log = g_build_filename (dir, "calls.log", NULL);
+  /* behaves like the real notify-send for option parsing: any argument that
+   * starts with '-' before a "--" must be a known option, else "Unknown
+   * option" and exit status 1 (getopt permutes, so this also catches a
+   * leading-dash title or body) */
   char *content = g_strdup_printf ("#!/bin/sh\n"
                                    "echo \"$@\" >> '%s'\n"
-                                   "echo 4242\n", log);
+                                   "while [ $# -gt 0 ]; do\n"
+                                   "  case \"$1\" in\n"
+                                   "    --) break ;;\n"
+                                   "    -a|-i|-u|-h|-r|-t|-c) shift 2 ;;\n"
+                                   "    -p) shift ;;\n"
+                                   "    -*) echo \"Unknown option $1\" >&2; echo REJECTED >> '%s'; exit 1 ;;\n"
+                                   "    *) shift ;;\n"
+                                   "  esac\n"
+                                   "done\n"
+                                   "echo 4242\n", log, log);
   char *paths[2], *fmts[] = { (char *) "png", NULL };
-  char *saved = nfc_tools.notify, *logged = NULL, *src = P ("test.png");
+  char *saved = nfc_tools.notify, *logged = NULL, *src = P ("-dash.png"), *orig = P ("test.png");
   gboolean pass;
 
   g_file_set_contents (script, content, -1, NULL);
   g_chmod (script, 0755);
+  /* a file whose name starts with '-': it ends up in the notification body */
+  {
+    char *data;
+    gsize len;
+
+    g_file_get_contents (orig, &data, &len, NULL);
+    g_file_set_contents (src, data, len, NULL);
+    g_free (data);
+  }
   nfc_tools.notify = script;
   paths[0] = src;
   paths[1] = NULL;
@@ -332,10 +354,16 @@ test_notifications (void)
       pass = g_str_has_prefix (lines[0], "-a File Converter") &&
              strstr (lines[0], "Converting") != NULL && strstr (lines[0], "-r ") == NULL &&
              strstr (lines[1], "-r 4242") != NULL &&
-             strstr (lines[1], "Conversion complete") != NULL;
+             strstr (lines[1], "Conversion complete") != NULL &&
+             /* "--" comes right before the positionals (title, body) ... */
+             strstr (lines[0], " -- Converting… -dash.png to BMP") != NULL &&
+             strstr (lines[1], " -- Conversion complete -dash.png → -dash.bmp") != NULL &&
+             /* ... and after every option */
+             strstr (lines[1], "-r 4242 -- ") != NULL &&
+             strstr (logged, "REJECTED") == NULL;
       g_strfreev (lines);
     }
-  add_row ("(notifications)", "-p / -r id", pass, pass ? "second call replaces id 4242" : (logged ? logged : "no calls"));
+  add_row ("(notifications)", "-p / -r id", pass, pass ? "-- before title/body; second call replaces id 4242" : (logged ? logged : "no calls"));
   nfc_tools.notify = saved;
   /* the converted bmp is left in work; remove it so naming tests stay exact */
   g_free (logged);
@@ -344,6 +372,7 @@ test_notifications (void)
   g_free (log);
   g_free (content);
   g_free (src);
+  g_free (orig);
 }
 
 /* ---- batch ---- */
@@ -438,6 +467,83 @@ test_batch (void)
   nfc_tools.notify = saved;
 }
 
+/* ---- file names that ImageMagick / ffmpeg / LibreOffice could misread ---- */
+static void
+check_special (const char *rel, const char *src_fmt_ext, const char *key)
+{
+  char *src = P (rel), *out, *dir = g_path_get_dirname (src), *stem = nfc_stem_of (src);
+  char *want, *got, *left = NULL;
+  guint n = 0;
+  GDir *d;
+  gboolean ok;
+  GString *entries = g_string_new (NULL);
+  const char *name;
+
+  (void) src_fmt_ext;
+  out = check (rel, key);
+  want = g_strdup_printf ("%s.%s", stem, key);
+  got = out ? g_path_get_basename (out) : g_strdup ("(failed)");
+  /* exactly the source and the output: nothing like "a0.jpg" next to them */
+  d = g_dir_open (dir, 0, NULL);
+  while (d && (name = g_dir_read_name (d)))
+    {
+      n++;
+      g_string_append_printf (entries, "%s | ", name);
+    }
+  if (d)
+    g_dir_close (d);
+  ok = out != NULL && g_str_equal (got, want) && n == 2 && !leftover_temp_files (dir, &left);
+  g_free (left);
+  add_row (rel, key, ok, ok ? "output named after the source, no stray files" : entries->str);
+  g_string_free (entries, TRUE);
+  g_free (src); g_free (out); g_free (dir); g_free (stem); g_free (want); g_free (got);
+}
+
+static void
+copy_to (const char *from_name, const char *rel)
+{
+  char *from = P (from_name), *to = P (rel), *todir = g_path_get_dirname (to), *data;
+  gsize len;
+
+  g_mkdir_with_parents (todir, 0755);
+  g_assert_true (g_file_get_contents (from, &data, &len, NULL));
+  g_assert_true (g_file_set_contents (to, data, len, NULL));
+  g_free (data); g_free (from); g_free (to); g_free (todir);
+}
+
+static void
+test_special_names (void)
+{
+  /* ImageMagick expands %-escapes in file names; also [ ] * @ : have meaning to it */
+  static const char *png_names[] = {
+    "a%d.png", "%[filename].png", "100%.png", "a%%d.png", "%s%n.png", "a[1].png",
+    "a*b.png", "@list.png", "a:b.png", "a b (1).png", "dir%d/x.png", "dir%[filename]/x.png",
+    "-dash.png", NULL
+  };
+  static const char *keys[] = { "jpg", "avif", "pdf", NULL };
+  char *rel;
+
+  for (guint i = 0; png_names[i]; i++)
+    for (guint k = 0; keys[k]; k++)
+      {
+        /* every file in its own directory so stray output is visible */
+        rel = g_strdup_printf ("special/p%u_%u/%s", i, k, png_names[i]);
+        copy_to ("test.png", rel);
+        check_special (rel, "png", keys[k]);
+        g_free (rel);
+      }
+  /* other tools and other input types with a '%' in the name */
+  rel = g_strdup ("special/svg/100%d.svg"); copy_to ("test.svg", rel); check_special (rel, "svg", "png"); g_free (rel);
+  rel = g_strdup ("special/gif/a%d.gif"); copy_to ("test.gif", rel); check_special (rel, "gif", "png"); g_free (rel);
+  rel = g_strdup ("special/ico/a%d.ico"); copy_to ("test.ico", rel); check_special (rel, "ico", "png"); g_free (rel);
+  rel = g_strdup ("special/tiff/a%d.tiff"); copy_to ("test.tiff", rel); check_special (rel, "tiff", "jpg"); g_free (rel);
+  rel = g_strdup ("special/wav/a%d.wav"); copy_to ("test.wav", rel); check_special (rel, "wav", "mp3"); g_free (rel);
+  rel = g_strdup ("special/mp4/v%d.mp4"); copy_to ("test.mp4", rel); check_special (rel, "mp4", "gif"); g_free (rel);
+  rel = g_strdup ("special/mp4b/v%d.mp4"); copy_to ("test.mp4", rel); check_special (rel, "mp4", "webm"); g_free (rel);
+  rel = g_strdup ("special/txt/100%.txt"); copy_to ("test.txt", rel); check_special (rel, "txt", "pdf"); g_free (rel);
+  rel = g_strdup ("special/txt2/sp ace%20.txt"); copy_to ("test.txt", rel); check_special (rel, "txt", "docx"); g_free (rel);
+}
+
 static void
 test_heic (void)
 {
@@ -501,8 +607,21 @@ main (void)
   char *profile, *envarg, *left;
   char *tmpdir;
 
-  work = g_dir_make_tmp ("nfc-test-XXXXXX", NULL);
+  {
+    /* not g_dir_make_tmp(): it would cache the temp dir before we change it */
+    const char *orig = g_getenv ("TMPDIR");
+    char *tmpl = g_strdup_printf ("%s/nfc-test-XXXXXX", orig && *orig ? orig : "/tmp");
+
+    work = g_mkdtemp (tmpl);
+  }
   g_assert_nonnull (work);
+  /* Run everything with a hostile TMPDIR ("sp ace%20"): LibreOffice profile
+   * URL, ImageMagick work files, nfc-decode output, all live in there. Must be
+   * set before anything caches g_get_tmp_dir(). */
+  tmpdir = P ("tmp sp ace%20");
+  g_assert_cmpint (g_mkdir_with_parents (tmpdir, 0755), ==, 0);
+  g_setenv ("TMPDIR", tmpdir, TRUE);
+  g_free (tmpdir);
   /* keep the log out of the user's real ~/.cache */
   tmpdir = P ("xdg-cache");
   g_setenv ("XDG_CACHE_HOME", tmpdir, TRUE);
@@ -550,7 +669,12 @@ main (void)
               "</text:p></draw:text-box></draw:frame></draw:page></office:presentation></office:body>"
               "</office:document>");
   profile = P ("p0");
-  envarg = g_strconcat ("-env:UserInstallation=file://", profile, NULL);
+  {
+    char *uri = g_filename_to_uri (profile, NULL, NULL);
+
+    envarg = g_strconcat ("-env:UserInstallation=", uri, NULL);
+    g_free (uri);
+  }
   fixture ("test.odt", run (work, NULL, "soffice", "--headless", envarg, "--convert-to", "odt", "test.txt", NULL));
   fixture ("test.docx", run (work, NULL, "soffice", "--headless", envarg, "--convert-to", "docx", "test.txt", NULL));
   fixture ("test.rtf", run (work, NULL, "soffice", "--headless", envarg, "--convert-to", "rtf", "test.txt", NULL));
@@ -593,6 +717,7 @@ main (void)
   check_many ("test.tiff", k_other_img);
   check_many ("test.ico", k_other_img);
   test_heic ();
+  test_special_names ();
   check_many ("test.wav", k_wav);
   check_many ("test.flac", k_flac);
   check_many ("test.mp3", k_toWav);

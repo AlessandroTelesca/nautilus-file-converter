@@ -6,42 +6,8 @@
 #include <string.h>
 
 /* -------------------------------------------------------------------------
- * Logging
+ * Helpers
  * ---------------------------------------------------------------------- */
-
-static GMutex log_lock;
-
-void
-nfc_log (const char *format, ...)
-{
-  va_list ap;
-  char *msg, *dir, *path, *ts;
-  GDateTime *now;
-  FILE *fh;
-
-  va_start (ap, format);
-  msg = g_strdup_vprintf (format, ap);
-  va_end (ap);
-
-  g_mutex_lock (&log_lock);
-  dir = g_strdup (g_get_user_cache_dir ());
-  g_mkdir_with_parents (dir, 0755);
-  path = g_build_filename (dir, "nautilus-file-converter.log", NULL);
-  now = g_date_time_new_now_local ();
-  ts = g_date_time_format (now, "%Y-%m-%d %H:%M:%S");
-  fh = g_fopen (path, "a");
-  if (fh != NULL)
-    {
-      fprintf (fh, "[%s] %s\n", ts, msg);
-      fclose (fh);
-    }
-  g_mutex_unlock (&log_lock);
-  g_date_time_unref (now);
-  g_free (ts);
-  g_free (path);
-  g_free (dir);
-  g_free (msg);
-}
 
 static char *
 last_line (const char *text)
@@ -110,6 +76,39 @@ rm_rf (const char *path)
 }
 
 /* -------------------------------------------------------------------------
+ * Timeouts
+ *
+ * Per step (one tool invocation): images 600 s, audio and documents 1800 s,
+ * video 1800 s plus 60 s per 100 MiB of input, capped at 4 h (a long film
+ * re-encode legitimately takes hours; a hung tool is killed eventually).
+ * NFC_TEST_TIMEOUT_SECS overrides all of them (tests only, honoured only when
+ * set to a positive number).
+ * ---------------------------------------------------------------------- */
+
+#define TIMEOUT_IMAGE_SECS     600
+#define TIMEOUT_DEFAULT_SECS   1800
+#define TIMEOUT_VIDEO_CAP_SECS (4 * 3600)
+
+static guint
+timeout_secs (NfcCategory cat, gint64 input_bytes)
+{
+  const char *e = g_getenv ("NFC_TEST_TIMEOUT_SECS");
+  guint64 v = (e != NULL && *e != '\0') ? g_ascii_strtoull (e, NULL, 10) : 0;
+  guint64 t;
+
+  if (v > 0 && v < G_MAXUINT)
+    return (guint) v;
+  if (cat == NFC_CAT_IMAGE)
+    return TIMEOUT_IMAGE_SECS;
+  if (cat == NFC_CAT_VIDEO)
+    {
+      t = TIMEOUT_DEFAULT_SECS + 60 * (guint64) (MAX (input_bytes, 0) / (100 * 1024 * 1024));
+      return (guint) MIN (t, (guint64) TIMEOUT_VIDEO_CAP_SECS);
+    }
+  return TIMEOUT_DEFAULT_SECS;
+}
+
+/* -------------------------------------------------------------------------
  * Single conversion job
  * ---------------------------------------------------------------------- */
 
@@ -117,15 +116,23 @@ typedef struct {
   NfcCategory cat;
   char *fmt, *key, *ext, *src, *dir, *stem;
   char *workdir, *produced, *hidden;
-  gboolean needs_decode;
+  gint64 src_size;
   GPtrArray *attempts;
   guint ai, si;
   char *err;
   GSubprocess *proc;
+  GCancellable *cancel;   /* cancelled by the step timeout and by shutdown */
+  pid_t pgid;             /* process group of the running step, 0 if none */
   guint timeout_id;
   gboolean timed_out;
+  gboolean aborted;       /* module shutdown: no further steps, no fallbacks */
+  gboolean finalizing;    /* output being moved into place by a worker thread */
   GTask *task;
 } Job;
+
+/* Jobs in flight; touched from the main thread only. */
+static GHashTable *active_jobs = NULL;
+static gboolean shutting_down = FALSE;
 
 static void run_step (Job *j);
 
@@ -147,9 +154,12 @@ job_cleanup_files (Job *j)
 static void
 job_free (Job *j)
 {
+  if (active_jobs != NULL)
+    g_hash_table_remove (active_jobs, j);
   if (j->timeout_id)
     g_source_remove (j->timeout_id);
   g_clear_object (&j->proc);
+  g_clear_object (&j->cancel);
   g_clear_pointer (&j->attempts, g_ptr_array_unref);
   g_free (j->fmt);
   g_free (j->key);
@@ -268,15 +278,29 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
     }
   if (!g_subprocess_communicate_finish (G_SUBPROCESS (source), res, &out, &errb, &error))
     {
+      /* the step was cancelled (timeout, shutdown) or the pipes broke; a
+       * timeout or shutdown is final, no fallback attempt is tried */
       char *cmd = join_argv (argv);
+      gboolean final = j->timed_out || j->aborted;
+      char *msg = g_strdup (j->timed_out ? "timed out" : j->aborted ? "cancelled"
+                                                                     : error->message);
 
-      nfc_log ("FAIL %s -> %s\n  cmd: %s\n  %s", j->src, j->key, cmd, error->message);
+      nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  %s", j->src, j->key,
+               j->timed_out ? "timeout" : j->aborted ? "cancelled" : "I/O error", cmd,
+               error->message);
+      nfc_kill_group (j->pgid); /* nothing of this step may outlive it */
+      j->pgid = 0;
       g_free (cmd);
       g_clear_object (&j->proc);
-      attempt_failed (j, error->message);
       g_clear_error (&error);
+      if (final)
+        job_fail (j, msg);
+      else
+        attempt_failed (j, msg);
+      g_free (msg);
       return;
     }
+  j->pgid = 0;
   {
     gboolean exited = g_subprocess_get_if_exited (j->proc);
     int status = exited ? g_subprocess_get_exit_status (j->proc) : -1;
@@ -287,30 +311,28 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
     char *se = p2 ? g_utf8_make_valid (p2, n2) : g_strdup ("");
 
     g_clear_object (&j->proc);
-    if (j->timed_out || status != 0)
+    if (status != 0)
       {
         char *cmd = join_argv (argv);
         char *msg;
+        gboolean final = j->timed_out; /* killed by the timeout: final */
 
-        if (j->timed_out)
-          msg = g_strdup ("timed out");
-        else
-          {
-            msg = last_line (se);
-            if (msg == NULL)
-              msg = last_line (so);
-            if (msg == NULL)
-              msg = g_strdup_printf ("exit code %d", status);
-          }
-        nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  stderr:\n%s\n  stdout:\n%s", j->src,
-                 j->key, j->timed_out ? "timeout" : "exit status", cmd, se, so);
-        j->timed_out = FALSE;
+        msg = j->timed_out ? g_strdup ("timed out") : last_line (se);
+        if (msg == NULL)
+          msg = last_line (so);
+        if (msg == NULL)
+          msg = g_strdup_printf ("exit code %d", status);
+        nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  stderr:\n%s\n  stdout:\n%s",
+                 j->src, j->key, j->timed_out ? "timeout" : "exit status", cmd, se, so);
         g_free (cmd);
         g_free (so);
         g_free (se);
         g_bytes_unref (out);
         g_bytes_unref (errb);
-        attempt_failed (j, msg);
+        if (final)
+          job_fail (j, msg);
+        else
+          attempt_failed (j, msg);
         g_free (msg);
         return;
       }
@@ -323,6 +345,11 @@ step_done (GObject *source, GAsyncResult *res, gpointer data)
   run_step (j);
 }
 
+/* The step ran too long. /usr/bin/soffice is a shell script that starts
+ * soffice.bin, which keeps our stdout/stderr pipes open even when the script
+ * is killed, so killing the direct child is not enough: kill the whole process
+ * group (the launcher put the child in its own) AND cancel the communicate
+ * operation so it finishes now instead of waiting for the pipes. */
 static gboolean
 step_timeout (gpointer data)
 {
@@ -330,8 +357,11 @@ step_timeout (gpointer data)
 
   j->timeout_id = 0;
   j->timed_out = TRUE;
+  nfc_kill_group (j->pgid);
   if (j->proc != NULL)
     g_subprocess_force_exit (j->proc);
+  if (j->cancel != NULL)
+    g_cancellable_cancel (j->cancel);
   return G_SOURCE_REMOVE;
 }
 
@@ -343,6 +373,12 @@ run_step (Job *j)
   GError *error = NULL;
   char **argv;
 
+  if (shutting_down || j->aborted)
+    {
+      j->aborted = TRUE;
+      job_fail (j, "cancelled");
+      return;
+    }
   if (j->ai >= j->attempts->len)
     {
       job_fail (j, j->err);
@@ -358,6 +394,8 @@ run_step (Job *j)
         {
           GTask *ft = g_task_new (NULL, NULL, finalize_done, j);
 
+          j->finalizing = TRUE;
+
           g_task_set_task_data (ft, j, NULL);
           g_task_run_in_thread (ft, finalize_thread);
           g_object_unref (ft);
@@ -368,9 +406,7 @@ run_step (Job *j)
       return;
     }
   argv = attempt->pdata[j->si];
-  l = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                 G_SUBPROCESS_FLAGS_STDERR_PIPE);
-  g_subprocess_launcher_set_stdin_file_path (l, "/dev/null");
+  l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_PIPE);
   j->proc = g_subprocess_launcher_spawnv (l, (const char *const *) argv, &error);
   g_object_unref (l);
   if (j->proc == NULL)
@@ -386,42 +422,12 @@ run_step (Job *j)
       return;
     }
   j->timed_out = FALSE;
-  j->timeout_id = g_timeout_add_seconds (j->cat == NFC_CAT_IMAGE ? 600 : 1800,
+  j->pgid = nfc_subprocess_pgid (j->proc);
+  g_clear_object (&j->cancel);
+  j->cancel = g_cancellable_new ();
+  j->timeout_id = g_timeout_add_seconds (timeout_secs (j->cat, j->src_size),
                                          step_timeout, j);
-  g_subprocess_communicate_async (j->proc, NULL, NULL, step_done, j);
-}
-
-static void
-decode_thread (GTask *task, gpointer source G_GNUC_UNUSED, gpointer data, GCancellable *c G_GNUC_UNUSED)
-{
-  Job *j = data;
-  GError *error = NULL;
-  char *dest = g_build_filename (j->workdir, "decoded.png", NULL);
-
-  if (!nfc_pixbuf_decode (j->src, dest, &error))
-    g_task_return_error (task, error);
-  else
-    g_task_return_boolean (task, TRUE);
-  g_free (dest);
-}
-
-static void
-decode_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data)
-{
-  Job *j = data;
-  GError *error = NULL;
-
-  if (!g_task_propagate_boolean (G_TASK (res), &error))
-    {
-      char *msg = g_strdup_printf ("cannot decode image: %s", error->message);
-
-      nfc_log ("FAIL %s -> %s\n  GdkPixbuf: %s", j->src, j->key, error->message);
-      g_clear_error (&error);
-      job_fail (j, msg);
-      g_free (msg);
-      return;
-    }
-  run_step (j);
+  g_subprocess_communicate_async (j->proc, NULL, j->cancel, step_done, j);
 }
 
 void
@@ -431,7 +437,7 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
 {
   Job *j = g_new0 (Job, 1);
   GError *error = NULL;
-  GTask *t;
+  GStatBuf st;
 
   j->task = g_task_new (NULL, NULL, callback, user_data);
   j->cat = cat;
@@ -441,6 +447,16 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
   j->src = g_canonicalize_filename (src_in, NULL);
   j->dir = g_path_get_dirname (j->src);
   j->stem = nfc_stem_of (j->src);
+  j->src_size = g_stat (j->src, &st) == 0 ? (gint64) st.st_size : 0;
+
+  if (shutting_down)
+    {
+      job_fail (j, "Nautilus is shutting down");
+      return;
+    }
+  if (active_jobs == NULL)
+    active_jobs = g_hash_table_new (g_direct_hash, g_direct_equal);
+  g_hash_table_add (active_jobs, j);
 
   j->workdir = g_dir_make_tmp ("nfc-XXXXXX", &error);
   if (j->workdir == NULL)
@@ -467,29 +483,45 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
       j->hidden = nfc_hidden_temp_name (j->dir, j->stem, ext);
       j->produced = g_strdup (j->hidden);
     }
-  j->attempts = nfc_build_attempts (cat, j->fmt, key, j->src, j->produced, j->workdir,
-                                    &j->needs_decode);
+  /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
+  j->attempts = nfc_build_attempts (cat, j->fmt, key, j->src, j->produced, j->workdir, NULL);
   if (j->attempts == NULL)
     {
       job_fail (j, "no converter available for this format");
       return;
     }
-  if (j->needs_decode)
-    {
-      /* HEIC/AVIF: decode in-process via GdkPixbuf off the main thread */
-      t = g_task_new (NULL, NULL, decode_done, j);
-      g_task_set_task_data (t, j, NULL);
-      g_task_run_in_thread (t, decode_thread);
-      g_object_unref (t);
-    }
-  else
-    run_step (j);
+  run_step (j);
 }
 
 char *
 nfc_convert_file_finish (GAsyncResult *result, GError **error)
 {
   return g_task_propagate_pointer (G_TASK (result), error);
+}
+
+void
+nfc_shutdown (void)
+{
+  GHashTableIter it;
+  gpointer key;
+
+  shutting_down = TRUE;
+  if (active_jobs == NULL)
+    return;
+  g_hash_table_iter_init (&it, active_jobs);
+  while (g_hash_table_iter_next (&it, &key, NULL))
+    {
+      Job *j = key;
+
+      j->aborted = TRUE;
+      nfc_kill_group (j->pgid);
+      if (j->cancel != NULL)
+        g_cancellable_cancel (j->cancel);
+      /* a job in its finalize thread is left alone: it ends within moments and
+       * cleans up after itself */
+      if (!j->finalizing)
+        job_cleanup_files (j);
+    }
 }
 
 /* -------------------------------------------------------------------------
@@ -574,12 +606,13 @@ notifier_launch (Notifier *n, NotifyMsg *m)
       g_ptr_array_add (argv, g_strdup ("-r"));
       g_ptr_array_add (argv, g_strdup_printf ("%" G_GUINT64_FORMAT, n->id));
     }
+  /* "--": a title or body that begins with '-' (a file named "-foo.png") must not
+   * be parsed as an option */
+  g_ptr_array_add (argv, g_strdup ("--"));
   g_ptr_array_add (argv, g_strdup (m->title));
   g_ptr_array_add (argv, g_strdup (m->body));
 
-  l = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                 G_SUBPROCESS_FLAGS_STDERR_SILENCE);
-  g_subprocess_launcher_set_stdin_file_path (l, "/dev/null");
+  l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
   p = g_subprocess_launcher_spawnv (l, (const char *const *) argv->pdata, NULL);
   g_object_unref (l);
   g_ptr_array_unref (argv);

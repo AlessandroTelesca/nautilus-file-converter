@@ -75,6 +75,16 @@ static GObject *provider;
 static char *work;
 
 /* returns the submenu labels joined by ',' or NULL when there is no menu */
+static void
+write_script (const char *path, const char *body)
+{
+  char *content = g_strconcat ("#!/bin/sh\n", body, NULL);
+
+  g_assert_true (g_file_set_contents (path, content, -1, NULL));
+  g_assert_cmpint (g_chmod (path, 0755), ==, 0);
+  g_free (content);
+}
+
 static char *
 menu_labels (GList *infos)
 {
@@ -92,20 +102,42 @@ menu_labels (GList *infos)
   g_object_get (items->data, "label", &label, "menu", &sub, NULL);
   g_assert_cmpstr (label, ==, "Convert to");
   g_assert_nonnull (sub);
-  for (GList *l = nautilus_menu_get_items (sub); l; l = l->next)
-    {
-      char *lab = NULL;
+  {
+    /* transfer full: the list and its items belong to the caller */
+    GList *sub_items = nautilus_menu_get_items (sub);
 
-      g_object_get (l->data, "label", &lab, NULL);
-      if (s->len)
-        g_string_append_c (s, ',');
-      g_string_append (s, lab);
-      g_free (lab);
-    }
+    for (GList *l = sub_items; l; l = l->next)
+      {
+        char *lab = NULL;
+
+        g_object_get (l->data, "label", &lab, NULL);
+        if (s->len)
+          g_string_append_c (s, ',');
+        g_string_append (s, lab);
+        g_free (lab);
+      }
+    nautilus_menu_item_list_free (sub_items);
+  }
   g_free (label);
   g_object_unref (sub);
   nautilus_menu_item_list_free (items);
   return g_string_free (s, FALSE);
+}
+
+/* The capability probes run in background threads and the menu never waits for
+ * them (that is the point), so right after initialize() an image/audio/video
+ * selection may get no menu yet. For positive expectations wait up to 5 s. */
+static char *
+menu_labels_wait (GList *infos)
+{
+  char *labels = menu_labels (infos);
+
+  for (int i = 0; i < 250 && labels == NULL; i++)
+    {
+      g_usleep (20000);
+      labels = menu_labels (infos);
+    }
+  return labels;
 }
 
 static char *
@@ -175,6 +207,9 @@ test_register_and_menu (void)
   g_assert_true (g_module_symbol (m, "nautilus_module_shutdown", (gpointer *) &shutdown));
   g_type_module_use (tm);
   initialize (tm);
+  /* the probes finish within milliseconds; give all three time so the menus
+   * printed below are complete (the assertions do not depend on this) */
+  g_usleep (500000);
   list_types (&types, &n);
   g_assert_cmpint (n, ==, 1);
   g_assert_cmpuint (types[0], !=, 0);
@@ -186,13 +221,18 @@ test_register_and_menu (void)
 
   touch ("a.png"); touch ("b.jpg"); touch ("c.wav"); touch ("d.xyz"); touch ("noext");
   touch ("e.odt"); touch ("f.mp4");
-  g_mkdir (g_build_filename (work, "adir.png", NULL), 0755);
+  {
+    char *adir = g_build_filename (work, "adir.png", NULL);
+
+    g_mkdir (adir, 0755);
+    g_free (adir);
+  }
 
   /* single image: no own format, other image targets present */
   u1 = path_uri ("a.png");
   f1 = fake_new (u1, "image/png", FALSE);
   l = g_list_append (NULL, f1);
-  labels = menu_labels (l);
+  labels = menu_labels_wait (l);
   g_assert_nonnull (labels);
   g_print ("single png    -> %s\n", labels);
   g_assert_false (has_label (labels, "PNG"));
@@ -204,7 +244,7 @@ test_register_and_menu (void)
   u2 = path_uri ("b.jpg");
   f2 = fake_new (u2, "image/jpeg", FALSE);
   l = g_list_append (l, f2);
-  labels = menu_labels (l);
+  labels = menu_labels_wait (l);
   g_assert_nonnull (labels);
   g_print ("png + jpg     -> %s\n", labels);
   g_assert_false (has_label (labels, "PNG"));
@@ -266,7 +306,7 @@ test_register_and_menu (void)
   /* no extension: the mime type decides */
   u1 = path_uri ("noext");
   l = g_list_append (NULL, fake_new (u1, "image/png", FALSE));
-  labels = menu_labels (l);
+  labels = menu_labels_wait (l);
   g_assert_nonnull (labels);
   g_assert_true (has_label (labels, "JPG"));
   g_free (labels);
@@ -315,6 +355,91 @@ test_register_and_menu (void)
   shutdown ();
 }
 
+/* QC finding 1, end to end through the real menu provider: with a fake ffmpeg
+ * that hangs for 20 s first in PATH, right-click on a plain .txt used to take
+ * 20 s (and a truly hung tool froze Nautilus for good). Runs in its own process
+ * (mode "freeze") because the probe state is once-per-process. */
+static void
+test_freeze (void)
+{
+  GModule *m = g_module_open (module_path, G_MODULE_BIND_LOCAL);
+  void (*initialize) (GTypeModule *);
+  void (*list_types) (const GType **, int *);
+  void (*shutdown) (void);
+  GTypeModule *tm = g_object_new (test_module_get_type (), NULL);
+  const GType *types = NULL;
+  int n = 0;
+  char *u, *labels;
+  GList *l;
+  gint64 t0, us;
+  gboolean got_jpg = FALSE;
+
+  g_assert_nonnull (m);
+  g_assert_true (g_module_symbol (m, "nautilus_module_initialize", (gpointer *) &initialize));
+  g_assert_true (g_module_symbol (m, "nautilus_module_list_types", (gpointer *) &list_types));
+  g_assert_true (g_module_symbol (m, "nautilus_module_shutdown", (gpointer *) &shutdown));
+  g_type_module_use (tm);
+  t0 = g_get_monotonic_time ();
+  initialize (tm);
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, 100000);
+  list_types (&types, &n);
+  provider = g_object_new (types[0], NULL);
+
+  touch ("a.txt"); touch ("b.png"); touch ("c.mp4");
+
+  /* plain text file: the very first right-click, probes still running */
+  u = path_uri ("a.txt");
+  l = g_list_append (NULL, fake_new (u, "text/plain", FALSE));
+  t0 = g_get_monotonic_time ();
+  labels = menu_labels (l);
+  us = g_get_monotonic_time () - t0;
+  g_print ("txt right-click with a hung ffmpeg: %" G_GINT64_FORMAT " us -> %s\n", us,
+           labels ? labels : "(no menu)");
+  g_assert_cmpint (us, <, 100000);
+  g_assert_nonnull (labels);
+  g_assert_true (has_label (labels, "PDF"));
+  g_free (labels);
+  g_list_free_full (l, g_object_unref);
+  g_free (u);
+
+  /* images: quick, and the menu appears as soon as magick has been probed,
+   * although ffmpeg is still hanging (only AVIF needs ffmpeg) */
+  u = path_uri ("b.png");
+  l = g_list_append (NULL, fake_new (u, "image/png", FALSE));
+  for (int i = 0; i < 300 && !got_jpg; i++)
+    {
+      t0 = g_get_monotonic_time ();
+      labels = menu_labels (l);
+      us = g_get_monotonic_time () - t0;
+      g_assert_cmpint (us, <, 100000);
+      if (labels != NULL)
+        {
+          got_jpg = has_label (labels, "JPG");
+          g_assert_false (has_label (labels, "AVIF"));
+          g_free (labels);
+        }
+      if (!got_jpg)
+        g_usleep (10000);
+    }
+  g_assert_true (got_jpg);
+  g_list_free_full (l, g_object_unref);
+  g_free (u);
+
+  /* video needs ffmpeg: no menu, immediately */
+  u = path_uri ("c.mp4");
+  l = g_list_append (NULL, fake_new (u, "video/mp4", FALSE));
+  t0 = g_get_monotonic_time ();
+  labels = menu_labels (l);
+  us = g_get_monotonic_time () - t0;
+  g_assert_cmpint (us, <, 100000);
+  g_assert_null (labels);
+  g_list_free_full (l, g_object_unref);
+  g_free (u);
+
+  g_object_unref (provider);
+  shutdown ();
+}
+
 int
 main (int argc, char **argv)
 {
@@ -326,26 +451,38 @@ main (int argc, char **argv)
   module_path = argv[1];
   work = g_dir_make_tmp ("nfc-menu-XXXXXX", NULL);
   g_assert_nonnull (work);
-  g_test_add_func ("/module/entry-points", test_entry_points);
-  g_test_add_func ("/module/register-and-menu", test_register_and_menu);
+  if (argc > 2 && g_str_equal (argv[2], "freeze"))
+    {
+      /* fakes first in PATH, before the module looks the tools up */
+      char *bin = g_build_filename (work, "bin", NULL), *p, *path;
+
+      g_mkdir (bin, 0755);
+      p = g_build_filename (bin, "ffmpeg", NULL);
+      write_script (p, "exec sleep 20\n");
+      g_free (p);
+      p = g_build_filename (bin, "magick", NULL);
+      write_script (p, "echo '      PNG* PNG       rw-   fake'\necho '     JPEG* JPEG      rw-   fake'\n");
+      g_free (p);
+      p = g_build_filename (bin, "soffice", NULL);
+      write_script (p, "exit 0\n");
+      g_free (p);
+      path = g_strconcat (bin, ":", g_getenv ("PATH"), NULL);
+      g_setenv ("PATH", path, TRUE);
+      g_free (path);
+      g_free (bin);
+      g_test_add_func ("/module/probe-freeze", test_freeze);
+    }
+  else
+    {
+      g_test_add_func ("/module/entry-points", test_entry_points);
+      g_test_add_func ("/module/register-and-menu", test_register_and_menu);
+    }
   rc = g_test_run ();
   {
-    char *cmd_dir = g_strdup (work);
-    GDir *d = g_dir_open (cmd_dir, 0, NULL);
-    const char *n;
+    char *rm[] = { "rm", "-rf", work, NULL };
 
-    while (d && (n = g_dir_read_name (d)))
-      {
-        char *p = g_build_filename (cmd_dir, n, NULL);
-
-        g_rmdir (p);
-        g_unlink (p);
-        g_free (p);
-      }
-    if (d)
-      g_dir_close (d);
-    g_rmdir (cmd_dir);
-    g_free (cmd_dir);
+    g_spawn_sync (NULL, rm, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL, NULL, NULL);
   }
+  g_free (work);
   return rc;
 }

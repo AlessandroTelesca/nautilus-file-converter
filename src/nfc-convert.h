@@ -3,11 +3,12 @@
 
 #include <gio/gio.h>
 #include "nfc-core.h"
+#include "nfc-util.h"
 
 G_BEGIN_DECLS
 
-/* Append a timestamped line to ~/.cache/nautilus-file-converter.log */
-void nfc_log (const char *format, ...) G_GNUC_PRINTF (1, 2);
+/* All of this runs on, and must be called from, the main thread (the thread
+ * that iterates the default main context). */
 
 /* Convert one file without blocking the main loop. The result is the final
  * output path (g_free) or an error whose message is the user-facing text. */
@@ -34,5 +35,11 @@ void nfc_batch_run (NfcCategory cat, const char *key, const char *label,
                     const char *ext, const char *const *paths,
                     const char *const *fmts, guint n,
                     NfcBatchDone done, gpointer user_data);
+
+/* Module shutdown: kill the process groups of all in-flight conversions,
+ * remove their work directories and hidden temp files (best effort), and
+ * refuse new conversions. Their callbacks still fire (with an error) if the
+ * main loop keeps running. */
+void nfc_shutdown (void);
 
 G_END_DECLS

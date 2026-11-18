@@ -59,6 +59,11 @@ on_activate (NautilusMenuItem *item G_GNUC_UNUSED, gpointer user_data)
                  (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
 }
 
+/* Runs on the Nautilus main thread: it must never wait. nfc_analyze_selection
+ * only stats the selected files and consults capability probes that run in
+ * background threads; targets whose probe is still running are left out (see
+ * nfc-core.h), so right after startup an image/audio/video selection may get no
+ * menu for a moment, while document menus work at once. */
 static GList *
 nfc_provider_get_file_items (NautilusMenuProvider *provider G_GNUC_UNUSED, GList *files)
 {
@@ -171,29 +176,21 @@ nfc_provider_class_finalize (NfcProviderClass *klass G_GNUC_UNUSED)
 {
 }
 
-static gpointer
-probe_thread (gpointer data G_GNUC_UNUSED)
-{
-  nfc_probe_ensure ();
-  return NULL;
-}
-
 void
 nautilus_module_initialize (GTypeModule *module)
 {
-  GThread *t;
-
   nfc_tools_init ();
   nfc_provider_register_type (module);
-  /* probe ffmpeg encoders / ImageMagick formats off the main thread */
-  t = g_thread_try_new ("nfc-probe", probe_thread, NULL, NULL);
-  if (t != NULL)
-    g_thread_unref (t);
+  /* probe ffmpeg encoders / ImageMagick formats / pixbuf loaders in background
+   * threads (each with a timeout); get_file_items never waits for them */
+  nfc_probe_start ();
 }
 
 void
 nautilus_module_shutdown (void)
 {
+  /* kill in-flight conversions and remove their temp files (best effort) */
+  nfc_shutdown ();
 }
 
 void

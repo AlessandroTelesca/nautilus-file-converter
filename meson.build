@@ -14,16 +14,33 @@ nautilus_dep = dependency('libnautilus-extension-4')
 extension_dir = nautilus_dep.get_variable(pkgconfig: 'extensiondir',
   default_value: get_option('libdir') / 'nautilus' / 'extensions-4')
 
-# Pure logic + async runner: no Nautilus dependency, also linked by the tests.
+# Where the out-of-process decoder is installed (and where the extension looks
+# for it): <prefix>/<libexecdir>, /usr/libexec by default.
+libexec_dir = get_option('prefix') / get_option('libexecdir')
+
+conf = configuration_data()
+conf.set_quoted('NFC_DECODE_HELPER_PATH', libexec_dir / 'nfc-decode')
+config_h = configure_file(output: 'config.h', configuration: conf)
+
+# Out-of-process HEIC/AVIF decoding and GdkPixbuf format listing. This is the
+# only code linked against gdk-pixbuf: the extension itself must not be.
+nfc_decode = executable('nfc-decode', 'src/nfc-decode.c',
+  dependencies: [pixbuf_dep],
+  install: true,
+  install_dir: libexec_dir,
+)
+
+# Pure logic + async runner: no Nautilus and no gdk-pixbuf dependency, also
+# linked by the tests.
 core_lib = static_library('nfc-core',
-  ['src/nfc-core.c', 'src/nfc-convert.c'],
-  dependencies: [glib_dep, gio_dep, gobject_dep, pixbuf_dep],
-  include_directories: include_directories('src'),
+  ['src/nfc-core.c', 'src/nfc-convert.c', 'src/nfc-util.c'],
+  dependencies: [glib_dep, gio_dep, gobject_dep],
+  include_directories: include_directories('src', '.'),
 )
 
 core_dep = declare_dependency(
   link_with: core_lib,
-  dependencies: [glib_dep, gio_dep, gobject_dep, pixbuf_dep],
+  dependencies: [glib_dep, gio_dep, gobject_dep],
   include_directories: include_directories('src'),
 )
 

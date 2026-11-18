@@ -1,24 +1,27 @@
 /* nautilus-file-converter: pure conversion logic. See nfc-core.h. */
+#define _GNU_SOURCE
 #include "nfc-core.h"
 
 #include <errno.h>
-#include <gdk-pixbuf/gdk-pixbuf.h>
+#include <fcntl.h>
 #include <gio/gio.h>
+#include <glib/gstdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
-NfcTools nfc_tools = { NULL, NULL, NULL, NULL };
+#include "config.h"
+#include "nfc-util.h"
+
+NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL };
 
 /* -------------------------------------------------------------------------
- * Tool discovery and capability probes
+ * Tool discovery
  * ---------------------------------------------------------------------- */
-
-static GMutex   probe_lock;
-static gboolean probed = FALSE;
-static GHashTable *ff_enc = NULL;    /* ffmpeg encoder names */
-static GHashTable *im_write = NULL;  /* ImageMagick writable format names */
-static GHashTable *pb_read = NULL;   /* GdkPixbuf format names */
 
 static char *
 find_first (const char *a, const char *b)
@@ -27,6 +30,20 @@ find_first (const char *a, const char *b)
   if (p == NULL && b != NULL)
     p = g_find_program_in_path (b);
   return p;
+}
+
+/* The out-of-process decoder: NFC_DECODE_HELPER (tests) or the configured
+ * install path. NULL if it is not there: HEIC/AVIF input is then not offered. */
+static char *
+find_decode_helper (void)
+{
+  const char *env = g_getenv ("NFC_DECODE_HELPER");
+
+  if (env != NULL && *env != '\0')
+    return g_file_test (env, G_FILE_TEST_IS_EXECUTABLE) ? g_strdup (env) : NULL;
+  if (g_file_test (NFC_DECODE_HELPER_PATH, G_FILE_TEST_IS_EXECUTABLE))
+    return g_strdup (NFC_DECODE_HELPER_PATH);
+  return NULL;
 }
 
 void
@@ -40,33 +57,118 @@ nfc_tools_init (void)
       g_free (nfc_tools.ffmpeg);
       g_free (nfc_tools.soffice);
       g_free (nfc_tools.notify);
+      g_free (nfc_tools.decode);
       nfc_tools.magick = find_first ("magick", "convert");
       nfc_tools.ffmpeg = find_first ("ffmpeg", NULL);
       nfc_tools.soffice = find_first ("soffice", "libreoffice");
       nfc_tools.notify = find_first ("notify-send", NULL);
+      nfc_tools.decode = find_decode_helper ();
       g_once_init_leave (&once, 1);
     }
 }
 
-/* Run argv quietly and return stdout (NULL on failure). */
-static char *
-run_quiet (const char *const *argv)
-{
-  GSubprocessLauncher *l;
-  GSubprocess *p;
-  char *out = NULL;
+/* -------------------------------------------------------------------------
+ * Capability probes (background threads; see nfc-core.h)
+ * ---------------------------------------------------------------------- */
 
-  l = g_subprocess_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE |
-                                 G_SUBPROCESS_FLAGS_STDERR_SILENCE);
-  g_subprocess_launcher_set_stdin_file_path (l, "/dev/null");
-  p = g_subprocess_launcher_spawnv (l, argv, NULL);
+#define PROBE_TIMEOUT_SECS 10
+
+/* 0 = pending, 1 = done. Stored AFTER the table of that probe is complete;
+ * readers check it first, so the tables need no lock (they are never changed
+ * once the flag is set). */
+static gint probe_state[NFC_PROBE_N];
+static GMutex probe_lock;
+static GCond probe_cond;
+static GHashTable *ff_enc = NULL;    /* ffmpeg encoder names */
+static GHashTable *im_write = NULL;  /* ImageMagick writable format names */
+static GHashTable *pb_read = NULL;   /* GdkPixbuf format names */
+
+static guint
+probe_timeout_secs (void)
+{
+  const char *e = g_getenv ("NFC_TEST_PROBE_TIMEOUT_SECS"); /* tests only */
+  guint64 v = (e != NULL && *e != '\0') ? g_ascii_strtoull (e, NULL, 10) : 0;
+
+  return v > 0 && v < 3600 ? (guint) v : PROBE_TIMEOUT_SECS;
+}
+
+typedef struct {
+  GMainLoop *loop;
+  GSubprocess *proc;
+  GCancellable *cancel;
+  gboolean timed_out;
+  gboolean ok;
+  char *out;
+} QuietCtx;
+
+static void
+quiet_done (GObject *source, GAsyncResult *res, gpointer data)
+{
+  QuietCtx *q = data;
+
+  q->ok = g_subprocess_communicate_utf8_finish (G_SUBPROCESS (source), res, &q->out,
+                                                NULL, NULL);
+  g_main_loop_quit (q->loop);
+}
+
+static gboolean
+quiet_timeout (gpointer data)
+{
+  QuietCtx *q = data;
+
+  q->timed_out = TRUE;
+  nfc_kill_group (nfc_subprocess_pgid (q->proc));
+  g_cancellable_cancel (q->cancel);
+  return G_SOURCE_REMOVE;
+}
+
+/* Run argv quietly and return stdout (NULL on failure or timeout). Blocks only
+ * the calling (probe) thread, in a private main context; after the timeout the
+ * whole process group is killed. */
+static char *
+run_quiet (const char *const *argv, const char *what)
+{
+  GMainContext *ctx = g_main_context_new ();
+  GSubprocessLauncher *l;
+  GSource *timer;
+  QuietCtx q = { NULL, NULL, NULL, FALSE, FALSE, NULL };
+  GError *error = NULL;
+  guint secs = probe_timeout_secs ();
+
+  g_main_context_push_thread_default (ctx);
+  l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+  q.proc = g_subprocess_launcher_spawnv (l, argv, &error);
   g_object_unref (l);
-  if (p == NULL)
-    return NULL;
-  if (!g_subprocess_communicate_utf8 (p, NULL, NULL, &out, NULL, NULL))
-    out = NULL;
-  g_object_unref (p);
-  return out;
+  if (q.proc == NULL)
+    {
+      nfc_log ("probe %s: cannot run %s: %s", what, argv[0], error->message);
+      g_clear_error (&error);
+      goto out;
+    }
+  q.loop = g_main_loop_new (ctx, FALSE);
+  q.cancel = g_cancellable_new ();
+  timer = g_timeout_source_new_seconds (secs);
+  g_source_set_callback (timer, quiet_timeout, &q, NULL);
+  g_source_attach (timer, ctx);
+  g_subprocess_communicate_utf8_async (q.proc, NULL, q.cancel, quiet_done, &q);
+  g_main_loop_run (q.loop);
+  g_source_destroy (timer);
+  g_source_unref (timer);
+  if (q.timed_out)
+    {
+      nfc_log ("probe %s: %s did not answer within %u s, killed; treated as unavailable "
+               "for this session", what, argv[0], secs);
+      g_clear_pointer (&q.out, g_free);
+    }
+  else if (!q.ok)
+    g_clear_pointer (&q.out, g_free);
+  g_main_loop_unref (q.loop);
+  g_object_unref (q.cancel);
+  g_object_unref (q.proc);
+out:
+  g_main_context_pop_thread_default (ctx);
+  g_main_context_unref (ctx);
+  return q.out;
 }
 
 static gboolean
@@ -86,7 +188,7 @@ probe_ffmpeg (void)
     return;
   {
     const char *argv[] = { nfc_tools.ffmpeg, "-hide_banner", "-encoders", NULL };
-    out = run_quiet (argv);
+    out = run_quiet (argv, "ffmpeg");
   }
   if (out == NULL)
     return;
@@ -131,7 +233,7 @@ probe_magick (void)
     return;
   {
     const char *argv[] = { nfc_tools.magick, "-list", "format", NULL };
-    out = run_quiet (argv);
+    out = run_quiet (argv, "magick");
   }
   if (out == NULL)
     return;
@@ -179,28 +281,105 @@ probe_magick (void)
   g_free (out);
 }
 
+/* Which image formats GdkPixbuf can read: asked of the helper process, never
+ * loaded into Nautilus. */
 static void
 probe_pixbuf (void)
 {
-  GSList *formats = gdk_pixbuf_get_formats ();
+  char *out;
 
   pb_read = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
-  for (GSList *l = formats; l; l = l->next)
-    g_hash_table_add (pb_read, gdk_pixbuf_format_get_name (l->data));
-  g_slist_free (formats);
+  if (nfc_tools.decode == NULL)
+    return;
+  {
+    const char *argv[] = { nfc_tools.decode, "--formats", NULL };
+    out = run_quiet (argv, "nfc-decode");
+  }
+  if (out == NULL)
+    return;
+  {
+    char **lines = g_strsplit (out, "\n", -1);
+
+    for (char **l = lines; *l; l++)
+      {
+        char *s = g_strstrip (*l);
+
+        if (*s != '\0')
+          g_hash_table_add (pb_read, g_strdup (s));
+      }
+    g_strfreev (lines);
+  }
+  g_free (out);
+}
+
+static gpointer
+probe_thread (gpointer data)
+{
+  NfcProbe which = GPOINTER_TO_INT (data);
+
+  switch (which)
+    {
+    case NFC_PROBE_FFMPEG: probe_ffmpeg (); break;
+    case NFC_PROBE_MAGICK: probe_magick (); break;
+    case NFC_PROBE_PIXBUF: probe_pixbuf (); break;
+    default: break;
+    }
+  g_atomic_int_set (&probe_state[which], 1);
+  g_mutex_lock (&probe_lock);
+  g_cond_broadcast (&probe_cond);
+  g_mutex_unlock (&probe_lock);
+  return NULL;
+}
+
+void
+nfc_probe_start (void)
+{
+  static gsize once = 0;
+
+  nfc_tools_init ();
+  if (g_once_init_enter (&once))
+    {
+      for (int i = 0; i < NFC_PROBE_N; i++)
+        {
+          GThread *t = g_thread_try_new ("nfc-probe", probe_thread, GINT_TO_POINTER (i), NULL);
+
+          if (t != NULL)
+            g_thread_unref (t);
+          else
+            {
+              /* cannot spawn a thread: leave this probe empty ("unavailable")
+               * rather than ever running a tool on the calling thread */
+              GHashTable **tbl = i == NFC_PROBE_FFMPEG ? &ff_enc
+                                 : i == NFC_PROBE_MAGICK ? &im_write : &pb_read;
+
+              *tbl = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+              g_atomic_int_set (&probe_state[i], 1);
+            }
+        }
+      g_once_init_leave (&once, 1);
+    }
+}
+
+gboolean
+nfc_probe_done (NfcProbe probe)
+{
+  return (guint) probe < NFC_PROBE_N && g_atomic_int_get (&probe_state[probe]) != 0;
 }
 
 void
 nfc_probe_ensure (void)
 {
-  nfc_tools_init ();
+  nfc_probe_start ();
   g_mutex_lock (&probe_lock);
-  if (!probed)
+  for (;;)
     {
-      probe_ffmpeg ();
-      probe_magick ();
-      probe_pixbuf ();
-      probed = TRUE;
+      gboolean all = TRUE;
+
+      for (int i = 0; i < NFC_PROBE_N; i++)
+        all = all && nfc_probe_done (i);
+      if (all)
+        break;
+      g_cond_wait (&probe_cond, &probe_lock);
     }
   g_mutex_unlock (&probe_lock);
 }
@@ -208,22 +387,21 @@ nfc_probe_ensure (void)
 gboolean
 nfc_have_encoder (const char *name)
 {
-  nfc_probe_ensure ();
-  return name != NULL && g_hash_table_contains (ff_enc, name);
+  return name != NULL && nfc_probe_done (NFC_PROBE_FFMPEG) && g_hash_table_contains (ff_enc, name);
 }
 
 gboolean
 nfc_magick_can_write (const char *im_format)
 {
-  nfc_probe_ensure ();
-  return im_format != NULL && g_hash_table_contains (im_write, im_format);
+  return im_format != NULL && nfc_probe_done (NFC_PROBE_MAGICK) &&
+         g_hash_table_contains (im_write, im_format);
 }
 
 gboolean
 nfc_pixbuf_can_read (const char *name)
 {
-  nfc_probe_ensure ();
-  return name != NULL && g_hash_table_contains (pb_read, name);
+  return name != NULL && nfc_probe_done (NFC_PROBE_PIXBUF) &&
+         g_hash_table_contains (pb_read, name);
 }
 
 /* -------------------------------------------------------------------------
@@ -457,17 +635,72 @@ nfc_category_available (NfcCategory cat)
     }
 }
 
-/* Is the tool/codec needed for this target available? */
-static gboolean
-target_ok (NfcCategory cat, const char *key)
+/* Is the tool/codec needed for something available? Three-valued: the
+ * capability probes run in the background, and until one has finished the
+ * answer is PENDING (never "wait for it"). */
+typedef enum { AV_NO, AV_YES, AV_PENDING } Avail;
+
+static Avail
+avail_and (Avail a, Avail b)
 {
-  nfc_probe_ensure ();
+  if (a == AV_NO || b == AV_NO)
+    return AV_NO;
+  if (a == AV_PENDING || b == AV_PENDING)
+    return AV_PENDING;
+  return AV_YES;
+}
+
+static Avail
+ff_has (const char *encoder)
+{
+  if (nfc_tools.ffmpeg == NULL)
+    return AV_NO;
+  if (!nfc_probe_done (NFC_PROBE_FFMPEG))
+    return AV_PENDING;
+  return nfc_have_encoder (encoder) ? AV_YES : AV_NO;
+}
+
+static Avail
+im_can_write (const char *im_format)
+{
+  if (nfc_tools.magick == NULL)
+    return AV_NO;
+  if (!nfc_probe_done (NFC_PROBE_MAGICK))
+    return AV_PENDING;
+  return nfc_magick_can_write (im_format) ? AV_YES : AV_NO;
+}
+
+static Avail
+im_has_any_writer (void)
+{
+  if (nfc_tools.magick == NULL)
+    return AV_NO;
+  if (!nfc_probe_done (NFC_PROBE_MAGICK))
+    return AV_PENDING;
+  return g_hash_table_size (im_write) > 0 ? AV_YES : AV_NO;
+}
+
+/* HEIC/AVIF input is decoded by the helper process via GdkPixbuf */
+static Avail
+pixbuf_can_read (const char *fmt)
+{
+  if (nfc_tools.decode == NULL)
+    return AV_NO;
+  if (!nfc_probe_done (NFC_PROBE_PIXBUF))
+    return AV_PENDING;
+  return nfc_pixbuf_can_read (fmt) ? AV_YES : AV_NO;
+}
+
+static Avail
+target_avail (NfcCategory cat, const char *key)
+{
   if (cat == NFC_CAT_IMAGE)
     {
       if (g_str_equal (key, "avif"))
-        return nfc_tools.ffmpeg != NULL && nfc_have_encoder ("libaom-av1") &&
-               g_hash_table_size (im_write) > 0;
-      return nfc_magick_can_write (im_format_name (key));
+        return avail_and (avail_and (nfc_tools.ffmpeg != NULL ? AV_YES : AV_NO,
+                                     ff_has ("libaom-av1")),
+                          im_has_any_writer ());
+      return im_can_write (im_format_name (key));
     }
   if (cat == NFC_CAT_AUDIO || cat == NFC_CAT_VIDEO)
     {
@@ -479,18 +712,16 @@ target_ok (NfcCategory cat, const char *key)
       };
       const char *enc = NULL;
 
-      if (nfc_tools.ffmpeg == NULL)
-        return FALSE;
       for (guint i = 0; i < G_N_ELEMENTS (need); i++)
         if (g_str_equal (need[i][0], key))
           enc = need[i][1];
       if (enc == NULL)
-        return FALSE;
+        return AV_NO;
       if (cat == NFC_CAT_VIDEO && g_str_equal (key, "webm"))
-        return nfc_have_encoder (enc) && nfc_have_encoder ("libopus");
-      return nfc_have_encoder (enc);
+        return avail_and (ff_has (enc), ff_has ("libopus"));
+      return ff_has (enc);
     }
-  return nfc_tools.soffice != NULL;
+  return nfc_tools.soffice != NULL ? AV_YES : AV_NO;
 }
 
 GPtrArray *
@@ -498,18 +729,21 @@ nfc_targets_for (NfcCategory cat, const char *fmt)
 {
   GPtrArray *out = g_ptr_array_new ();
   const NfcTarget *table = target_table (cat);
+  Avail src_ok = AV_YES;
 
   if (table == NULL || fmt == NULL)
     return out;
-  /* ImageMagick here cannot read HEIC/AVIF; without the GdkPixbuf loader
-   * there is no way to decode them */
-  if (cat == NFC_CAT_IMAGE && is_pixbuf_src (fmt) && !nfc_pixbuf_can_read (fmt))
+  /* ImageMagick here cannot read HEIC/AVIF; without the GdkPixbuf loader (in
+   * the helper process) there is no way to decode them */
+  if (cat == NFC_CAT_IMAGE && is_pixbuf_src (fmt))
+    src_ok = pixbuf_can_read (fmt);
+  if (src_ok != AV_YES)
     return out;
   for (const NfcTarget *t = table; t->key; t++)
     {
       if (g_str_equal (t->key, fmt))
         continue;
-      if (!target_ok (cat, t->key))
+      if (target_avail (cat, t->key) != AV_YES) /* NO, or probe still running */
         continue;
       g_ptr_array_add (out, (gpointer) t);
     }
@@ -597,6 +831,7 @@ nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel)
 
   if (!nfc_category_available (cat))
     goto out;
+  nfc_probe_start (); /* no-op once started; never blocks */
   sel->cat = cat;
 
   /* targets valid for every selected file; a target equal to the source
@@ -668,15 +903,27 @@ attempts_new (void)
   return g_ptr_array_new_with_free_func ((GDestroyNotify) g_ptr_array_unref);
 }
 
-/* one attempt consisting of the given steps (takes ownership of the argv) */
+/* one attempt consisting of the given steps (NULL-terminated list of argv; a
+ * NULL step is skipped; takes ownership of the argv) */
+static void add_attempt (GPtrArray *attempts, char **first, ...) G_GNUC_NULL_TERMINATED;
+
 static void
-add_attempt (GPtrArray *attempts, char **step1, char **step2)
+add_attempt (GPtrArray *attempts, char **first, ...)
 {
   GPtrArray *at = attempt_new ();
+  va_list ap;
+  char **step = first;
 
-  g_ptr_array_add (at, step1);
-  if (step2 != NULL)
-    g_ptr_array_add (at, step2);
+  va_start (ap, first);
+  for (;;)
+    {
+      if (step != NULL)
+        g_ptr_array_add (at, step);
+      step = va_arg (ap, char **);
+      if (step == NULL)
+        break;
+    }
+  va_end (ap);
   g_ptr_array_add (attempts, at);
 }
 
@@ -698,6 +945,58 @@ im_flatten (GPtrArray *a)
   av_add (a, "-background", "white", "-alpha", "remove", "-alpha", "off", NULL);
 }
 
+/* ImageMagick expands %-escapes ("%d", "%[filename]", ...) in every file name
+ * it is given, input and output; "%%" is a literal percent sign. */
+static char *
+im_escape (const char *s)
+{
+  GString *g = g_string_new (NULL);
+
+  for (; *s; s++)
+    {
+      if (*s == '%')
+        g_string_append_c (g, '%');
+      g_string_append_c (g, *s);
+    }
+  return g_string_free (g, FALSE);
+}
+
+/* Explicit input coder, from the classified type: ImageMagick must not pick a
+ * coder by sniffing the content (an ".png" that is really PostScript, MVG or
+ * MSL would otherwise reach Ghostscript or the script coders). */
+static const char *
+im_input_coder (const char *fmt)
+{
+  static const char *map[][2] = {
+    { "png", "PNG" }, { "jpg", "JPEG" }, { "webp", "WEBP" }, { "bmp", "BMP" },
+    { "gif", "GIF" }, { "ico", "ICO" }, { "svg", "SVG" }, { "tiff", "TIFF" },
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (map); i++)
+    if (g_str_equal (map[i][0], fmt))
+      return map[i][1];
+  return NULL;
+}
+
+/* "CODER:<escaped path>" plus an optional suffix such as "[0]" */
+static char *
+im_path_arg (const char *coder, const char *path, const char *suffix)
+{
+  char *esc = im_escape (path);
+  char *r = g_strconcat (coder, ":", esc, suffix != NULL ? suffix : "", NULL);
+
+  g_free (esc);
+  return r;
+}
+
+/* resource limits: a hostile or huge image must not eat the machine */
+static void
+im_limits (GPtrArray *a)
+{
+  av_add (a, "-limit", "memory", "1GiB", "-limit", "map", "2GiB", "-limit", "disk",
+          "4GiB", "-limit", "time", "600", NULL);
+}
+
 GPtrArray *
 nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
                     const char *src_in, const char *out, const char *workdir,
@@ -715,22 +1014,33 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
 
   if (cat == NFC_CAT_IMAGE)
     {
-      char *inp, *im_in;
-      const char *imname;
+      char *im_in, *decoded = NULL;
+      char **dec_step = NULL;
+      const char *imname, *coder;
 
       if (nfc_tools.magick == NULL ||
           (im_format_name (key) == NULL && !g_str_equal (key, "avif")))
         goto fail;
       if (is_pixbuf_src (fmt))
         {
-          inp = g_build_filename (workdir, "decoded.png", NULL);
+          /* step 1: nfc-decode <src> <workdir>/decoded.png (own process) */
+          if (nfc_tools.decode == NULL)
+            goto fail;
+          decoded = g_build_filename (workdir, "decoded.png", NULL);
+          a = av_new ();
+          av_add (a, nfc_tools.decode, src, decoded, NULL);
+          dec_step = av_done (a);
+          im_in = im_path_arg ("PNG", decoded, "[0]");
           if (needs_decode != NULL)
             *needs_decode = TRUE;
         }
       else
-        inp = g_strdup (src);
-      im_in = g_strconcat (inp, "[0]", NULL);
-      g_free (inp);
+        {
+          coder = im_input_coder (fmt);
+          if (coder == NULL)
+            goto fail;
+          im_in = im_path_arg (coder, src, "[0]");
+        }
 
       if (g_str_equal (key, "avif"))
         {
@@ -740,12 +1050,15 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
           if (nfc_tools.ffmpeg == NULL)
             {
               g_free (im_in);
+              g_free (decoded);
+              g_strfreev (dec_step);
               goto fail;
             }
           flat = g_build_filename (workdir, "flat.png", NULL);
-          flatp = g_strconcat ("PNG:", flat, NULL);
+          flatp = im_path_arg ("PNG", flat, NULL);
           a = av_new ();
           av_add (a, nfc_tools.magick, "-quiet", NULL);
+          im_limits (a);
           if (g_str_equal (fmt, "svg"))
             av_add (a, "-background", "none", "-density", "192", NULL);
           av_add (a, im_in, "-auto-orient", NULL);
@@ -759,10 +1072,11 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
                   "-cpu-used", "6", "-row-mt", "1", "-still-picture", "1",
                   "-f", "avif", out, NULL);
           s2 = av_done (a);
-          add_attempt (attempts, s1, s2);
+          add_attempt (attempts, dec_step, s1, s2, NULL);
           g_free (flat);
           g_free (flatp);
           g_free (im_in);
+          g_free (decoded);
           g_free (src);
           return attempts;
         }
@@ -770,6 +1084,7 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
       imname = im_format_name (key);
       a = av_new ();
       av_add (a, nfc_tools.magick, "-quiet", NULL);
+      im_limits (a);
       if (g_str_equal (fmt, "svg"))
         av_add (a, "-background", "none", "-density", "192", NULL);
       av_add (a, im_in, NULL);
@@ -793,13 +1108,14 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
       {
         /* explicit format prefix: ImageMagick silently writes PNG data under
          * an .avif/.heic name, and never trusts the extension we want */
-        char *o = g_strconcat (imname, ":", out, NULL);
+        char *o = im_path_arg (imname, out, NULL);
 
         av_add (a, o, NULL);
         g_free (o);
       }
-      add_attempt (attempts, av_done (a), NULL);
+      add_attempt (attempts, dec_step, av_done (a), NULL);
       g_free (im_in);
+      g_free (decoded);
       g_free (src);
       return attempts;
     }
@@ -882,13 +1198,23 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
   /* documents */
   {
     const char *flt = lo_filter (key);
-    char *outdir, *profile, *envarg;
+    char *outdir, *profile, *envarg, *puri;
 
     if (flt == NULL || nfc_tools.soffice == NULL)
       goto fail;
-    outdir = g_path_get_dirname (out);
+    /* --outdir is percent-decoded by LibreOffice when given as a plain path
+     * ("%20" in a directory name would become a space), so give it a URI */
+    char *outdir_path = g_path_get_dirname (out);
+
+    outdir = g_filename_to_uri (outdir_path, NULL, NULL);
+    g_free (outdir_path);
+    if (outdir == NULL)
+      outdir = g_strdup ("");
     profile = g_build_filename (workdir, "lo_profile", NULL);
-    envarg = g_strconcat ("-env:UserInstallation=file://", profile, NULL);
+    /* a proper URI: a space or '%' in the temp dir would otherwise crash soffice */
+    puri = g_filename_to_uri (profile, NULL, NULL);
+    envarg = g_strconcat ("-env:UserInstallation=", puri != NULL ? puri : "", NULL);
+    g_free (puri);
     a = av_new ();
     av_add (a, nfc_tools.soffice, envarg, "--headless", "--norestore",
             "--nolockcheck", "--nodefault", "--nologo", "--convert-to", flt,
@@ -907,24 +1233,6 @@ fail:
   return NULL;
 }
 
-gboolean
-nfc_pixbuf_decode (const char *src, const char *dest, GError **error)
-{
-  GdkPixbuf *p, *o;
-  gboolean ok;
-
-  p = gdk_pixbuf_new_from_file (src, error);
-  if (p == NULL)
-    return FALSE;
-  o = gdk_pixbuf_apply_embedded_orientation (p);
-  if (o == NULL)
-    o = g_object_ref (p);
-  ok = gdk_pixbuf_save (o, dest, "png", error, NULL);
-  g_object_unref (o);
-  g_object_unref (p);
-  return ok;
-}
-
 /* -------------------------------------------------------------------------
  * Output naming
  * ---------------------------------------------------------------------- */
@@ -939,9 +1247,49 @@ nfc_candidate_name (const char *stem, const char *ext, guint n)
 
 static GMutex name_lock;
 
+/* rename without ever replacing an existing entry. Returns 0, or -1 with errno
+ * (EEXIST: the name is taken; EINVAL/ENOSYS/...: not supported here). */
+static int
+rename_noreplace (const char *from, const char *to)
+{
+#if defined(__linux__) && defined(SYS_renameat2)
+#ifndef RENAME_NOREPLACE
+#define RENAME_NOREPLACE (1 << 0)
+#endif
+  return (int) syscall (SYS_renameat2, AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE);
+#else
+  (void) from;
+  (void) to;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+/* Last resort for filesystems that neither link nor know RENAME_NOREPLACE:
+ * reserve the name with O_CREAT|O_EXCL (atomic), then rename over our own
+ * placeholder. */
+static int
+reserve_and_rename (const char *from, const char *to)
+{
+  int fd = open (to, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+
+  if (fd < 0)
+    return -1;
+  close (fd);
+  if (rename (from, to) != 0)
+    {
+      int saved = errno;
+
+      unlink (to);
+      errno = saved;
+      return -1;
+    }
+  return 0;
+}
+
 char *
-nfc_publish (const char *tmp_path, const char *directory, const char *stem,
-             const char *ext, GError **error)
+nfc_publish_with_mode (const char *tmp_path, const char *directory, const char *stem,
+                       const char *ext, NfcPublishMode mode, GError **error)
 {
   char *result = NULL;
 
@@ -950,11 +1298,42 @@ nfc_publish (const char *tmp_path, const char *directory, const char *stem,
     {
       char *name = nfc_candidate_name (stem, ext, n);
       char *cand = g_build_filename (directory, name, NULL);
+      int link_errno = 0;
 
       g_free (name);
-      if (link (tmp_path, cand) == 0) /* fails with EEXIST if it appeared */
+      if (mode == NFC_PUBLISH_AUTO)
         {
-          unlink (tmp_path);
+          if (link (tmp_path, cand) == 0) /* fails with EEXIST if it appeared */
+            {
+              unlink (tmp_path);
+              result = cand;
+              break;
+            }
+          if (errno == EEXIST)
+            {
+              g_free (cand);
+              continue;
+            }
+          link_errno = errno;
+        }
+      /* filesystem without hard links (FAT, ...) */
+      if (mode != NFC_PUBLISH_NO_LINK_NO_RENAME2)
+        {
+          if (rename_noreplace (tmp_path, cand) == 0)
+            {
+              result = cand;
+              break;
+            }
+          if (errno == EEXIST)
+            {
+              g_free (cand);
+              continue;
+            }
+          if (errno != EINVAL && errno != ENOSYS && errno != EOPNOTSUPP)
+            goto failed;
+        }
+      if (reserve_and_rename (tmp_path, cand) == 0)
+        {
           result = cand;
           break;
         }
@@ -963,31 +1342,26 @@ nfc_publish (const char *tmp_path, const char *directory, const char *stem,
           g_free (cand);
           continue;
         }
+    failed:
       {
-        /* filesystem without hard links (FAT, ...): rename, but never over
-         * an existing entry */
-        int saved = errno;
-        struct stat st;
+        int e = errno;
 
-        if (lstat (cand, &st) == 0)
-          {
-            g_free (cand);
-            continue;
-          }
-        if (rename (tmp_path, cand) == 0)
-          {
-            result = cand;
-            break;
-          }
-        g_set_error (error, G_IO_ERROR, g_io_error_from_errno (errno),
-                     "cannot create %s: %s (link: %s)", cand, g_strerror (errno),
-                     g_strerror (saved));
+        g_set_error (error, G_IO_ERROR, g_io_error_from_errno (e),
+                     "cannot create %s: %s (link: %s)", cand, g_strerror (e),
+                     link_errno ? g_strerror (link_errno) : "not tried");
         g_free (cand);
         break;
       }
     }
   g_mutex_unlock (&name_lock);
   return result;
+}
+
+char *
+nfc_publish (const char *tmp_path, const char *directory, const char *stem,
+             const char *ext, GError **error)
+{
+  return nfc_publish_with_mode (tmp_path, directory, stem, ext, NFC_PUBLISH_AUTO, error);
 }
 
 char *
