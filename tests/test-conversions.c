@@ -1740,20 +1740,20 @@ test_compress_notifications (const char *dir)
     const char *unwanted;
   } c[] = {
     { "one file", NFC_PRESET_HIGH, { "big", NULL },
-      { " -- Compressing… f0.jpg (High)", " -- Compression complete f0.jpg → f0 (compressed).jpg (High), −", "%", NULL },
+      { " -- Reducing file size… f0.jpg (High)", " -- File size reduced f0.jpg → f0 (compressed).jpg (High), −", "%", NULL },
       "already as small" },
     { "three files", NFC_PRESET_BALANCED, { "big", "big", "big", NULL },
-      { " -- Compressing… 3 files (Balanced)", " -- Compression complete Compressed 3 files (Balanced), −", "%", NULL },
+      { " -- Reducing file size… 3 files (Balanced)", " -- File size reduced Compressed 3 files (Balanced), −", "%", NULL },
       "already as small" },
     { "already as small as it gets", NFC_PRESET_HIGH, { "tiny", NULL },
-      { " -- Compressing… f0.jpg (High)", " -- Nothing to compress f0.jpg is already as small as it gets", NULL, NULL },
-      "Compression failed" },
+      { " -- Reducing file size… f0.jpg (High)", " -- Nothing to reduce f0.jpg is already as small as it gets", NULL, NULL },
+      "Couldn't reduce file size" },
     { "one good, one skipped", NFC_PRESET_BALANCED, { "big", "tiny", NULL },
-      { " -- Compression complete f0.jpg → f0 (compressed).jpg (Balanced), −",
+      { " -- File size reduced f0.jpg → f0 (compressed).jpg (Balanced), −",
         "\nf1.jpg is already as small as it gets", NULL, NULL },
-      "Compression failed" },
+      "Couldn't reduce file size" },
     { "one good, one broken", NFC_PRESET_BALANCED, { "big", "bad", NULL },
-      { " -- Compression failed f0.jpg → f0 (compressed).jpg (Balanced), −", "\nFailed: f1.jpg — ", NULL, NULL },
+      { " -- Couldn't reduce file size f0.jpg → f0 (compressed).jpg (Balanced), −", "\nFailed: f1.jpg — ", NULL, NULL },
       "already as small" },
   };
 
@@ -1796,9 +1796,9 @@ test_compress_notifications (const char *dir)
           g_usleep (20000);
           g_clear_pointer (&logged, g_free);
           if (g_file_get_contents (log, &logged, NULL, NULL))
-            pass = strstr (logged, "Compression complete") != NULL ||
-                   strstr (logged, "Compression failed") != NULL ||
-                   strstr (logged, "Nothing to compress") != NULL;
+            pass = strstr (logged, "File size reduced") != NULL ||
+                   strstr (logged, "Couldn't reduce file size") != NULL ||
+                   strstr (logged, "Nothing to reduce") != NULL;
         }
       if (!pass)
         g_string_append (miss, "no final notification; ");
@@ -2349,27 +2349,27 @@ test_resize_notifications (const char *dir)
     { "one file", "1080p", { "4k", NULL },
       { " -- Resizing… f0.png (1080p)",
         " -- Resize complete f0.png → f0 (1080p).png, 3840×2160 → 1920×1080", NULL, NULL },
-      "already smaller" },
+      " or smaller" },
     { "two files", "720p", { "4k", "4k", NULL },
       { " -- Resizing… 2 files to 720p", " -- Resize complete Resized 2 files to 720p", NULL, NULL },
-      "already smaller" },
+      " or smaller" },
     { "50%", "50pct", { "4k", NULL },
       { " -- Resizing… f0.png (50%)",
         " -- Resize complete f0.png → f0 (50%).png, 3840×2160 → 1920×1080", NULL, NULL },
-      "already smaller" },
+      " or smaller" },
     { "already smaller", "1080p", { "small", NULL },
-      { " -- Resizing… f0.png (1080p)", " -- Nothing to resize f0.png is already smaller than 1080p", NULL, NULL },
+      { " -- Resizing… f0.png (1080p)", " -- Nothing to resize f0.png is already 1080p or smaller", NULL, NULL },
       "Resize failed" },
     { "two already smaller", "1080p", { "small", "small", NULL },
-      { " -- Nothing to resize 2 files are already smaller than 1080p", NULL, NULL, NULL },
+      { " -- Nothing to resize 2 files are already 1080p or smaller", NULL, NULL, NULL },
       "Resize failed" },
     { "one good, one skipped", "1080p", { "4k", "small", NULL },
       { " -- Resize complete f0.png → f0 (1080p).png, 3840×2160 → 1920×1080",
-        "\nf1.png is already smaller than 1080p", NULL, NULL },
+        "\nf1.png is already 1080p or smaller", NULL, NULL },
       "Resize failed" },
     { "one good, one broken", "1080p", { "4k", "bad", NULL },
       { " -- Resize failed f0.png → f0 (1080p).png, 3840×2160 → 1920×1080", "\nFailed: f1.png — ", NULL, NULL },
-      "already smaller" },
+      " or smaller" },
     { "too small for a percentage", "25pct", { "tiny", NULL },
       { " -- Nothing to resize f0.png is too small to resize to 25%", NULL, NULL, NULL }, "Resize failed" },
   };
@@ -2475,7 +2475,7 @@ test_resize_notifications (const char *dir)
             g_usleep (20000);
             g_clear_pointer (&logged, g_free);
             if (g_file_get_contents (log, &logged, NULL, NULL))
-              pass = strstr (logged, "complete") != NULL || strstr (logged, "failed") != NULL;
+              pass = strstr (logged, "complete") != NULL || strstr (logged, "reduced") != NULL || strstr (logged, "failed") != NULL;
           }
         pass = pass && strstr (logged, s[k].want) != NULL;
         add_row ("(notifications)", s[k].label, pass, pass ? "the size is named when Small scaled" : (logged ? logged : "no calls"));
@@ -2603,9 +2603,9 @@ test_resize (void)
                                "testsrc2=d=1:s=1280x720:r=25", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
                                "yuv420p", "hd.mp4", NULL));
     fixture ("s0/tiny.png", run (sub, NULL, "magick", "-size", "30x30", "gradient:red-blue", "tiny.png", NULL));
-    check_resize_skipped (sub, "small.png", "1080p", "already smaller than 1080p");
-    check_resize_skipped (sub, "exact.png", "1080p", "already smaller than 1080p"); /* equal is not smaller */
-    check_resize_skipped (sub, "hd.mp4", "720p", "already smaller than 720p");     /* 720p -> 720p */
+    check_resize_skipped (sub, "small.png", "1080p", "already 1080p or smaller");
+    check_resize_skipped (sub, "exact.png", "1080p", "already 1080p or smaller"); /* equal is "or smaller" */
+    check_resize_skipped (sub, "hd.mp4", "720p", "already 720p or smaller");     /* 720p -> 720p */
     check_resize_skipped (sub, "tiny.png", "50pct", "too small to resize to 50%");
     g_free (sub);
   }
@@ -3199,7 +3199,12 @@ test_upscale (void)
   if (why != NULL)
     {
       g_print ("Upscale: real runs SKIPPED: %s\n", why);
-      add_row ("(upscale)", "real runs with upscayl-bin", TRUE, g_strdup_printf ("SKIPPED: %s", why));
+      {
+        char *detail = g_strdup_printf ("SKIPPED: %s", why);
+
+        add_row ("(upscale)", "real runs with upscayl-bin", TRUE, detail);
+        g_free (detail);
+      }
     }
   else
     {

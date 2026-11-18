@@ -51,8 +51,7 @@ gboolean    nfc_preset_from_key (const char *key, NfcPreset *out);
 gboolean    nfc_target_has_presets (NfcCategory cat, const char *key);
 /* Menu label of a preset, saying what Small does to the size: "Best", "High",
  * "Balanced", and "Small (max 2560 px)" for JPG/WEBP/AVIF, "Small (max 1080p)" for
- * MP4/WebM, "Small (480 px)" for GIF. key NULL: the Compress entry ("Small (max
- * 2560 px / 1080p)"). The item NAME stays nfc_preset_key (). Static string. */
+ * MP4/WebM, "Small (480 px)" for GIF. key NULL: the Compress entry ("Small (max * 2560 px / 1080p)"). The item NAME stays nfc_preset_key (). Static string. */
 const char *nfc_preset_menu_label (NfcCategory cat, const char *key, NfcPreset preset);
 /* Did this preset scale a w x h source of target (cat, key) down, and to what?
  * TRUE (and *ow, *oh) only for Small when the source is larger than its limit
@@ -136,7 +135,7 @@ const NfcResizePreset *nfc_resize_preset_from_key (NfcCategory cat, const char *
 
 /* The size a w x h source gets with preset p. TRUE only when that is strictly
  * smaller (long side for named image presets, short side for video, both sides
- * for percent) and usable; FALSE otherwise ("already smaller than 1080p").
+ * for percent) and usable; FALSE otherwise ("already 1080p or smaller").
  * ow/oh (may be NULL) are what ImageMagick / ffmpeg make of it: nearest integer,
  * video sides even. Unknown size (0): FALSE. */
 gboolean nfc_resize_output_size (const NfcResizePreset *p, guint64 w, guint64 h,

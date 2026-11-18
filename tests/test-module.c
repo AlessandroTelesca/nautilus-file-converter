@@ -145,7 +145,7 @@ top_items (GList *infos)
           n_convert++;
           g_assert_cmpuint (pos, ==, 0);
         }
-      else if (g_strcmp0 (label, "Compress") == 0)
+      else if (g_strcmp0 (label, "Reduce file size") == 0)
         {
           n_compress++;
           g_assert_cmpuint (n_resize, ==, 0);
@@ -492,13 +492,13 @@ test_preset_menus (void)
 /* The names, labels and tooltips of the Compress submenu of a selection: High,
  * Balanced, Small, as leaves, named FileConverter::Compress::<preset> */
 static void
-assert_compress_submenu (GList *infos)
+assert_compress_submenu (GList *infos, const char *small)
 {
   static const char *const keys[] = { "high", "balanced", "small" };
-  static const char *const labels[] = { "High", "Balanced", "Small (max 2560 px / 1080p)" };
+  const char *const labels[] = { "High", "Balanced", small };
   static const char *const tip_starts[] = { "High", "Balanced", "Small" };
   GList *items = top_items (infos);
-  NautilusMenuItem *top = find_top (items, "Compress");
+  NautilusMenuItem *top = find_top (items, "Reduce file size");
   NautilusMenu *sub = NULL;
   GList *sub_items;
   char *name = item_prop (top, "name"), *tip = item_prop (top, "tip");
@@ -544,7 +544,7 @@ compress_offered_wait (GList *infos, gboolean expect)
   for (int i = 0; i < 600; i++)
     {
       items = top_items (infos);
-      got = find_top (items, "Compress") != NULL;
+      got = find_top (items, "Reduce file size") != NULL;
       if (got || (!expect && find_top (items, "Convert to") != NULL))
         break;
       free_top (items);
@@ -592,7 +592,7 @@ test_compress_menus (void)
   /* a JPG: yes, with its three presets; "Convert to" is still first */
   l = sel1 ("c1.jpg", "image/jpeg", FALSE);
   g_assert_true (compress_offered_wait (l, TRUE));
-  assert_compress_submenu (l);
+  assert_compress_submenu (l, "Small (max 2560 px)");
   g_list_free_full (l, g_object_unref);
 
   /* .jpeg and two JPGs: yes */
@@ -600,7 +600,7 @@ test_compress_menus (void)
   g_assert_true (compress_offered_wait (l, TRUE));
   l = sel_add (l, "c1.jpg", "image/jpeg");
   g_assert_true (compress_offered_wait (l, TRUE));
-  assert_compress_submenu (l);
+  assert_compress_submenu (l, "Small (max 2560 px)");
   g_list_free_full (l, g_object_unref);
 
   /* a PNG has no presets: no Compress (but "Convert to" is there) */
@@ -624,20 +624,20 @@ test_compress_menus (void)
 
   /* a directory, alone or with a JPG: no menu at all */
   l = sel1 ("compress-dir", "inode/directory", TRUE);
-  g_assert_null (top_submenu (l, "Compress"));
+  g_assert_null (top_submenu (l, "Reduce file size"));
   g_assert_null (top_submenu (l, "Convert to"));
   g_list_free_full (l, g_object_unref);
   l = sel1 ("c1.jpg", "image/jpeg", FALSE);
   l = g_list_append (l, fake_new ("file:///tmp", "inode/directory", TRUE));
-  g_assert_null (top_submenu (l, "Compress"));
+  g_assert_null (top_submenu (l, "Reduce file size"));
   g_list_free_full (l, g_object_unref);
 
   /* audio, a document: no */
   l = sel1 ("c5.wav", "audio/x-wav", FALSE);
-  g_assert_null (top_submenu (l, "Compress"));
+  g_assert_null (top_submenu (l, "Reduce file size"));
   g_list_free_full (l, g_object_unref);
   l = sel1 ("c6.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", FALSE);
-  g_assert_null (top_submenu (l, "Compress"));
+  g_assert_null (top_submenu (l, "Reduce file size"));
   g_list_free_full (l, g_object_unref);
 
   /* mixed formats of one category are fine: each is compressed in its own format
@@ -653,7 +653,7 @@ test_compress_menus (void)
         l = sel1 ("c1.jpg", "image/jpeg", FALSE);
         l = sel_add (l, "c4.webp", "image/webp");
         g_assert_true (compress_offered_wait (l, TRUE));
-        assert_compress_submenu (l);
+        assert_compress_submenu (l, "Small (max 2560 px)");
         g_list_free_full (l, g_object_unref);
       }
     g_free (labels);
@@ -673,7 +673,7 @@ test_compress_menus (void)
           l = sel1 (*f, g_str_has_suffix (*f, "webm") ? "video/webm" : "video/mp4", FALSE);
           /* offered only if the needed encoder (libx264/libopenh264, libvpx-vp9) exists */
           if (compress_offered_wait (l, TRUE))
-            assert_compress_submenu (l);
+            assert_compress_submenu (l, "Small (max 1080p)");
           g_list_free_full (l, g_object_unref);
         }
       /* MP4 + MKV: no */
@@ -684,7 +684,13 @@ test_compress_menus (void)
       /* GIF (an image) and a JPG together */
       l = sel1 ("g1.gif", "image/gif", FALSE);
       if (compress_offered_wait (l, TRUE))
-        assert_compress_submenu (l);
+        assert_compress_submenu (l, "Small (480 px)");
+      g_list_free_full (l, g_object_unref);
+      /* a JPG + a GIF: different Small wordings, so a neutral "Small" */
+      l = sel1 ("c1.jpg", "image/jpeg", FALSE);
+      l = sel_add (l, "g1.gif", "image/gif");
+      if (compress_offered_wait (l, TRUE))
+        assert_compress_submenu (l, "Small");
       g_list_free_full (l, g_object_unref);
     }
   g_free (ffmpeg_path);
@@ -1055,7 +1061,7 @@ test_upscale_menus (void)
       g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x"); /* 8×: 32800 px */
       g_free (names);
       tl = top_labels (l);
-      g_assert_cmpstr (tl, ==, "Convert to,Compress,Resize,Upscale");
+      g_assert_cmpstr (tl, ==, "Convert to,Reduce file size,Resize,Upscale");
       g_free (tl);
       g_list_free_full (l, g_object_unref);
 
@@ -1377,7 +1383,7 @@ test_no_upscayl (void)
       g_assert_nonnull (names);
       g_free (names);
       tl = top_labels (l);
-      g_assert_cmpstr (tl, ==, "Convert to,Compress,Resize");
+      g_assert_cmpstr (tl, ==, "Convert to,Reduce file size,Resize");
       g_free (tl);
       g_assert_null (top_submenu (l, "Upscale"));
       g_list_free_full (l, g_object_unref);

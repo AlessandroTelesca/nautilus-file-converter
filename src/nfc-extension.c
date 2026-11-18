@@ -1,7 +1,7 @@
 /* nautilus-file-converter: Nautilus glue (menu provider + module entry points).
  *
  * Select files, right-click, "Convert to" > <format> [> <quality preset>], or
- * "Compress" > <quality preset> (a smaller copy in the same format), or
+ * "Reduce file size" > <quality preset> (a smaller copy in the same format), or
  * "Resize" > <size> (a smaller copy at a given pixel size), or "Upscale" > 2× .. 8×
  * (an AI-enlarged copy, made by Upscayl's backend). All
  * real work happens in nfc-core.c / nfc-convert.c.
@@ -104,7 +104,7 @@ convert_item_new (const NfcSelection *sel, const NfcTarget *t, NfcPreset preset,
   d->preset = preset;
   d->compress = t == NULL;
   d->key = g_strdup (t != NULL ? t->key : "");
-  d->label = g_strdup (t != NULL ? t->label : "Compress");
+  d->label = g_strdup (t != NULL ? t->label : "Reduce file size");
   d->ext = g_strdup (t != NULL ? t->ext : "");
   activate_data_copy_selection (d, sel);
   g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), d,
@@ -152,12 +152,34 @@ target_item_new (const NfcSelection *sel, const NfcTarget *t)
   return item;
 }
 
-/* The "Compress" entry: a submenu High / Balanced / Small (item names
- * "FileConverter::Compress::<preset>"). */
+/* The label of Compress's Small: the one its formats share (images: max 2560 px,
+ * MP4/WebM: max 1080p, GIF: 480 px), a neutral "Small" when they differ */
+static const char *
+compress_small_label (const NfcSelection *sel)
+{
+  const char *label = NULL;
+
+  for (guint i = 0; i < sel->fmts->len; i++)
+    {
+      NfcCompressTarget t;
+      const char *l;
+
+      if (!nfc_compress_target (sel->cat, sel->fmts->pdata[i], &t))
+        return "Small";
+      l = nfc_preset_menu_label (t.cat, t.key, NFC_PRESET_SMALL);
+      if (label != NULL && !g_str_equal (label, l))
+        return "Small";
+      label = l;
+    }
+  return label != NULL ? label : "Small";
+}
+
+/* The "Reduce file size" entry: a submenu High / Balanced / Small. The item names
+ * stay "FileConverter::Compress" and "FileConverter::Compress::<preset>". */
 static NautilusMenuItem *
 compress_item_new (const NfcSelection *sel)
 {
-  NautilusMenuItem *top = nautilus_menu_item_new ("FileConverter::Compress", "Compress",
+  NautilusMenuItem *top = nautilus_menu_item_new ("FileConverter::Compress", "Reduce file size",
                                                   "Make a smaller copy next to the original; "
                                                   "nothing is made if it would not be smaller",
                                                   NULL);
@@ -167,7 +189,8 @@ compress_item_new (const NfcSelection *sel)
     {
       char *name = g_strdup_printf ("FileConverter::Compress::%s", nfc_preset_key (p));
       NautilusMenuItem *pi = convert_item_new (sel, NULL, p, name,
-                                               nfc_preset_menu_label (sel->cat, NULL, p),
+                                               p == NFC_PRESET_SMALL ? compress_small_label (sel)
+                                                                  : nfc_preset_menu_label (sel->cat, NULL, p),
                                                nfc_compress_tooltip (p));
 
       nautilus_menu_append_item (sub, pi);

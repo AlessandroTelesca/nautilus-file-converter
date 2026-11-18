@@ -269,7 +269,7 @@ job_skip_resize (Job *j)
   job_cleanup_files (j);
   task_keep_dims (j);
   msg = j->resize->percent > 0 ? g_strdup_printf ("too small to resize to %s", j->resize->name)
-                               : g_strdup_printf ("already smaller than %s", j->resize->name);
+                               : g_strdup_printf ("already %s or smaller", j->resize->name);
   g_task_return_new_error (task, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER, "%s", msg);
   g_free (msg);
   j->task = NULL;
@@ -1580,7 +1580,8 @@ resize_message (Batch *b, GString *body, const char **icon)
 {
   const NfcResizePreset *p = b->resize;
   guint good = 0, skipped = 0, bad = 0;
-  const char *small_verb = p->percent > 0 ? "too small to resize to" : "already smaller than";
+  gboolean pct = p->percent > 0;
+  const char *small_verb = pct ? "too small to resize to" : "already";
 
   for (guint i = 0; i < b->n; i++)
     {
@@ -1630,7 +1631,7 @@ resize_message (Batch *b, GString *body, const char **icon)
 
             if (body->len)
               g_string_append_c (body, '\n');
-            g_string_append_printf (body, "%s is %s %s", base, small_verb, p->name);
+            g_string_append_printf (body, pct ? "%s is %s %s" : "%s is %s %s or smaller", base, small_verb, p->name);
             g_free (base);
           }
       }
@@ -1638,7 +1639,7 @@ resize_message (Batch *b, GString *body, const char **icon)
     {
       if (body->len)
         g_string_append_c (body, '\n');
-      g_string_append_printf (body, "%u files are %s %s", skipped, small_verb, p->name);
+      g_string_append_printf (body, pct ? "%u files are %s %s" : "%u files are %s %s or smaller", skipped, small_verb, p->name);
     }
   append_failures (b, body);
   if (bad > 0)
@@ -1860,15 +1861,15 @@ compress_message (Batch *b, GString *body, const char **icon)
   if (bad > 0)
     {
       *icon = "dialog-error-symbolic";
-      return "Compression failed";
+      return "Couldn't reduce file size";
     }
   if (good > 0)
     {
       *icon = "object-select-symbolic";
-      return "Compression complete";
+      return "File size reduced";
     }
   *icon = "dialog-information-symbolic";
-  return "Nothing to compress";
+  return "Nothing to reduce";
 }
 
 static void
@@ -2181,7 +2182,7 @@ batch_start (gboolean compress, const NfcResizePreset *resize, const NfcUpscaleP
                             : g_strdup_printf ("%s to %s", what, b->short_label);
 
     notifier_send (b->notifier, upscale != NULL ? "Upscaling…" : resize != NULL ? "Resizing…"
-                                : compress ? "Compressing…" : "Converting…",
+                                : compress ? "Reducing file size…" : "Converting…",
                    body, "view-refresh-symbolic", "normal");
     g_free (body);
   }

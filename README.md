@@ -4,9 +4,9 @@ A "Convert to" submenu for Nautilus (GNOME Files), similar to the Windows app
 *File Converter*. Select one or more files, right-click, choose a target
 format; the converted copies appear next to the originals. For JPG, WEBP, AVIF,
 MP4, WebM and GIF the target opens a small submenu of quality presets (Best, High,
-Balanced, Small; see "Quality presets" below). A second entry, "Compress"
+Balanced, Small; see "Quality presets" below). A second entry, "Reduce file size"
 (High, Balanced, Small), makes a smaller copy of a JPG, WEBP, AVIF, MP4, WebM or
-GIF in the same format (see "Compress" below), and "Resize" (1080p, 720p, 50 %, ...;
+GIF in the same format (see "Reduce file size" below), and "Resize" (1080p, 720p, 50 %, ...;
 only sizes smaller than the file) makes a copy at a smaller pixel size (see "Resize"
 below). With Upscayl installed a further entry, "Upscale" (2×, 3×, 4×, 5×, 6×, 8×), makes
 an AI-enlarged copy of an image on the GPU (see "Upscale" below).
@@ -177,8 +177,8 @@ and the notifications name it when it is not Best ("Converted 3 files to JPG
 * **Balanced**: a good default for sharing.
 * **Small**: the smallest acceptable result. Its menu label says what it does to
   the size: "Small (max 2560 px)" for JPG, WEBP and AVIF, "Small (max 1080p)" for
-  MP4 and WebM, "Small (480 px)" for GIF (and "Small (max 2560 px / 1080p)" in
-  Compress); the item name stays `...::small`. When it really scaled a picture
+  MP4 and WebM, "Small (480 px)" for GIF (the same in Reduce file size; a mixed selection such as JPG + GIF gets a plain
+  "Small"); the item name stays `...::small`. When it really scaled a picture
   down, the success banner gives the new size: "photo.png → photo.jpg (Small,
   2560×1707)". It also shrinks: images larger than
   2560 px on the long side are scaled to 2560 px (JPG, WEBP, AVIF), video whose
@@ -280,9 +280,10 @@ Where the numbers fall short of the intent, and why:
   screencast at 25 % of Best's bitrate is still 60 % of its size. libx264 is
   the main path and behaves as the table shows.
 
-### Compress
+### Reduce file size (Compress)
 
-Next to "Convert to" the menu has **Compress**, with the presets **High /
+Next to "Convert to" the menu has **Reduce file size** (not "Compress", which Nautilus
+uses for archives; the item names stay `FileConverter::Compress...`), with the presets **High /
 Balanced / Small** (item names `FileConverter::Compress::<high|balanced|small>`).
 It makes a smaller copy of a file in the *same* format, with the settings of
 that preset from the table above.
@@ -305,8 +306,8 @@ that preset from the table above.
   hidden temporary file), the file counts as skipped, not failed, and the
   notification says so. Re-encoding an already well-compressed file at a high
   quality often makes it bigger: "photo.jpg is already as small as it gets".
-* **Notifications**: "Compressing…", then "photo.jpg → photo (compressed).jpg
-  (Balanced), −62%", or "Compressed 3 files (Balanced), −54%" (the percentage is
+* **Notifications**: "Reducing file size…", then "photo.jpg → photo (compressed).jpg
+  (Balanced), −62%" (title "File size reduced"), or "Compressed 3 files (Balanced), −54%" (the percentage is
   the saving over all compressed files), plus a line "photo.jpg is already as
   small as it gets" / "2 files are already as small as they get" for skipped
   files, and "Failed: ..." lines as usual.
@@ -388,7 +389,7 @@ tests use that to run from the build directory).
 
 ### Resize
 
-After "Convert to" and "Compress" the menu has **Resize**: a copy at a smaller
+After "Convert to" and "Reduce file size" the menu has **Resize**: a copy at a smaller
 pixel size, in the *same* format, next to the original (item names
 `FileConverter::Resize::<key>`).
 
@@ -415,7 +416,7 @@ pixel size, in the *same* format, next to the original (item names
   in the menu) the fixed list is shown, and the job decides when it runs.
 * **When it runs**, the size is probed (`identify -ping`, `nfc-decode --info`,
   `ffprobe`) and a file the preset would not make smaller is skipped, not failed:
-  "photo.jpg is already smaller than 1080p", "icon.png is too small to resize to
+  "photo.jpg is already 1080p or smaller", "icon.png is too small to resize to
   50%". Nothing is written for it.
 * **Quality**: the Best settings of the format. PNG, BMP and TIFF stay lossless,
   JPG is q95 4:4:4 (photo) or q99 4:4:4 (the source class rules of the table above),
@@ -437,7 +438,7 @@ pixel size, in the *same* format, next to the original (item names
   (a flat PNG).
 * **Notifications**: "Resizing…", then "photo.jpg → photo (1080p).jpg, 3840×2160
   → 1920×1080", or "Resized 3 files to 1080p", plus "photo.jpg is already
-  smaller than 1080p" / "2 files are already smaller than 1080p" for the skipped
+  1080p or smaller" / "2 files are already 1080p or smaller" for the skipped
   ones and "Failed: ..." lines.
 
 For features that reuse this: `nfc_analyze_selection` fills `sel->dims` (an
@@ -657,7 +658,7 @@ and are only honoured when set.
   ("Converted 3 files to MP4") or, on failure, the file name and the last line
   of the tool's error output. A preset other than Best is named: "Converted 3
   files to JPG (Balanced)", "photo.png → photo.jpg (Small)". Compress has its
-  own texts (see "Compress"), and so has Resize (see "Resize"). When the Small
+  own texts (see "Reduce file size"), and so has Resize (see "Resize"). When the Small
   preset scaled a picture down the size is added: "photo.png → photo.jpg (Small,
   2560×1707)".
 * **Output cap**: a tool's stdout and stderr are read incrementally and only the
@@ -716,10 +717,10 @@ meson test -C build
   the middle of the list); and the preset menus: JPG/WEBP/AVIF/MP4/WebM/GIF are
   submenus with the items Best, High, Balanced, Small (names `...::<preset>`, a
   tooltip each), PNG, BMP, MP3, MKV and the rest are plain items, also for a
-  multi-file selection; and "Compress" (High, Balanced, Small): offered for a
+  multi-file selection; and "Reduce file size" (High, Balanced, Small): offered for a
   JPG, `.jpeg`, two JPGs, JPG + WEBP, MP4, M4V, WebM and GIF, not for PNG, BMP, HEIC,
   JPG + PNG, MP4 + MKV, MKV, audio, a document, a directory. And "Resize" after
-  "Compress": generated 3840x2160 PNG (1440p ... 25 %, no 4K), 1000x800 JPG (480p, 50
+  "Reduce file size": generated 3840x2160 PNG (1440p ... 25 %, no 4K), 1000x800 JPG (480p, 50
   %, 25 %), 20x20 and 30x30 PNGs (no Resize at all), a video (fixed 1080p/720p/480p),
   a selection (a preset that shrinks at least one file), an unreadable size (the
   fixed list), HEIC, SVG, a document, a directory.

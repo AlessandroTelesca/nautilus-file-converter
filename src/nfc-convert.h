@@ -58,7 +58,7 @@ typedef struct {
   gint64      reference_size;
   /* Resize: the preset to scale to (NULL: no resize). The job probes the
    * source's pixel size first and, when the preset would not make it smaller,
-   * ends with NFC_CONVERT_ERROR_NOT_SMALLER ("already smaller than 1080p")
+   * ends with NFC_CONVERT_ERROR_NOT_SMALLER ("already 1080p or smaller")
    * without running the converter. cat/fmt/key/ext are those of
    * nfc_resize_target; preset is ignored (Best). Add new fields below this one:
    * callers initialise the leading ones positionally. */
@@ -125,7 +125,7 @@ void nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset,
  * BALANCED or SMALL; see nfc_compress_target), named "<name> (compressed).<ext>",
  * kept only if smaller than the original (NFC_REFERENCE_SOURCE). The results
  * carry `skipped` for files that were already as small as they get. Shows
- * "Compressing...", then "Compressed 3 files (Balanced), -62%" /
+ * "Reducing file size...", then "Compressed 3 files (Balanced), -62%" /
  * "a.jpg → a (compressed).jpg (Balanced), -62%", plus a line for each file that
  * was not smaller ("a.jpg is already as small as it gets"). */
 void nfc_batch_run_compress (NfcCategory cat, NfcPreset preset,
@@ -138,7 +138,7 @@ void nfc_batch_run_compress (NfcCategory cat, NfcPreset preset,
  * only if the preset makes it smaller; files it would not are `skipped`. Shows
  * "Resizing...", then "photo.jpg → photo (1080p).jpg, 3840×2160 → 1920×1080" /
  * "Resized 3 files to 1080p", plus a line for each file that was already smaller
- * ("photo.jpg is already smaller than 1080p"). An unknown preset key finishes the
+ * ("photo.jpg is already 1080p or smaller"). An unknown preset key finishes the
  * batch at once with every file failed. */
 void nfc_batch_run_resize (NfcCategory cat, const char *preset_key,
                            const char *const *paths, const char *const *fmts, guint n,
