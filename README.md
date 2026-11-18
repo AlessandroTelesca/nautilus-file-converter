@@ -17,9 +17,9 @@ MIME type as a fallback.
 
 | Category | Input | Targets | Backend |
 |---|---|---|---|
-| Image | png, jpg/jpeg, webp, avif, heic/heif, bmp, tiff, gif, ico, svg | PNG, JPG, WEBP, AVIF, ICO (256/48/32/16 px), BMP, TIFF, PDF (see "Image quality" below) | ImageMagick (+ the `nfc-decode` helper, GdkPixbuf, for HEIC/AVIF input; ffmpeg/libaom for AVIF output) |
+| Image | png, jpg/jpeg, webp, avif, heic/heif, bmp, tiff, gif, ico, svg | PNG, JPG, WEBP, AVIF, ICO (256/48/32/16 px, never enlarged), BMP, TIFF, PDF (see "Image quality" below) | ImageMagick (+ the `nfc-decode` helper, GdkPixbuf, for HEIC/AVIF input; ffmpeg/libaom for AVIF output) |
 | Audio | mp3, wav, flac, ogg, opus, m4a, aac, wma | MP3 (LAME V2), FLAC, WAV, OGG (Vorbis), OPUS (128k), M4A (AAC 192k) | ffmpeg |
-| Video | mp4, mkv, webm, mov, avi, wmv, flv, m4v | MP4 (H.264 CRF 18, preset slow, + AAC 192k), MKV (stream copy, falls back to re-encode), WebM (VP9 CRF 28 + Opus 128k), GIF (15 fps, up to 960 px wide), MP3 / M4A (audio only; a video without an audio track fails with "it has no audio track") | | ffmpeg |
+| Video | mp4, mkv, webm, mov, avi, wmv, flv, m4v | MP4 (H.264 CRF 18, preset slow, + AAC 192k; libopenh264 at about 3 bits per pixel per second where libx264 is missing), MKV (stream copy, falls back to re-encode), WebM (VP9 CRF 28 + Opus 128k), GIF (15 fps, up to 960 px wide), MP3 / M4A (audio only; a video without an audio track fails with "it has no audio track") | | ffmpeg |
 | Document | doc, docx, odt, rtf, txt | PDF, DOCX, ODT | LibreOffice |
 | Spreadsheet | xls, xlsx, ods, csv | PDF, XLSX, ODS, CSV (first sheet) | LibreOffice |
 | Presentation | ppt, pptx, odp | PDF, PPTX, ODP | LibreOffice |
@@ -27,6 +27,27 @@ MIME type as a fallback.
 Notes:
 
 * HEIC output is not offered (no encoder in the standard ImageMagick build).
+* HEIC input is offered only when it can really be decoded: glycin and libheif
+  list `heic` even without an HEVC decoder (stock Fedora without
+  `libheif-freeworld`), so `nfc-decode --formats` decodes a built-in 16x16
+  HEVC sample (a synthetic gradient) and leaves `heic` out of the list if that
+  fails. If such a file is converted anyway, the toast says "can't decode HEIC:
+  the HEVC decoder is missing (install libheif-freeworld from RPM Fusion)".
+* The toast of a failed conversion shows the line of the tool's stderr that
+  names the cause (not simply the last one), without program names and
+  ImageMagick's `@ error/file.c/Function/NNN` suffix, and in plain words for
+  known causes (missing HEVC decoder, a broken ffmpeg decoder, "image too large
+  for available memory", "disk full"). The full stderr is in the log.
+* Notifications all have urgency normal (a critical one stays until dismissed
+  and the later "Converting…" / "Conversion complete" banners would queue
+  behind it); the success icon is `object-select-symbolic` (`emblem-ok-symbolic`
+  is gone from Adwaita 50).
+* MP4 (and the MKV re-encode) need an H.264 encoder: libx264, or libopenh264,
+  which stock Fedora's `ffmpeg-free` has (with the `openh264` package). With
+  both, libx264 is tried first and libopenh264 is the next attempt.
+  libopenh264 only has a bitrate mode: 3 bits per pixel per second, from the
+  picture size (`ffprobe`), 0.5 to 40 Mbit/s (6.2 at 1080p; 1080p is assumed if
+  `ffprobe` is missing).
 * Transparency is flattened onto white for JPG, PDF and AVIF.
 * GIF/TIFF/ICO/PDF sources: only the first frame/page is converted to images.
 * HEIC/AVIF input is decoded by `nfc-decode`, a small helper executable that
@@ -86,10 +107,10 @@ more than a photo does.
 | Target | Graphics source (png, bmp, tiff, gif, ico, svg) | Photo source |
 |---|---|---|
 | JPG | quality 99, 4:4:4 | quality 95, 4:4:4 |
-| WEBP | lossless (smaller than the source PNG for every screenshot tried) | lossy quality 94, method 6, sharp YUV |
+| WEBP | lossless (smaller than the source PNG for every screenshot tried) | lossy quality 90, method 6, sharp YUV |
 | AVIF | libaom 4:4:4, CRF 9, 8-bit | libaom 4:2:0, CRF 12, 8-bit |
 | PDF, PNG, BMP, TIFF | lossless | lossless |
-| ICO | 256, 48, 32 and 16 px entries, aspect ratio kept (padded transparently to a square) | same |
+| ICO | 256, 48, 32 and 16 px entries that do not enlarge the source (a 16 px icon gives one 16 px entry, 87x98 gives 98, 48, 32, 16), aspect ratio kept (padded transparently to a square) | same |
 
 * JPG is always 4:4:4, stated explicitly (ImageMagick only uses it on its own
   from quality 90 up). 4:2:0 smears the colour edges of screenshots.
@@ -119,7 +140,7 @@ more than a photo does.
   orientation applied; the colour profile is applied by the loader (the pixels
   differ from a raw decode by the P3 to sRGB conversion). Bit depth above 8 is
   lost. This is the only loss before the target encoder.
-* Video: H.264 CRF 18 with `-preset slow`, 4:2:0, `+faststart`, audio AAC
+* Video: H.264 CRF 18 with `-preset slow` (libx264; libopenh264 at a bitrate if that is all there is), 4:2:0, `+faststart`, audio AAC
   192k; VP9 CRF 28 with `-deadline good -cpu-used 2 -row-mt 1`, Opus 128k;
   GIF at 15 fps up to 960 px wide with a per-frame difference palette and
   ordered (Bayer 5) dithering. Error diffusion (Sierra) was measured at 5 times

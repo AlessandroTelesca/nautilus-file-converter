@@ -17,7 +17,7 @@
 #include "config.h"
 #include "nfc-util.h"
 
-NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL };
+NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL, NULL };
 
 /* -------------------------------------------------------------------------
  * Tool discovery
@@ -58,11 +58,13 @@ nfc_tools_init (void)
       g_free (nfc_tools.soffice);
       g_free (nfc_tools.notify);
       g_free (nfc_tools.decode);
+      g_free (nfc_tools.ffprobe);
       nfc_tools.magick = find_first ("magick", "convert");
       nfc_tools.ffmpeg = find_first ("ffmpeg", NULL);
       nfc_tools.soffice = find_first ("soffice", "libreoffice");
       nfc_tools.notify = find_first ("notify-send", NULL);
       nfc_tools.decode = find_decode_helper ();
+      nfc_tools.ffprobe = find_first ("ffprobe", NULL);
       g_once_init_leave (&once, 1);
     }
 }
@@ -178,22 +180,13 @@ is_word_char (char c, const char *extra)
   return g_ascii_isalnum (c) || (c != 0 && strchr (extra, c) != NULL);
 }
 
-static void
-probe_ffmpeg (void)
+/* Fill a fresh ff_enc from the text of `ffmpeg -encoders`. */
+static GHashTable *
+parse_encoders (const char *out)
 {
-  char *out;
-  char **lines;
+  GHashTable *enc = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+  char **lines = g_strsplit (out, "\n", -1);
 
-  ff_enc = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
-  if (nfc_tools.ffmpeg == NULL)
-    return;
-  {
-    const char *argv[] = { nfc_tools.ffmpeg, "-hide_banner", "-encoders", NULL };
-    out = run_quiet (argv, "ffmpeg");
-  }
-  if (out == NULL)
-    return;
-  lines = g_strsplit (out, "\n", -1);
   for (char **l = lines; *l; l++)
     {
       /* " V....D libx264   description": flags are 6 chars [VAS][\w.]{5} */
@@ -216,11 +209,43 @@ probe_ffmpeg (void)
         while (*e && *e != ' ')
           e++;
         if (e > sp)
-          g_hash_table_add (ff_enc, g_strndup (sp, e - sp));
+          g_hash_table_add (enc, g_strndup (sp, e - sp));
       }
     }
   g_strfreev (lines);
+  return enc;
+}
+
+static void
+probe_ffmpeg (void)
+{
+  char *out = NULL;
+
+  if (nfc_tools.ffmpeg == NULL)
+    {
+      ff_enc = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+      return;
+    }
+  {
+    const char *argv[] = { nfc_tools.ffmpeg, "-hide_banner", "-encoders", NULL };
+    out = run_quiet (argv, "ffmpeg");
+  }
+  ff_enc = parse_encoders (out != NULL ? out : "");
   g_free (out);
+}
+
+/* Tests only: take `text` as the output of `ffmpeg -encoders` (instead of
+ * running ffmpeg) and mark the ffmpeg probe done. Call it before anything
+ * starts the probes, or while no probe thread is running. */
+void
+nfc_test_set_encoders (const char *text)
+{
+  GHashTable *old = ff_enc;
+
+  ff_enc = parse_encoders (text);
+  g_atomic_int_set (&probe_state[NFC_PROBE_FFMPEG], 1);
+  if (old != NULL)
+    g_hash_table_unref (old);
 }
 
 static void
@@ -663,6 +688,16 @@ avail_and (Avail a, Avail b)
 }
 
 static Avail
+avail_or (Avail a, Avail b)
+{
+  if (a == AV_YES || b == AV_YES)
+    return AV_YES;
+  if (a == AV_PENDING || b == AV_PENDING)
+    return AV_PENDING;
+  return AV_NO;
+}
+
+static Avail
 ff_has (const char *encoder)
 {
   if (nfc_tools.ffmpeg == NULL)
@@ -719,10 +754,14 @@ target_avail (NfcCategory cat, const char *key)
       static const char *need[][2] = {
         { "mp3", "libmp3lame" }, { "flac", "flac" }, { "wav", "pcm_s16le" },
         { "ogg", "libvorbis" }, { "opus", "libopus" }, { "m4a", "aac" },
-        { "mp4", "libx264" }, { "mkv", "libx264" }, { "webm", "libvpx-vp9" },
-        { "gif", "gif" },
+        { "webm", "libvpx-vp9" }, { "gif", "gif" },
       };
       const char *enc = NULL;
+
+      /* MP4 and the MKV re-encode need an H.264 encoder: libx264, or libopenh264
+       * (what stock Fedora's ffmpeg-free has) as the fallback */
+      if (cat == NFC_CAT_VIDEO && (g_str_equal (key, "mp4") || g_str_equal (key, "mkv")))
+        return avail_or (ff_has ("libx264"), ff_has ("libopenh264"));
 
       for (guint i = 0; i < G_N_ELEMENTS (need); i++)
         if (g_str_equal (need[i][0], key))
@@ -953,6 +992,69 @@ ff_base (const char *src)
   return a;
 }
 
+/* libopenh264 has no constant-quality mode, only a target bitrate. Pick one
+ * from the picture size: 0.1 bit per pixel per frame at an assumed 30 fps
+ * (3 bits per pixel per second: 6.2 Mbit/s at 1080p, 2.8 at 720p, 24.9 at 4K),
+ * which measured SSIM ~0.98 on screen recordings, within 40 Mbit/s and not
+ * below 0.5. The frame rate is not probed: a 60 fps source gets half the bits
+ * per frame. Unknown size: 1080p. */
+#define H264_BITS_PER_PIXEL_SECOND 3
+#define H264_MIN_BPS               ((guint64) 500 * 1000)
+#define H264_MAX_BPS               ((guint64) 40 * 1000 * 1000)
+
+guint64
+nfc_h264_bitrate (const NfcImageInfo *info)
+{
+  guint64 w = 1920, h = 1080, bps;
+
+  if (info != NULL && info->width > 0 && info->height > 0)
+    {
+      w = MIN (info->width, (guint64) 65536);
+      h = MIN (info->height, (guint64) 65536);
+    }
+  bps = w * h * H264_BITS_PER_PIXEL_SECOND;
+  return CLAMP (bps, H264_MIN_BPS, H264_MAX_BPS);
+}
+
+/* The MP4 / MKV re-encode attempts for the H.264 encoders ffmpeg has: libx264
+ * (crf 18, slow) first, then libopenh264 (bitrate, see above) as the next
+ * attempt. With neither known (the probe has not run) the libx264 attempt alone,
+ * as before. */
+static void
+add_h264_attempts (GPtrArray *attempts, const char *src, const char *out, gboolean mp4,
+                   const NfcImageInfo *info)
+{
+  gboolean x264 = nfc_have_encoder ("libx264");
+  gboolean oh264 = nfc_have_encoder ("libopenh264");
+  GPtrArray *a;
+
+  if (x264 || !oh264)
+    {
+      a = ff_base (src);
+      av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+              "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
+      if (mp4)
+        av_add (a, "-movflags", "+faststart", NULL);
+      av_add (a, out, NULL);
+      add_attempt (attempts, av_done (a), NULL);
+    }
+  if (oh264)
+    {
+      char *bps = g_strdup_printf ("%" G_GUINT64_FORMAT, nfc_h264_bitrate (info));
+
+      a = ff_base (src);
+      av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+              "-vf", EVEN, "-c:v", "libopenh264", "-rc_mode", "bitrate", "-b:v", bps,
+              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
+      if (mp4)
+        av_add (a, "-movflags", "+faststart", NULL);
+      av_add (a, out, NULL);
+      add_attempt (attempts, av_done (a), NULL);
+      g_free (bps);
+    }
+}
+
 static void
 im_flatten (GPtrArray *a)
 {
@@ -1055,6 +1157,37 @@ im_limits (GPtrArray *a)
   g_free (map);
 }
 
+
+/* The icon:auto-resize list for a source whose larger side is known: the
+ * usual 256/48/32/16 sizes, but only those that do not enlarge the (padded
+ * square) source, plus the source's own size when it is none of them (a 98 px
+ * source gives 98,48,32,16); a source below 16 px gives its own single size.
+ * Without a known size, or for SVG (vector: scales losslessly), the full list.
+ * g_free. */
+static char *
+ico_sizes (const char *fmt, const NfcImageInfo *info)
+{
+  static const guint std[] = { 256, 48, 32, 16 };
+  GString *s;
+  guint side;
+
+  if (info == NULL || info->width == 0 || info->height == 0 || g_str_equal (fmt, "svg"))
+    return g_strdup ("256,48,32,16");
+  /* the -resize 256x256> shrinks anything bigger */
+  side = (guint) MIN (MAX (info->width, info->height), 256);
+  s = g_string_new (NULL);
+  for (guint i = 0; i < G_N_ELEMENTS (std); i++)
+    {
+      if (std[i] > side)
+        continue;
+      if (s->len == 0 && std[i] < side)
+        g_string_append_printf (s, "%u", side);
+      g_string_append_printf (s, "%s%u", s->len ? "," : "", std[i]);
+    }
+  if (s->len == 0)
+    g_string_append_printf (s, "%u", side);
+  return g_string_free (s, FALSE);
+}
 
 /* Photographic (lossy, camera or phone) source versus graphics (screenshots,
  * drawings, icons, scans: lossless formats). The two want different
@@ -1471,11 +1604,14 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
           /* WEBP stores at most 16383 pixels per side: shrink only beyond that.
            * Graphics (lossless sources): lossless WEBP, which was smaller than
            * the source PNG for every screenshot tried and has no chroma
-           * subsampling or ringing. Photos: lossy q94, method 6, sharp YUV
-           * (the chroma conversion that keeps colour edges). */
+           * subsampling or ringing. Photos: lossy q90, method 6, sharp YUV
+           * (the chroma conversion that keeps colour edges). 94 made a phone JPEG
+           * larger than its source (a lossy source re-encoded at a higher quality
+           * keeps its artefacts at a higher bitrate): at q90 the output is not
+           * larger, SSIM >= 0.98 against the source on most photos. */
           av_add (a, "-auto-orient", "-resize", "16383x16383>", NULL);
           if (photo_source (fmt))
-            av_add (a, "-quality", "94", "-define", "webp:method=6",
+            av_add (a, "-quality", "90", "-define", "webp:method=6",
                     "-define", "webp:sharp-yuv=true", NULL);
           else
             av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
@@ -1484,11 +1620,17 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
         {
           /* up to 256 px, never enlarged, aspect ratio kept (padded
            * transparently to a square: icon:auto-resize would stretch a
-           * non-square image), then the usual 256/48/32/16 sizes */
+           * non-square image), then the usual 256/48/32/16 sizes that do not
+           * enlarge it (see ico_sizes) */
+          char *sizes = ico_sizes (fmt, info);
+          char *def = g_strconcat ("icon:auto-resize=", sizes, NULL);
+
           av_add (a, "-auto-orient", "-resize", "256x256>", "-background", "none",
                   "-gravity", "center", "-set", "option:nfc:side", "%[fx:max(w,h)]",
                   "-extent", "%[option:nfc:side]x%[option:nfc:side]",
-                  "-define", "icon:auto-resize=256,48,32,16", NULL);
+                  "-define", def, NULL);
+          g_free (def);
+          g_free (sizes);
         }
       else if (g_str_equal (key, "pdf"))
         {
@@ -1555,25 +1697,14 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
         }
 
       if (g_str_equal (key, "mp4"))
-        {
-          a = ff_base (src);
-          av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-                  "-movflags", "+faststart", out, NULL);
-          add_attempt (attempts, av_done (a), NULL);
-        }
+        add_h264_attempts (attempts, src, out, TRUE, info);
       else if (g_str_equal (key, "mkv"))
         {
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
                   "-c", "copy", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
-          a = ff_base (src);
-          av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", out, NULL);
-          add_attempt (attempts, av_done (a), NULL);
+          add_h264_attempts (attempts, src, out, FALSE, info);
         }
       else if (g_str_equal (key, "webm"))
         {
@@ -1807,4 +1938,199 @@ nfc_hidden_temp_name (const char *directory, const char *stem, const char *ext)
   g_free (short_stem);
   g_free (name);
   return path;
+}
+
+/* -------------------------------------------------------------------------
+ * Failure messages
+ * ---------------------------------------------------------------------- */
+
+#define MSG_MAX_BYTES 300 /* longest failure text shown in the toast */
+
+static gboolean
+line_has_any (const char *lower, const char *const *needles)
+{
+  for (; *needles != NULL; needles++)
+    if (strstr (lower, *needles) != NULL)
+      return TRUE;
+  return FALSE;
+}
+
+/* Lines that name the real cause, whatever comes after them on stderr. */
+static const char *const known_cause[] = {
+  "error while opening decoder", "decoderpluginerror", "loadingerror", "unknown decoder",
+  "no such file", "permission denied", "invalid data found", "not a jpeg",
+  "improper image header", "cache resources exhausted", "no space left", "memory allocation",
+  "cannot allocate memory", "out of memory", "unable to open", "corrupt", "truncated", NULL
+};
+static const char *const generic_cause[] = { "error", "failed", "unable", NULL };
+
+/* Remove what only clutters a toast: leading "[dec:x @ 0x..] " groups, a
+ * "program: " prefix (magick: , /usr/bin/convert: ) and ImageMagick's
+ * " @ error/file.c/Function/123." tail. In place. */
+static void
+clean_line (char *s)
+{
+  char *p, *at;
+
+  for (;;)
+    {
+      p = s;
+      if (*p != '[' || (at = strchr (p, ']')) == NULL)
+        break;
+      p = at + 1;
+      while (*p == ' ')
+        p++;
+      if (*p == '\0')
+        break;
+      memmove (s, p, strlen (p) + 1);
+    }
+  /* "magick: ", "/usr/bin/convert-im6.q16: ", "ffmpeg: ": our own tools' names */
+  p = strstr (s, ": ");
+  if (p != NULL && p > s && p[2] != '\0')
+    {
+      char *prog = g_strndup (s, p - s);
+      char *base = g_path_get_basename (prog);
+
+      if (strchr (prog, ' ') == NULL &&
+          (g_str_has_prefix (base, "magick") || g_str_has_prefix (base, "convert") ||
+           g_str_has_prefix (base, "identify") || g_str_has_prefix (base, "ffmpeg") ||
+           g_str_has_prefix (base, "soffice") || g_str_has_prefix (base, "nfc-decode")))
+        memmove (s, p + 2, strlen (p + 2) + 1);
+      g_free (base);
+      g_free (prog);
+    }
+  if ((at = strstr (s, " @ error/")) != NULL)
+    {
+      *at = '\0';
+      g_strchomp (s);
+      if (*s != '\0' && s[strlen (s) - 1] == '.')
+        s[strlen (s) - 1] = '\0';
+    }
+}
+
+/* The codec named in "[dec:libopenh264 @ 0x55d3] Error while opening decoder",
+ * or NULL. g_free. */
+static char *
+decoder_name (const char *text)
+{
+  const char *p = strstr (text, "[dec:");
+  const char *e;
+
+  if (p == NULL)
+    return NULL;
+  p += 5;
+  e = p;
+  while (*e != '\0' && *e != ' ' && *e != ']' && *e != '\n')
+    e++;
+  return e > p ? g_strndup (p, e - p) : NULL;
+}
+
+static char *
+truncated_copy (const char *s)
+{
+  if (strlen (s) > MSG_MAX_BYTES)
+    {
+      const char *cut = s + MSG_MAX_BYTES;
+      char *head;
+      char *res;
+
+      /* keep the start, on a UTF-8 character boundary */
+      while (cut > s && (*cut & 0xC0) == 0x80)
+        cut--;
+      head = g_strndup (s, cut - s);
+      res = g_strconcat (head, "…", NULL);
+      g_free (head);
+      return res;
+    }
+  return g_strdup (s);
+}
+
+char *
+nfc_failure_message (const char *text, const char *src_fmt)
+{
+  char **lines;
+  char *best = NULL, *lb, *res = NULL;
+  int best_rank = 0, n;
+  char *lower_best = NULL;
+
+  if (text == NULL)
+    return NULL;
+  lines = g_strsplit (text, "\n", -1);
+  n = (int) g_strv_length (lines);
+  /* rank 3: a known cause, 2: error/failed/unable, 1: any non-empty line; the
+   * last line of the best rank wins */
+  for (int i = n - 1; i >= 0; i--)
+    {
+      char *s = g_strstrip (lines[i]);
+      char *lower;
+      int rank;
+
+      if (*s == '\0')
+        continue;
+      lower = g_ascii_strdown (s, -1);
+      rank = line_has_any (lower, known_cause) ? 3 : line_has_any (lower, generic_cause) ? 2 : 1;
+      if (rank > best_rank)
+        {
+          best_rank = rank;
+          best = s;
+          g_free (lower_best);
+          lower_best = lower;
+        }
+      else
+        g_free (lower);
+      if (best_rank == 3)
+        break;
+    }
+  if (best == NULL)
+    {
+      g_strfreev (lines);
+      return NULL;
+    }
+  lb = g_ascii_strdown (best, -1);
+
+  /* causes we can say in words */
+  if ((strstr (lb, "decoderpluginerror") != NULL ||
+       strstr (lb, "loadingerror") != NULL) &&
+      src_fmt != NULL && (g_str_equal (src_fmt, "heic") || g_str_equal (src_fmt, "heif")))
+    res = g_strdup ("can't decode HEIC: the HEVC decoder is missing "
+                    "(install libheif-freeworld from RPM Fusion)");
+  else if (strstr (lb, "error while opening decoder") != NULL)
+    {
+      char *codec = decoder_name (best);
+
+      res = codec != NULL ? g_strdup_printf ("the video decoder failed (%s decoder unavailable)", codec)
+                          : g_strdup ("the video decoder failed (decoder unavailable)");
+      g_free (codec);
+    }
+  else if (strstr (lb, "cache resources exhausted") != NULL)
+    res = g_strdup ("image too large for available memory");
+  else if (strstr (lb, "no space left on device") != NULL)
+    res = g_strdup ("disk full");
+  else
+    {
+      clean_line (best);
+      res = truncated_copy (*best != '\0' ? best : lines[0]);
+    }
+  g_free (lb);
+  g_free (lower_best);
+  g_strfreev (lines);
+  return res;
+}
+
+char **
+nfc_build_video_probe_argv (const char *src_in)
+{
+  GPtrArray *a;
+  char *src;
+
+  nfc_tools_init ();
+  if (src_in == NULL || nfc_tools.ffprobe == NULL)
+    return NULL;
+  src = g_canonicalize_filename (src_in, NULL); /* absolute: never an option */
+  a = av_new ();
+  av_add (a, nfc_tools.ffprobe, "-v", "error", "-select_streams", "v:0",
+          "-show_entries", "stream=width,height", "-of", "default=noprint_wrappers=1:nokey=1",
+          "-i", src, NULL);
+  g_free (src);
+  return av_done (a);
 }

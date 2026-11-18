@@ -173,6 +173,39 @@ test_accepted (void)
   }
 }
 
+/* "heic" is listed by `nfc-decode --formats` exactly when a HEIC really decodes
+ * (an HEVC decoder is installed): the synthetic 16 x 16 sample in tests/data
+ * is the same picture the helper embeds, so the two answers must agree. glycin
+ * advertises heic even without HEVC, which is what this probe exists for. */
+static void
+test_heic_probe (void)
+{
+  const char *helper = g_getenv ("NFC_DECODE_HELPER");
+  const char *data = g_getenv ("NFC_TEST_DATA");
+  char *argv[] = { (char *) helper, (char *) "--formats", NULL };
+  char *sample, *out, *err = NULL, *so = NULL;
+  gint status = -1;
+  gint64 us;
+  gboolean decodes, listed;
+  char **lines;
+
+  g_assert_nonnull (helper);
+  g_assert_nonnull (data);
+  sample = g_build_filename (data, "data", "tiny-hevc.heic", NULL);
+  out = g_build_filename (dir, "tiny-out.png", NULL);
+  decodes = run_decode (sample, out, &err, &us) == 0;
+  g_free (err); err = NULL;
+  g_assert_true (g_spawn_sync (NULL, argv, NULL, G_SPAWN_DEFAULT, NULL, NULL, &so, NULL, &status, NULL));
+  g_assert_true (g_spawn_check_wait_status (status, NULL));
+  lines = g_strsplit (so, "\n", -1);
+  listed = g_strv_contains ((const char *const *) lines, "heic");
+  g_assert_true (g_strv_contains ((const char *const *) lines, "png"));
+  g_print ("HEIC probe: sample decodes=%d, --formats lists heic=%d\n", decodes, listed);
+  g_assert_cmpint (listed, ==, decodes);
+  g_strfreev (lines);
+  g_free (so); g_free (sample); g_free (out);
+}
+
 int
 main (int argc, char **argv)
 {
@@ -185,6 +218,7 @@ main (int argc, char **argv)
   g_assert_nonnull (dir);
   g_test_add_func ("/decode/refuses-huge", test_refused);
   g_test_add_func ("/decode/accepts-limit-and-real-files", test_accepted);
+  g_test_add_func ("/decode/heic-probe", test_heic_probe);
   rc = g_test_run ();
   {
     char *rm[] = { "rm", "-rf", dir, NULL };

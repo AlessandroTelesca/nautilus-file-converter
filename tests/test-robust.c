@@ -346,8 +346,9 @@ test_probe_freeze (void)
     g_ptr_array_unref (t);
     if (saved != NULL)
       {
-        g_assert_true (nfc_pixbuf_can_read ("heic"));
-        g_assert_cmpuint (with_helper, >, 0);
+        /* heic is listed only when it really decodes (no HEVC decoder on e.g. stock
+         * Fedora): the targets offered must agree with the probe either way */
+        g_assert_cmpint (with_helper > 0, ==, nfc_pixbuf_can_read ("heic"));
       }
     nfc_tools.decode = NULL;
     t = nfc_targets_for (NFC_CAT_IMAGE, "heic");

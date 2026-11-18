@@ -38,6 +38,7 @@ typedef struct {
   char *soffice;
   char *notify;
   char *decode; /* nfc-decode helper (HEIC/AVIF decode, GdkPixbuf format list) */
+  char *ffprobe; /* video size probe for the H.264 bitrate; optional */
 } NfcTools;
 
 /* Global tool paths; resolved by nfc_tools_init(). Tests may overwrite. */
@@ -74,6 +75,10 @@ gboolean nfc_probe_done (NfcProbe probe);
 void     nfc_probe_ensure (void);
 
 gboolean nfc_have_encoder (const char *name);
+
+/* Tests only: use `text` as the output of `ffmpeg -encoders` and mark the
+ * ffmpeg probe done, without running ffmpeg. */
+void     nfc_test_set_encoders (const char *text);
 gboolean nfc_magick_can_write (const char *im_format);
 gboolean nfc_magick_can_read (const char *im_format);
 gboolean nfc_pixbuf_can_read (const char *name);
@@ -155,6 +160,15 @@ gboolean nfc_image_info_parse (const char *text, NfcImageInfo *out);
  * is available for it. */
 char   **nfc_build_probe_argv (const char *fmt, const char *src);
 
+/* argv (g_strfreev) that prints "<width>\n<height>\n" of src's first video
+ * stream (nfc_image_info_parse reads it), for the libopenh264 bitrate; NULL if
+ * ffprobe is missing. */
+char   **nfc_build_video_probe_argv (const char *src);
+
+/* Target bitrate (bits/s) for the libopenh264 fallback encoder of a video of
+ * this size (info may be NULL: 1080p assumed). */
+guint64  nfc_h264_bitrate (const NfcImageInfo *info);
+
 /* Same as nfc_build_attempts, but info (may be NULL) is what the probe found:
  * a PDF made from an image without a resolution gets one that makes the page
  * fit an A4 sheet (see README). */
@@ -193,6 +207,19 @@ gboolean nfc_admission_allows (guint64 pixels, guint64 est, guint64 reserved,
  * It is on the disk, unlike /tmp, which is usually RAM (tmpfs). Falls back to
  * the system temp directory (never NULL). g_free. */
 char    *nfc_spill_dir (void);
+
+
+/* ---- failure messages ---- */
+
+/* The one line of a failed tool's stderr (or stdout) that tells the user what
+ * went wrong, in words where the cause is known: picks the line that names the
+ * cause (not the last one: the glycin loader ends with "Setting process memory
+ * limit"), strips noise (program names, "[dec:x @ 0x..]", ImageMagick's
+ * "@ error/file.c/Fn/123."), and maps known causes to plain text (missing HEVC
+ * decoder for src_fmt "heic", broken ffmpeg decoder, out of memory, disk full).
+ * src_fmt (may be NULL) is the canonical source format key. Never longer than
+ * ~300 bytes. NULL if text has no non-blank line. g_free. */
+char *nfc_failure_message (const char *text, const char *src_fmt);
 
 /* ---- output naming ---- */
 

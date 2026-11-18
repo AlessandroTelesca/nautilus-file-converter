@@ -368,6 +368,11 @@ test_notifications (void)
 
       pass = g_str_has_prefix (lines[0], "-a File Converter") &&
              strstr (lines[0], "Converting") != NULL && strstr (lines[0], "-r ") == NULL &&
+             /* every banner is urgency normal (a critical one would block the later
+              * ones), and the success icon is one Adwaita 50 has */
+             strstr (lines[0], "-i view-refresh-symbolic -u normal ") != NULL &&
+             strstr (lines[1], "-i object-select-symbolic -u normal ") != NULL &&
+             strstr (logged, "critical") == NULL && strstr (logged, "emblem-ok") == NULL &&
              strstr (lines[1], "-r 4242") != NULL &&
              strstr (lines[1], "Conversion complete") != NULL &&
              /* "--" comes right before the positionals (title, body) ... */
@@ -379,6 +384,38 @@ test_notifications (void)
       g_strfreev (lines);
     }
   add_row ("(notifications)", "-p / -r id", pass, pass ? "-- before title/body; second call replaces id 4242" : (logged ? logged : "no calls"));
+  /* a failed conversion: urgency normal as well, error icon, and the toast shows
+   * the cause. The "image" is plain text, which ImageMagick refuses. */
+  {
+    char *bad = P ("notify-bad.png"), *logged2 = NULL;
+    char *bpaths[2] = { bad, NULL };
+    GMainContext *ctx = g_main_context_default ();
+    gboolean ok2 = FALSE;
+
+    g_file_set_contents (bad, "this is not an image\n", -1, NULL);
+    nfc_batch_run (NFC_CAT_IMAGE, "bmp", "BMP", "bmp", (const char *const *) bpaths,
+                   (const char *const *) fmts, 1, NULL, NULL);
+    for (int i = 0; i < 500 && !ok2; i++)
+      {
+        g_main_context_iteration (ctx, FALSE);
+        g_usleep (20000);
+        if (g_file_get_contents (log, &logged2, NULL, NULL))
+          {
+            ok2 = strstr (logged2, "Conversion failed") != NULL;
+            if (!ok2)
+              g_clear_pointer (&logged2, g_free);
+          }
+      }
+    pass = ok2 && strstr (logged2, "-i dialog-error-symbolic -u normal ") != NULL &&
+           strstr (logged2, "critical") == NULL &&
+           strstr (logged2, "Failed: notify-bad.png — ") != NULL &&
+           strstr (logged2, "REJECTED") == NULL;
+    add_row ("(notifications)", "failure banner normal urgency", pass,
+             pass ? "dialog-error-symbolic, urgency normal" : (logged2 ? logged2 : "no failure banner"));
+    g_free (logged2);
+    g_remove (bad);
+    g_free (bad);
+  }
   nfc_tools.notify = saved;
   /* the converted bmp is left in work; remove it so naming tests stay exact */
   g_free (logged);
@@ -754,7 +791,88 @@ test_quality (void)
       g_free (sizes);
     }
   g_free (out);
+  /* ICO never enlarges: a 16x16 source gives one 16 entry, an 87x98 one 98,48,32,16
+   * (the ICONDIR entries are read back with identify) */
+  {
+    const struct { const char *name, *size, *want; } ic[] = {
+      { "ico16.png", "16x16", "16x16" },
+      { "ico87x98.png", "87x98", "98x98 48x48 32x32 16x16" },
+      { "ico48.png", "48x48", "48x48 32x32 16x16" },
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (ic); i++)
+      {
+        char *sizes = NULL, *label = g_strdup_printf ("%s (%s)", ic[i].name, ic[i].size);
+
+        fixture (ic[i].name, run (work, NULL, "magick", "-size", ic[i].size, "gradient:red-blue",
+                                  "-depth", "8", ic[i].name, NULL));
+        out = check (ic[i].name, "ico");
+        if (out != NULL)
+          {
+            gboolean ok = run (NULL, &sizes, "magick", "identify", "-format", "%wx%h ", out, NULL);
+
+            add_row (label, "ico entries (no upscaling)",
+                     ok && sizes != NULL && g_str_equal (g_strstrip (sizes), ic[i].want),
+                     sizes ? sizes : "(identify failed)");
+            g_free (sizes);
+          }
+        g_free (out);
+        g_free (label);
+      }
+  }
   g_free (src);
+}
+
+/* A system whose ffmpeg has no libx264 but libopenh264 (stock Fedora ffmpeg-free):
+ * `ffmpeg -encoders` is replaced by the real list without libx264, then MKV -> MP4
+ * and MP4 -> MKV must still be offered and must produce H.264 made by libopenh264. */
+static void
+test_openh264_only (void)
+{
+  char *enc = NULL, *out;
+  GString *filtered = g_string_new (NULL);
+  char **lines;
+  gboolean have_oh;
+
+  if (!run (NULL, &enc, "ffmpeg", "-hide_banner", "-encoders", NULL) || enc == NULL)
+    return;
+  have_oh = strstr (enc, "libopenh264") != NULL;
+  if (!have_oh)
+    {
+      add_row ("test.mkv", "mp4 (libopenh264 only)", TRUE, "skipped: this ffmpeg has no libopenh264");
+      g_free (enc);
+      g_string_free (filtered, TRUE);
+      return;
+    }
+  lines = g_strsplit (enc, "\n", -1);
+  for (char **l = lines; *l; l++)
+    if (strstr (*l, " libx264") == NULL)
+      g_string_append_printf (filtered, "%s\n", *l);
+  nfc_test_set_encoders (filtered->str);
+  g_assert_false (nfc_have_encoder ("libx264"));
+  /* test.mkv -> mp4 (re-encode) and test.mp4 -> mkv (stream copy first, then the
+   * re-encode only if needed) */
+  out = check ("test.mkv", "mp4");
+  if (out != NULL)
+    {
+      char *tag = NULL;
+      gboolean ok = run (NULL, &tag, "ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream_tags=encoder:stream=codec_name,width,height",
+                         "-of", "default=nw=1", out, NULL);
+
+      add_row ("test.mkv", "mp4 made by libopenh264", ok && tag != NULL &&
+               strstr (tag, "libopenh264") != NULL && strstr (tag, "codec_name=h264") != NULL &&
+               strstr (tag, "width=320") != NULL, tag ? tag : "(ffprobe failed)");
+      g_free (tag);
+      g_free (out);
+    }
+  g_free (check ("test.mp4", "mkv"));
+  g_free (check ("noaudio.mp4", "mkv"));
+  /* back to the real list */
+  nfc_test_set_encoders (enc);
+  g_strfreev (lines);
+  g_string_free (filtered, TRUE);
+  g_free (enc);
 }
 
 /* Free memory in GiB (MemAvailable), 0 if unknown. */
@@ -1090,6 +1208,7 @@ main (void)
   test_pdf_page_size ();
   check_many ("test.mov", k_mov);
   check_many ("test.mkv", k_mkv);
+  test_openh264_only ();
   check_many ("test.txt", k_txt);
   check_many ("test.odt", k_odt);
   check_many ("test.docx", k_docx);

@@ -200,7 +200,7 @@ test_argv (void)
   at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "ico", "/s/a.png", "/o/x.ico", "/w", &dec);
   argv = ((GPtrArray *) at->pdata[0])->pdata[0];
   g_assert_true (argv_has (argv, "256x256>"));
-  g_assert_true (argv_has (argv, "icon:auto-resize=256,48,32,16"));
+  g_assert_true (argv_has (argv, "icon:auto-resize=256,48,32,16")); /* size unknown: all */
   g_assert_true (argv_has (argv, "-extent"));
   g_ptr_array_unref (at);
   /* JPG: explicit 4:4:4 always; q99 for graphics (screenshots), q95 for photos */
@@ -220,7 +220,7 @@ test_argv (void)
         g_ptr_array_unref (at);
       }
   }
-  /* WEBP: lossless for lossless sources, lossy q94 + sharp YUV for photos;
+  /* WEBP: lossless for lossless sources, lossy q90 + sharp YUV for photos;
    * never wider than the 16383 pixels WEBP can hold */
   at = nfc_build_attempts (NFC_CAT_IMAGE, "png", "webp", "/s/a.png", "/o/x.webp", "/w", &dec);
   argv = ((GPtrArray *) at->pdata[0])->pdata[0];
@@ -232,7 +232,7 @@ test_argv (void)
   a0 = at->pdata[0];
   argv = a0->pdata[a0->len - 1];
   g_assert_false (argv_has (argv, "webp:lossless=true"));
-  g_assert_cmpstr (argv_after (argv, "-quality"), ==, "94");
+  g_assert_cmpstr (argv_after (argv, "-quality"), ==, "90");
   g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
   g_ptr_array_unref (at);
   /* AVIF: graphics 4:4:4 crf 9 with a fallback attempt (8-bit 4:2:0), photos
@@ -776,6 +776,257 @@ test_spill_dir (void)
   g_free (cache); g_free (want); g_free (old); g_free (young);
 }
 
+static void
+expect_msg (const char *text, const char *fmt, const char *want)
+{
+  char *got = nfc_failure_message (text, fmt);
+
+  g_assert_cmpstr (got, ==, want);
+  g_free (got);
+}
+
+/* The line shown in the failure toast: the cause, not the last line, in words
+ * where it is known. The inputs are the real stderr texts seen in the field. */
+static void
+test_failure_message (void)
+{
+  char *long_line, *got;
+
+  /* HEIC without an HEVC decoder (glycin): the last stderr line is the loader's
+   * own chatter, the cause is earlier */
+  expect_msg ("cannot decode /x/IMG_1.heic: Failed to load image: "
+              "org.gnome.glycin.Error.LoadingError: glycin-loaders/glycin-heif/src/main.rs:103:24: "
+              "DecoderPluginError(Unspecified)\nSetting process memory limit\n", "heic",
+              "can't decode HEIC: the HEVC decoder is missing "
+              "(install libheif-freeworld from RPM Fusion)");
+  /* ... but the same text for another source format is not claimed to be HEVC */
+  got = nfc_failure_message ("org.gnome.glycin.Error.LoadingError: x\nSetting process memory limit\n",
+                             "avif");
+  g_assert_nonnull (strstr (got, "LoadingError"));
+  g_assert_null (strstr (got, "HEVC"));
+  g_free (got);
+  /* ffmpeg with a broken decoder: the last line is "Unknown error occurred" */
+  expect_msg ("Input #0, mov,mp4, from 'a.mp4':\n"
+              "[vist#0:0/h264 @ 0x55d] [dec:libopenh264 @ 0x55e] Error while opening decoder: Generic error in an external library\n"
+              "[vost#0:0/libx264 @ 0x55f] Error initializing a simple filtergraph\n"
+              "Error opening output files: Unknown error occurred\n", NULL,
+              "the video decoder failed (libopenh264 decoder unavailable)");
+  expect_msg ("[dec:libopenh264] Error while opening decoder\n"
+              "Error opening output files: Unknown error occurred\n", NULL,
+              "the video decoder failed (libopenh264 decoder unavailable)");
+  expect_msg ("Error while opening decoder for input stream #0:0 : Function not implemented\n", NULL,
+              "the video decoder failed (decoder unavailable)");
+  /* ImageMagick: program prefix and "@ error/..." tail are dropped */
+  expect_msg ("magick: Improper image header `/x/a.jpg' @ error/jpeg.c/EmitMessage/232.\n", NULL,
+              "Improper image header `/x/a.jpg'");
+  expect_msg ("/usr/bin/magick: Not a JPEG file: starts with 0x52 0x49 `/x/a.jpg' @ error/jpeg.c/EmitMessage/232.\n"
+              "magick: no images defined `/o/.a.jpg' @ error/convert.c/ConvertImageCommand/3500.\n", NULL,
+              "Not a JPEG file: starts with 0x52 0x49 `/x/a.jpg'");
+  expect_msg ("magick: unable to open image '/x/a.png': No such file or directory @ error/blob.c/OpenBlob/3601.\n",
+              NULL, "unable to open image '/x/a.png': No such file or directory");
+  expect_msg ("magick: cache resources exhausted `/x/a.png' @ error/cache.c/OpenPixelCache/4119.\n"
+              "magick: no images defined `/o/x.jpg' @ error/convert.c/ConvertImageCommand/3500.\n", NULL,
+              "image too large for available memory");
+  expect_msg ("av_interleaved_write_frame(): No space left on device\n"
+              "Error writing trailer of /o/x.mp4: No space left on device\n", NULL, "disk full");
+  expect_msg ("/x/a.mp4: Permission denied\n", NULL, "/x/a.mp4: Permission denied");
+  expect_msg ("/x/a.mp3: Invalid data found when processing input\n", NULL,
+              "/x/a.mp3: Invalid data found when processing input");
+  /* no known cause: the last line that says error/failed/unable, else the last line */
+  expect_msg ("starting\nLoad failed: bad thing\nsome trailing note\n", NULL,
+              "Load failed: bad thing");
+  expect_msg ("first\nsecond line\n\n  \n", NULL, "second line");
+  g_assert_null (nfc_failure_message ("", NULL));
+  g_assert_null (nfc_failure_message ("  \n\n", NULL));
+  g_assert_null (nfc_failure_message (NULL, NULL));
+  /* an endless line is cut on a character boundary */
+  long_line = g_strnfill (400, 'x');
+  got = nfc_failure_message (long_line, NULL);
+  g_assert_true (g_str_has_suffix (got, "…"));
+  g_assert_cmpuint (strlen (got), <=, 300 + 3);
+  g_assert_true (g_utf8_validate (got, -1, NULL));
+  g_free (got);
+  g_free (long_line);
+  {
+    GString *s = g_string_new (NULL);
+
+    for (int i = 0; i < 200; i++)
+      g_string_append (s, "é");
+    got = nfc_failure_message (s->str, NULL);
+    g_assert_true (g_utf8_validate (got, -1, NULL));
+    g_assert_cmpuint (strlen (got), <=, 300 + 3);
+    g_free (got);
+    g_string_free (s, TRUE);
+  }
+}
+
+/* ICO: the 256/48/32/16 entries that do not enlarge the source, plus its own
+ * size; at least one entry */
+static void
+check_ico_sizes (const char *fmt, guint64 w, guint64 h, const char *want)
+{
+  NfcImageInfo info = { w, h, FALSE, 0, 0 };
+  gboolean dec;
+  GPtrArray *at = nfc_build_attempts_info (NFC_CAT_IMAGE, fmt, "ico", "/s/a.x", "/o/x.ico", "/w",
+                                           w ? &info : NULL, &dec);
+  char *def = g_strconcat ("icon:auto-resize=", want, NULL);
+
+  g_assert_nonnull (at);
+  g_assert_true (argv_has (((GPtrArray *) at->pdata[0])->pdata[0], def));
+  g_free (def);
+  g_ptr_array_unref (at);
+}
+
+static void
+test_ico_sizes (void)
+{
+  nfc_tools_init ();
+  g_free (nfc_tools.magick);
+  nfc_tools.magick = g_strdup ("/bin/magick");
+
+  check_ico_sizes ("png", 16, 16, "16");
+  check_ico_sizes ("png", 87, 98, "98,48,32,16");
+  check_ico_sizes ("png", 98, 87, "98,48,32,16");
+  check_ico_sizes ("png", 8, 8, "8");
+  check_ico_sizes ("png", 15, 40, "40,32,16");
+  check_ico_sizes ("png", 32, 32, "32,16");
+  check_ico_sizes ("png", 48, 48, "48,32,16");
+  check_ico_sizes ("png", 200, 100, "200,48,32,16");
+  check_ico_sizes ("png", 256, 256, "256,48,32,16");
+  check_ico_sizes ("png", 400, 100, "256,48,32,16");   /* shrunk to 256 first */
+  check_ico_sizes ("png", 4000, 3000, "256,48,32,16");
+  check_ico_sizes ("png", 0, 0, "256,48,32,16");       /* size unknown */
+  check_ico_sizes ("svg", 16, 16, "256,48,32,16");     /* vector: no enlarging issue */
+}
+
+/* `ffmpeg -encoders` lines, as ffmpeg prints them */
+#define ENC_HEADER " Encoders:\n V..... = Video\n ------\n"
+#define ENC_X264 " V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n"
+#define ENC_OH264 " V....D libopenh264          OpenH264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)\n"
+#define ENC_OTHER " V....D h264_vaapi           H.264/AVC (VAAPI) (codec h264)\n A....D aac                  AAC (Advanced Audio Coding)\n"
+
+static gboolean
+offers (NfcCategory cat, const char *fmt, const char *key)
+{
+  GPtrArray *t = nfc_targets_for (cat, fmt);
+  gboolean found = FALSE;
+
+  for (guint i = 0; i < t->len; i++)
+    found = found || g_str_equal (((const NfcTarget *) t->pdata[i])->key, key);
+  g_ptr_array_unref (t);
+  return found;
+}
+
+static char **
+attempt_argv (GPtrArray *at, guint i)
+{
+  return ((GPtrArray *) at->pdata[i])->pdata[0];
+}
+
+/* MP4 and the MKV re-encode: libx264 when ffmpeg has it, libopenh264 (bitrate
+ * mode, bitrate from the picture size) otherwise or as the next attempt; MP4
+ * and MKV are offered if any H.264 encoder exists. */
+static void
+test_h264_encoders (void)
+{
+  NfcImageInfo hd = { 1920, 1080, FALSE, 0, 0 }, hd720 = { 1280, 720, FALSE, 0, 0 };
+  NfcImageInfo uhd = { 3840, 2160, FALSE, 0, 0 }, tiny = { 160, 120, FALSE, 0, 0 };
+  NfcImageInfo huge = { 7680, 4320, FALSE, 0, 0 };
+  GPtrArray *at;
+  gboolean dec;
+
+  nfc_tools_init ();
+  g_free (nfc_tools.ffmpeg);
+  nfc_tools.ffmpeg = g_strdup ("/bin/ffmpeg");
+
+  /* bitrate: 3 bit per pixel per second, 0.5 .. 40 Mbit/s, 1080p when unknown */
+  g_assert_cmpuint (nfc_h264_bitrate (&hd), ==, 6220800);
+  g_assert_cmpuint (nfc_h264_bitrate (&hd720), ==, 2764800);
+  g_assert_cmpuint (nfc_h264_bitrate (&uhd), ==, 24883200);
+  g_assert_cmpuint (nfc_h264_bitrate (&huge), ==, 40000000);
+  g_assert_cmpuint (nfc_h264_bitrate (&tiny), ==, 500000);
+  g_assert_cmpuint (nfc_h264_bitrate (NULL), ==, 6220800);
+
+  /* both: libx264 first, libopenh264 as the next attempt */
+  nfc_test_set_encoders (ENC_HEADER ENC_X264 ENC_OH264 ENC_OTHER);
+  g_assert_true (offers (NFC_CAT_VIDEO, "mkv", "mp4"));
+  g_assert_true (offers (NFC_CAT_VIDEO, "mp4", "mkv"));
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mkv", "mp4", "/s/a.mkv", "/o/x.mp4", "/w", &hd720, &dec);
+  g_assert_cmpuint (at->len, ==, 2);
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-c:v"), ==, "libx264");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-crf"), ==, "18");
+  g_assert_false (argv_has (attempt_argv (at, 0), "-b:v"));
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-c:v"), ==, "libopenh264");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-b:v"), ==, "2764800");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-rc_mode"), ==, "bitrate");
+  g_assert_false (argv_has (attempt_argv (at, 1), "-crf"));
+  g_assert_false (argv_has (attempt_argv (at, 1), "-preset"));
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-pix_fmt"), ==, "yuv420p");
+  g_assert_true (argv_has (attempt_argv (at, 1), "+faststart"));
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-vf"), ==, "crop=trunc(iw/2)*2:trunc(ih/2)*2");
+  g_assert_cmpstr (attempt_argv (at, 1)[g_strv_length (attempt_argv (at, 1)) - 1], ==, "/o/x.mp4");
+  g_ptr_array_unref (at);
+  /* MKV: stream copy, then x264, then openh264; no faststart in MKV */
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mp4", "mkv", "/s/a.mp4", "/o/x.mkv", "/w", &uhd, &dec);
+  g_assert_cmpuint (at->len, ==, 3);
+  g_assert_true (argv_has (attempt_argv (at, 0), "copy"));
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-c:v"), ==, "libx264");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 2), "-c:v"), ==, "libopenh264");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 2), "-b:v"), ==, "24883200");
+  g_assert_false (argv_has (attempt_argv (at, 2), "+faststart"));
+  g_ptr_array_unref (at);
+
+  /* stock Fedora: libopenh264 only */
+  nfc_test_set_encoders (ENC_HEADER ENC_OH264 ENC_OTHER);
+  g_assert_true (offers (NFC_CAT_VIDEO, "mkv", "mp4"));
+  g_assert_true (offers (NFC_CAT_VIDEO, "mp4", "mkv"));
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mkv", "mp4", "/s/a.mkv", "/o/x.mp4", "/w", &hd, &dec);
+  g_assert_cmpuint (at->len, ==, 1);
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-c:v"), ==, "libopenh264");
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-b:v"), ==, "6220800");
+  g_ptr_array_unref (at);
+  /* no size known: 1080p */
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mkv", "mp4", "/s/a.mkv", "/o/x.mp4", "/w", NULL, &dec);
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-b:v"), ==, "6220800");
+  g_ptr_array_unref (at);
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mp4", "mkv", "/s/a.mp4", "/o/x.mkv", "/w", &hd, &dec);
+  g_assert_cmpuint (at->len, ==, 2);
+  g_assert_true (argv_has (attempt_argv (at, 0), "copy"));
+  g_assert_cmpstr (argv_after (attempt_argv (at, 1), "-c:v"), ==, "libopenh264");
+  g_ptr_array_unref (at);
+
+  /* libx264 only */
+  nfc_test_set_encoders (ENC_HEADER ENC_X264 ENC_OTHER);
+  g_assert_true (offers (NFC_CAT_VIDEO, "mkv", "mp4"));
+  at = nfc_build_attempts_info (NFC_CAT_VIDEO, "mkv", "mp4", "/s/a.mkv", "/o/x.mp4", "/w", &hd, &dec);
+  g_assert_cmpuint (at->len, ==, 1);
+  g_assert_cmpstr (argv_after (attempt_argv (at, 0), "-c:v"), ==, "libx264");
+  g_ptr_array_unref (at);
+
+  /* no H.264 encoder (a hardware wrapper alone does not count): not offered */
+  nfc_test_set_encoders (ENC_HEADER ENC_OTHER);
+  g_assert_false (offers (NFC_CAT_VIDEO, "mkv", "mp4"));
+  g_assert_false (offers (NFC_CAT_VIDEO, "mp4", "mkv"));
+  nfc_test_set_encoders ("");
+
+  /* the ffprobe size probe: absolute path after -i, never an option */
+  g_free (nfc_tools.ffprobe);
+  nfc_tools.ffprobe = g_strdup ("/bin/ffprobe");
+  {
+    char **argv = nfc_build_video_probe_argv ("-odd name.mp4");
+
+    g_assert_nonnull (argv);
+    g_assert_cmpstr (argv[0], ==, "/bin/ffprobe");
+    g_assert_cmpstr (argv_after (argv, "-select_streams"), ==, "v:0");
+    g_assert_true (g_str_has_suffix (argv_after (argv, "-i"), "/-odd name.mp4"));
+    g_assert_true (g_path_is_absolute (argv_after (argv, "-i")));
+    g_strfreev (argv);
+    g_free (nfc_tools.ffprobe);
+    nfc_tools.ffprobe = NULL;
+    g_assert_null (nfc_build_video_probe_argv ("/s/a.mp4"));
+  }
+}
+
 int
 main (int argc, char **argv)
 {
@@ -791,5 +1042,8 @@ main (int argc, char **argv)
   g_test_add_func ("/core/admission", test_admission);
   g_test_add_func ("/core/probe-argv-and-pdf-density", test_probe_argv_and_pdf_density);
   g_test_add_func ("/core/spill-dir", test_spill_dir);
+  g_test_add_func ("/core/ico-sizes", test_ico_sizes);
+  g_test_add_func ("/core/h264-encoders", test_h264_encoders); /* last: fakes the encoder probe */
+  g_test_add_func ("/core/failure-message", test_failure_message);
   return g_test_run ();
 }

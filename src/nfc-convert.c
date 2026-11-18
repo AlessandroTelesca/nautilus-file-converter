@@ -9,43 +9,6 @@
  * Helpers
  * ---------------------------------------------------------------------- */
 
-#define MSG_MAX_BYTES 300 /* longest failure text shown in the toast */
-
-static char *
-last_line (const char *text)
-{
-  char **lines;
-  char *res = NULL;
-
-  if (text == NULL)
-    return NULL;
-  lines = g_strsplit (text, "\n", -1);
-  for (int i = (int) g_strv_length (lines) - 1; i >= 0; i--)
-    {
-      char *s = g_strstrip (lines[i]);
-
-      if (*s != '\0')
-        {
-          /* one endless line must not become an endless toast: keep the
-           * start, on a UTF-8 character boundary (text is valid UTF-8 here) */
-          if (strlen (s) > MSG_MAX_BYTES)
-            {
-              char *cut = s + MSG_MAX_BYTES;
-
-              while (cut > s && (*cut & 0xC0) == 0x80)
-                cut--;
-              *cut = '\0';
-              res = g_strconcat (s, "…", NULL);
-            }
-          else
-            res = g_strdup (s);
-          break;
-        }
-    }
-  g_strfreev (lines);
-  return res;
-}
-
 /* ffmpeg's own words for "this file has no audio stream" are no help in a toast
  * ("Stream map '' matches no streams."): recognise that failure (the audio
  * targets map a required audio stream, the video targets map it optionally, so
@@ -503,9 +466,9 @@ step_finished (StepIO *io)
         else if (j->timed_out)
           msg = g_strdup ("timed out");
         else
-          msg = last_line (se);
+          msg = nfc_failure_message (se, j->fmt);
         if (msg == NULL)
-          msg = last_line (so);
+          msg = nfc_failure_message (so, j->fmt);
         if (msg == NULL)
           msg = g_strdup_printf ("exit code %d", status);
         nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  stderr:\n%s\n  stdout:\n%s",
@@ -753,6 +716,18 @@ admission_submit (Job *j)
   admission_pump ();
 }
 
+
+/* the size probe is over: images go through the memory admission, a video (probed
+ * only for its encoder bitrate) starts at once */
+static void
+probe_finished (Job *j)
+{
+  if (j->cat == NFC_CAT_VIDEO)
+    job_start (j);
+  else
+    admission_submit (j);
+}
+
 static gboolean
 probe_timeout (gpointer data)
 {
@@ -800,19 +775,20 @@ probe_done (GObject *source, GAsyncResult *res, gpointer data)
              j->src, error != NULL ? error->message : "no usable output");
   g_free (out);
   g_clear_error (&error);
-  admission_submit (j);
+  probe_finished (j);
 }
 
 /* first step of an image job: read the size without decoding pixels */
 static void
 probe_start (Job *j)
 {
-  char **argv = nfc_build_probe_argv (j->fmt, j->src);
+  char **argv = j->cat == NFC_CAT_VIDEO ? nfc_build_video_probe_argv (j->src)
+                                         : nfc_build_probe_argv (j->fmt, j->src);
   GSubprocessLauncher *l;
 
   if (argv == NULL)
     {
-      admission_submit (j);
+      probe_finished (j);
       return;
     }
   l = nfc_launcher_new (G_SUBPROCESS_FLAGS_STDOUT_PIPE | G_SUBPROCESS_FLAGS_STDERR_SILENCE);
@@ -821,7 +797,7 @@ probe_start (Job *j)
   g_strfreev (argv);
   if (j->proc == NULL)
     {
-      admission_submit (j);
+      probe_finished (j);
       return;
     }
   j->pgid = nfc_subprocess_pgid (j->proc);
@@ -926,6 +902,8 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
 
   if (cat == NFC_CAT_IMAGE)
     probe_start (j); /* then the admission decides when job_start runs */
+  else if (cat == NFC_CAT_VIDEO && (g_str_equal (key, "mp4") || g_str_equal (key, "mkv")))
+    probe_start (j); /* the picture size sets the libopenh264 bitrate; then job_start */
   else
     job_start (j);
 }
@@ -1176,8 +1154,12 @@ batch_finish (Batch *b)
         }
       else
         g_string_printf (body, "Converted %u files to %s", good, b->short_label);
+      /* "emblem-ok-symbolic" does not exist in Adwaita 50 (GNOME Shell drew a
+       * missing-image placeholder); object-select-symbolic does. Every banner
+       * is urgency normal: a critical one stays until dismissed and the later
+       * banners of the same sync group then queue behind it and never show. */
       notifier_send (b->notifier, "Conversion complete", body->str,
-                     "emblem-ok-symbolic", "normal");
+                     "object-select-symbolic", "normal");
     }
   else
     {
@@ -1205,7 +1187,7 @@ batch_finish (Batch *b)
                                 "\n…and %u more (see ~/.cache/nautilus-file-converter.log)",
                                 bad - 3);
       notifier_send (b->notifier, "Conversion failed", body->str,
-                     "dialog-error-symbolic", "critical");
+                     "dialog-error-symbolic", "normal");
     }
   g_string_free (body, TRUE);
 
