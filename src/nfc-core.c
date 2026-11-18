@@ -569,6 +569,84 @@ nfc_category_name (NfcCategory cat)
   return (guint) cat < NFC_CAT_N ? names[cat] : "?";
 }
 
+/* -------------------------------------------------------------------------
+ * Quality presets
+ * ---------------------------------------------------------------------- */
+
+static const struct { const char *key, *label; } preset_names[NFC_PRESET_N] = {
+  { "best", "Best" }, { "high", "High" }, { "balanced", "Balanced" }, { "small", "Small" },
+};
+
+const char *
+nfc_preset_key (NfcPreset preset)
+{
+  return (guint) preset < NFC_PRESET_N ? preset_names[preset].key : "best";
+}
+
+const char *
+nfc_preset_label (NfcPreset preset)
+{
+  return (guint) preset < NFC_PRESET_N ? preset_names[preset].label : "Best";
+}
+
+gboolean
+nfc_preset_from_key (const char *key, NfcPreset *out)
+{
+  if (key == NULL)
+    return FALSE;
+  for (guint i = 0; i < NFC_PRESET_N; i++)
+    if (g_str_equal (preset_names[i].key, key))
+      {
+        if (out != NULL)
+          *out = (NfcPreset) i;
+        return TRUE;
+      }
+  return FALSE;
+}
+
+gboolean
+nfc_target_has_presets (NfcCategory cat, const char *key)
+{
+  if (key == NULL)
+    return FALSE;
+  if (cat == NFC_CAT_IMAGE)
+    return g_str_equal (key, "jpg") || g_str_equal (key, "webp") || g_str_equal (key, "avif");
+  if (cat == NFC_CAT_VIDEO)
+    return g_str_equal (key, "mp4") || g_str_equal (key, "webm") || g_str_equal (key, "gif");
+  return FALSE;
+}
+
+/* The tooltips say what a preset does, with the sizes measured against Best
+ * (see README: they depend on the content). */
+const char *
+nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset)
+{
+  static const char *const image_tips[NFC_PRESET_N] = {
+    "Best — the highest quality; the file can be large",
+    "High — visually identical, typically 55-70% of the size of Best",
+    "Balanced — good for sharing, typically 25-45% of the size of Best",
+    "Small — smallest acceptable file, typically 10-30% of Best; images over 2560 px are scaled down to 2560 px",
+  };
+  static const char *const video_tips[NFC_PRESET_N] = {
+    "Best — the highest quality; the file can be large",
+    "High — visually identical, typically 55-70% of the size of Best",
+    "Balanced — good for sharing, typically 25-45% of the size of Best",
+    "Small — smallest acceptable file, typically 15-20% of Best; video above 1080p is scaled down to 1080p",
+  };
+  static const char *const gif_tips[NFC_PRESET_N] = {
+    "Best — 960 px wide, 15 frames/s, 256 colours",
+    "High — 720 px wide, 15 frames/s, about 60% of the size of Best",
+    "Balanced — 640 px wide, 12 frames/s, about 40% of the size of Best",
+    "Small — 480 px wide, 10 frames/s, 128 colours, about 17% of the size of Best",
+  };
+
+  if ((guint) preset >= NFC_PRESET_N || !nfc_target_has_presets (cat, key))
+    return "";
+  if (cat == NFC_CAT_IMAGE)
+    return image_tips[preset];
+  return g_str_equal (key, "gif") ? gif_tips[preset] : video_tips[preset];
+}
+
 #define T(k, l, e) { k, l, e }
 static const NfcTarget image_targets[] = {
   T ("png", "PNG", "png"), T ("jpg", "JPG", "jpg"), T ("webp", "WEBP", "webp"),
@@ -1016,13 +1094,29 @@ nfc_h264_bitrate (const NfcImageInfo *info)
   return CLAMP (bps, H264_MIN_BPS, H264_MAX_BPS);
 }
 
+/* Per preset (best, high, balanced, small): the libx264 crf, and libopenh264's
+ * share (percent) of the bitrate nfc_h264_bitrate gives. Small also uses the
+ * faster x264 preset and shrinks video larger than 1080p (short side) to 1080p. */
+static const char *const x264_crf[NFC_PRESET_N] = { "18", "23", "28", "34" };
+static const guint oh264_percent[NFC_PRESET_N] = { 100, 60, 40, 25 };
+
+/* ffmpeg scale filter: short side above 1080 -> 1080, aspect ratio kept, even sizes */
+#define SCALE_1080 "scale=w='if(gt(iw,ih),-2,min(iw,1080))':h='if(gt(iw,ih),min(ih,1080),-2)'"
+
+/* The video filter chain of the H.264 and VP9 encoders for a preset */
+static const char *
+video_filter (NfcPreset preset)
+{
+  return preset == NFC_PRESET_SMALL ? EVEN "," SCALE_1080 : EVEN;
+}
+
 /* The MP4 / MKV re-encode attempts for the H.264 encoders ffmpeg has: libx264
- * (crf 18, slow) first, then libopenh264 (bitrate, see above) as the next
- * attempt. With neither known (the probe has not run) the libx264 attempt alone,
- * as before. */
+ * (crf by preset: 18 for Best; slow) first, then libopenh264 (bitrate, see
+ * above) as the next attempt. With neither known (the probe has not run) the
+ * libx264 attempt alone, as before. */
 static void
 add_h264_attempts (GPtrArray *attempts, const char *src, const char *out, gboolean mp4,
-                   const NfcImageInfo *info)
+                   const NfcImageInfo *info, NfcPreset preset)
 {
   gboolean x264 = nfc_have_encoder ("libx264");
   gboolean oh264 = nfc_have_encoder ("libopenh264");
@@ -1032,7 +1126,8 @@ add_h264_attempts (GPtrArray *attempts, const char *src, const char *out, gboole
     {
       a = ff_base (src);
       av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-              "-vf", EVEN, "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+              "-vf", video_filter (preset), "-c:v", "libx264", "-crf", x264_crf[preset],
+              "-preset", preset == NFC_PRESET_SMALL ? "medium" : "slow",
               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
       if (mp4)
         av_add (a, "-movflags", "+faststart", NULL);
@@ -1041,11 +1136,12 @@ add_h264_attempts (GPtrArray *attempts, const char *src, const char *out, gboole
     }
   if (oh264)
     {
-      char *bps = g_strdup_printf ("%" G_GUINT64_FORMAT, nfc_h264_bitrate (info));
+      guint64 rate = nfc_h264_bitrate (info) * oh264_percent[preset] / 100;
+      char *bps = g_strdup_printf ("%" G_GUINT64_FORMAT, MAX (rate, (guint64) H264_MIN_BPS));
 
       a = ff_base (src);
       av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-              "-vf", EVEN, "-c:v", "libopenh264", "-rc_mode", "bitrate", "-b:v", bps,
+              "-vf", video_filter (preset), "-c:v", "libopenh264", "-rc_mode", "bitrate", "-b:v", bps,
               "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
       if (mp4)
         av_add (a, "-movflags", "+faststart", NULL);
@@ -1202,9 +1298,28 @@ photo_source (const char *fmt)
          g_str_equal (fmt, "avif") || g_str_equal (fmt, "webp");
 }
 
+/* Max side of an image converted with the Small preset (larger ones shrink) */
+#define SMALL_MAX_SIDE "2560x2560>"
+
+/* AVIF crf per preset (best, high, balanced, small). */
+static const char *const avif_crf_graphics[NFC_PRESET_N] = { "9", "18", "26", "34" };
+static const char *const avif_crf_photo[NFC_PRESET_N] = { "12", "20", "28", "36" };
+
+/* JPG, per preset (best, high, balanced, small): quality and chroma sampling
+ * for graphics (lossless sources) and photos (lossy sources). Best's values are
+ * written out where they are used. */
+static const char *const jpg_quality_graphics[NFC_PRESET_N] = { "99", "95", "85", "75" };
+static const char *const jpg_sampling_graphics[NFC_PRESET_N] = { "4:4:4", "4:4:4", "4:4:4", "4:2:0" };
+static const char *const jpg_quality_photo[NFC_PRESET_N] = { "95", "92", "80", "70" };
+static const char *const jpg_sampling_photo[NFC_PRESET_N] = { "4:4:4", "4:2:0", "4:2:0", "4:2:0" };
+
+/* WEBP lossy quality of photos, per preset */
+static const char *const webp_quality_photo[NFC_PRESET_N] = { "90", "85", "78", "65" };
+
 /* The ffmpeg step that makes the AVIF from the flattened PNG.
  *
- * Graphics: 4:4:4 (no chroma smearing of text), crf 9. Photos: 4:2:0, crf 12.
+ * Graphics: 4:4:4 (no chroma smearing of text), crf 9 (Best). Photos: 4:2:0,
+ * crf 12 (Best). The other presets raise the crf (tables above).
  * 8-bit: the 10-bit variants gave no better result on screenshots once the
  * viewer converts back to 8 bits, and 8-bit 4:4:4 decodes everywhere.
  * Colour: RGB -> YCbCr with the BT.709 matrix, FULL range, and the file is
@@ -1214,14 +1329,15 @@ photo_source (const char *fmt)
  * No -tiles: AV1 allows tiles up to 4096 px wide only, libaom picks as many as
  * the width needs by itself (an explicit count made wide images fail). */
 static char **
-ff_avif_step (const char *flat, const char *out, gboolean photo)
+ff_avif_step (const char *flat, const char *out, gboolean photo, NfcPreset preset)
 {
   GPtrArray *a = ff_base (flat);
 
   av_add (a, "-frames:v", "1", "-vf",
           photo ? "scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv420p"
                 : "scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv444p",
-          "-c:v", "libaom-av1", "-crf", photo ? "12" : "9", "-b:v", "0",
+          "-c:v", "libaom-av1", "-crf", (photo ? avif_crf_photo : avif_crf_graphics)[preset],
+          "-b:v", "0",
           "-cpu-used", "6", "-row-mt", "1", "-still-picture", "1",
           "-colorspace", "bt709", "-color_primaries", "bt709", "-color_range", "pc",
           "-f", "avif", out, NULL);
@@ -1495,8 +1611,18 @@ nfc_build_attempts (NfcCategory cat, const char *fmt, const char *key,
 
 GPtrArray *
 nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
-                         const char *src_in, const char *out, const char *workdir,
+                         const char *src, const char *out, const char *workdir,
                          const NfcImageInfo *info, gboolean *needs_decode)
+{
+  return nfc_build_attempts_preset (cat, fmt, key, NFC_PRESET_BEST, src, out, workdir,
+                                    info, needs_decode);
+}
+
+GPtrArray *
+nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
+                           NfcPreset preset, const char *src_in, const char *out,
+                           const char *workdir, const NfcImageInfo *info,
+                           gboolean *needs_decode)
 {
   GPtrArray *attempts, *a;
   char *src;
@@ -1505,6 +1631,9 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
     *needs_decode = FALSE;
   if (src_in == NULL || fmt == NULL || key == NULL || out == NULL || workdir == NULL)
     return NULL;
+  /* targets without presets always convert as Best */
+  if ((guint) preset >= NFC_PRESET_N || !nfc_target_has_presets (cat, key))
+    preset = NFC_PRESET_BEST;
   src = g_canonicalize_filename (src_in, NULL);
   attempts = attempts_new ();
 
@@ -1558,6 +1687,8 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
           if (g_str_equal (fmt, "svg"))
             av_add (a, "-background", "none", "-density", "192", NULL);
           av_add (a, im_in, "-auto-orient", NULL);
+          if (preset == NFC_PRESET_SMALL)
+            av_add (a, "-resize", SMALL_MAX_SIDE, NULL);
           im_flatten (a);
           av_add (a, flatp, NULL);
           s1 = av_done (a);
@@ -1566,11 +1697,11 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
            * (8-bit 4:2:0) only runs when libaom refuses attempt 1, which it
            * does for some huge images (4:4:4 at ~200 megapixels). Each attempt
            * runs the whole chain: the steps are owned by the attempt. */
-          s2 = ff_avif_step (flat, out, photo_source (fmt));
+          s2 = ff_avif_step (flat, out, photo_source (fmt), preset);
           add_attempt (attempts, dec_step, s1, s2, NULL);
           if (!photo_source (fmt))
             add_attempt (attempts, g_strdupv (dec_step), g_strdupv (s1),
-                         ff_avif_step (flat, out, TRUE), NULL);
+                         ff_avif_step (flat, out, TRUE, preset), NULL);
           g_free (flat);
           g_free (flatp);
           g_free (im_in);
@@ -1593,11 +1724,22 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
            * smeared by 4:2:0). Graphics need q99 to stay clean around text
            * (SSIM on text-heavy screenshots: q92 0.90-0.98, q98 0.96-0.998, q99
            * 0.989-0.999);
-           * photos are fine at q95. */
+           * photos are fine at q95. The other presets lower the quality (tables
+           * above), write progressive files and subsample the chroma where that
+           * costs little; Small also shrinks images beyond 2560 px. */
           av_add (a, "-auto-orient", NULL);
+          if (preset == NFC_PRESET_SMALL)
+            av_add (a, "-resize", SMALL_MAX_SIDE, NULL);
           im_flatten (a);
-          av_add (a, "-quality", photo_source (fmt) ? "95" : "99",
-                  "-sampling-factor", "4:4:4", NULL);
+          if (preset == NFC_PRESET_BEST)
+            av_add (a, "-quality", photo_source (fmt) ? "95" : "99",
+                    "-sampling-factor", "4:4:4", NULL);
+          else if (photo_source (fmt))
+            av_add (a, "-quality", jpg_quality_photo[preset], "-sampling-factor",
+                    jpg_sampling_photo[preset], "-interlace", "JPEG", NULL);
+          else
+            av_add (a, "-quality", jpg_quality_graphics[preset], "-sampling-factor",
+                    jpg_sampling_graphics[preset], "-interlace", "JPEG", NULL);
         }
       else if (g_str_equal (key, "webp"))
         {
@@ -1608,13 +1750,30 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
            * (the chroma conversion that keeps colour edges). 94 made a phone JPEG
            * larger than its source (a lossy source re-encoded at a higher quality
            * keeps its artefacts at a higher bitrate): at q90 the output is not
-           * larger, SSIM >= 0.98 against the source on most photos. */
-          av_add (a, "-auto-orient", "-resize", "16383x16383>", NULL);
+           * larger, SSIM >= 0.98 against the source on most photos.
+           *
+           * Other presets, photos: a lower lossy quality. Graphics: still
+           * lossless, but with fewer bits of information per pixel, so the file
+           * is never larger than Best's: 6 or 5 bits per channel (High,
+           * Balanced) or an adaptive 128-colour palette (Small). A lossy WEBP
+           * is larger than the lossless one for flat text/UI screenshots, and
+           * near-lossless (webp:near-lossless) has no effect in ImageMagick.
+           * Small also shrinks images beyond 2560 px. */
+          av_add (a, "-auto-orient", "-resize",
+                  preset == NFC_PRESET_SMALL ? SMALL_MAX_SIDE : "16383x16383>", NULL);
           if (photo_source (fmt))
-            av_add (a, "-quality", "90", "-define", "webp:method=6",
+            av_add (a, "-quality", webp_quality_photo[preset], "-define", "webp:method=6",
                     "-define", "webp:sharp-yuv=true", NULL);
           else
-            av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
+            {
+              if (preset == NFC_PRESET_HIGH)
+                av_add (a, "-depth", "6", NULL);
+              else if (preset == NFC_PRESET_BALANCED)
+                av_add (a, "-depth", "5", NULL);
+              else if (preset == NFC_PRESET_SMALL)
+                av_add (a, "+dither", "-colors", "128", NULL);
+              av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
+            }
         }
       else if (g_str_equal (key, "ico"))
         {
@@ -1697,33 +1856,43 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
         }
 
       if (g_str_equal (key, "mp4"))
-        add_h264_attempts (attempts, src, out, TRUE, info);
+        add_h264_attempts (attempts, src, out, TRUE, info, preset);
       else if (g_str_equal (key, "mkv"))
         {
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
                   "-c", "copy", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
-          add_h264_attempts (attempts, src, out, FALSE, info);
+          add_h264_attempts (attempts, src, out, FALSE, info, NFC_PRESET_BEST);
         }
       else if (g_str_equal (key, "webm"))
         {
+          static const char *const vp9_crf[NFC_PRESET_N] = { "28", "36", "44", "52" };
+
           a = ff_base (src);
           av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-                  "-c:v", "libvpx-vp9", "-crf", "28", "-b:v", "0", "-row-mt", "1",
-                  "-deadline", "good", "-cpu-used", "2", "-pix_fmt", "yuv420p", "-vf", EVEN,
+                  "-c:v", "libvpx-vp9", "-crf", vp9_crf[preset], "-b:v", "0", "-row-mt", "1",
+                  "-deadline", "good", "-cpu-used", "2", "-pix_fmt", "yuv420p",
+                  "-vf", video_filter (preset),
                   "-c:a", "libopus", "-b:a", "128k", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
         }
       else if (g_str_equal (key, "gif"))
         {
+          /* width cap, frame rate and palette size per preset */
+          static const struct { guint width, fps; const char *colors; } gif_p[NFC_PRESET_N] = {
+            { 960, 15, "" }, { 720, 15, "" }, { 640, 12, "" }, { 480, 10, ":max_colors=128" },
+          };
+          char *vf = g_strdup_printf ("fps=%u,scale='min(%u,iw)':-1:flags=lanczos,"
+                                      "split[s0][s1];[s0]palettegen=stats_mode=diff%s[p];"
+                                      "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                                      gif_p[preset].fps, gif_p[preset].width, gif_p[preset].colors);
+
           a = ff_base (src);
-          av_add (a, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf",
-                  "fps=15,scale='min(960,iw)':-1:flags=lanczos,"
-                  "split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
-                  "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+          av_add (a, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf,
                   "-loop", "0", out, NULL);
           add_attempt (attempts, av_done (a), NULL);
+          g_free (vf);
         }
       else
         goto fail;

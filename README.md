@@ -2,7 +2,9 @@
 
 A "Convert to" submenu for Nautilus (GNOME Files), similar to the Windows app
 *File Converter*. Select one or more files, right-click, choose a target
-format; the converted copies appear next to the originals.
+format; the converted copies appear next to the originals. For JPG, WEBP, AVIF,
+MP4, WebM and GIF the target opens a small submenu of quality presets (Best, High,
+Balanced, Small; see "Quality presets" below).
 
 Written in C against `libnautilus-extension-4` (Nautilus 43+ / GTK 4) and built
 with meson. There is no scripting-language runtime involved: no Python, no
@@ -152,6 +154,102 @@ more than a photo does.
   "it has no audio track" instead of ffmpeg's `Stream map '' matches no
   streams`. The audio is detected by ffmpeg's own error (no `ffprobe` pre-step:
   the menu never probes files, and ffmpeg fails in about 0.1 s anyway).
+
+### Quality presets
+
+JPG, WEBP, AVIF, MP4, WebM and GIF are submenus: **Best / High / Balanced /
+Small** (menu item names `FileConverter::<category>::<target>::<preset>`, e.g.
+`FileConverter::image::jpg::balanced`). Every other target (PNG, BMP, TIFF, ICO,
+PDF, MKV, all audio and the documents) stays one click and converts as it always
+did. With several files selected the preset applies to all of them. The preset is
+not encoded in the output name (`photo.jpg`, then `photo (1).jpg`, as before),
+and the notifications name it when it is not Best ("Converted 3 files to JPG
+(Balanced)").
+
+* **Best** is what the extension has always done; its commands are unchanged
+  (the tests compare them with a copy of the previous ones).
+* **High**: visually identical on screenshots and photos.
+* **Balanced**: a good default for sharing.
+* **Small**: the smallest acceptable result. It also shrinks: images larger than
+  2560 px on the long side are scaled to 2560 px (JPG, WEBP, AVIF), video whose
+  short side is above 1080 is scaled to 1080p (MP4, WebM; a 4K clip becomes
+  1920x1080), GIF is 480 px wide at 10 fps with 128 colours. High and Balanced
+  never change the picture size (GIF: High 720 px at 15 fps, Balanced 640 px at
+  12 fps; Best 960 px at 15 fps). The menu tooltips say the same.
+
+Settings (the source classes are as above: *graphics* = lossless sources,
+*photo* = lossy sources):
+
+| Target | Best | High | Balanced | Small |
+|---|---|---|---|---|
+| JPG graphics | q99, 4:4:4 | q95, 4:4:4, progressive | q85, 4:4:4, progressive | q75, 4:2:0, progressive, max 2560 px |
+| JPG photo | q95, 4:4:4 | q92, 4:2:0, progressive | q80, 4:2:0, progressive | q70, 4:2:0, progressive, max 2560 px |
+| WEBP graphics | lossless | lossless, 6 bits per channel | lossless, 5 bits per channel | lossless, 128-colour palette, max 2560 px |
+| WEBP photo | lossy q90 | q85 | q78 | q65, max 2560 px |
+| AVIF graphics (4:4:4) | CRF 9 | CRF 18 | CRF 26 | CRF 34, max 2560 px |
+| AVIF photo (4:2:0) | CRF 12 | CRF 20 | CRF 28 | CRF 36, max 2560 px |
+| MP4 libx264 | CRF 18, slow | CRF 23, slow | CRF 28, slow | CRF 34, medium, max 1080p |
+| MP4 libopenh264 | 100 % of the bitrate | 60 % | 40 % | 25 %, max 1080p |
+| WebM VP9 | CRF 28 | CRF 36 | CRF 44 | CRF 52, max 1080p |
+| GIF | 960 px, 15 fps | 720 px, 15 fps | 640 px, 12 fps | 480 px, 10 fps, 128 colours |
+
+Why WEBP graphics are lossless in every preset: for flat screenshots (a
+terminal, a UI) the lossless file is already smaller than any lossy WEBP (a
+1160x747 terminal screenshot: lossless 32 KB, lossy q60 59 KB, q98 135 KB), so
+a lossy preset would make "Small" larger than "Best". ImageMagick's
+`webp:near-lossless` has no effect. Instead the information in the pixels is
+reduced (6 or 5 bits per channel, or a 128-colour palette) and the result is
+encoded losslessly, which never makes the file larger.
+
+Measured (SSIM from ffmpeg's `ssim` filter, RGB for images and 4:2:0 luma+chroma
+for video, against the source; the "text" column is SSIM of a 400x200 crop of the
+text; size is relative to Best's output for the same file; `-` = not applicable,
+the crop is only taken from the text screenshots). A Small result that was
+scaled down is compared with the source scaled the same way. Sources:
+`shot-1080p.png` (game screenshot), `shot-terminal.png` (text-heavy),
+`Bildschirmfoto ... .png` (965x283 UI), `photo-phone.jpg` (3024x4032),
+`photo-big.jpg` (4191x6286), a phone HEIC (2268x4032), two 1080p GNOME
+screencasts (v01 7.4 s, v02 11.4 s), `obs-cut15s.mkv` (HEVC 1080p60, 15 s) and
+a generated 720p test clip.
+
+| Target, source | High: size, SSIM, text | Balanced: size, SSIM, text | Small: size, SSIM, text |
+|---|---|---|---|
+| JPG, game screenshot | 45 %, 0.967, - | 23 %, 0.932, - | 13 %, 0.900, - |
+| JPG, terminal | 64 %, 0.995, 0.989 | 42 %, 0.979, 0.957 | 29 %, 0.958, 0.918 |
+| JPG, UI | 53 %, 0.984, 0.982 | 32 %, 0.971, 0.967 | 22 %, 0.948, 0.941 |
+| JPG, phone photo / big photo / HEIC | 73 / 53 / 68 %, 0.984 / 0.986 / 0.981 | 41 / 26 / 40 %, 0.941 / 0.980 / 0.959 | 13 / 4 / 14 %, 0.928 / 0.969 / 0.931 |
+| WEBP, game screenshot | 69 %, 0.990, - | 51 %, 0.967, - | 23 %, 0.939, - |
+| WEBP, terminal | 85 %, 0.999, 1.000 | 77 %, 0.994, 0.996 | 75 %, 0.996, 1.000 |
+| WEBP, UI | 56 %, 0.993, 0.995 | 43 %, 0.978, 0.989 | 29 %, 0.991, 0.995 |
+| WEBP, phone photo / big photo / HEIC | 62 / 67 / 69 %, 0.927 / 0.976 / 0.956 | 34 / 46 / 44 %, 0.896 / 0.971 / 0.929 | 9 / 9 / 15 %, 0.915 / 0.964 / 0.896 |
+| AVIF, game screenshot | 64 %, 0.966, - | 45 %, 0.951, - | 28 %, 0.922, - |
+| AVIF, terminal | 73 %, 0.998, 0.998 | 64 %, 0.998, 0.997 | 58 %, 0.996, 0.996 |
+| AVIF, UI | 73 %, 0.988, 0.994 | 60 %, 0.981, 0.984 | 50 %, 0.968, 0.951 |
+| AVIF, phone photo / big photo / HEIC | 82 / 60 / 57 %, 0.971 / 0.978 / 0.954 | 22 / 37 / 30 %, 0.876 / 0.972 / 0.917 | 6 / 6 / 8 %, 0.905 / 0.963 / 0.868 |
+| MP4 x264, v01 / v02 / obs / generated | 56 / 59 / 56 / 71 %, 0.985 / 0.991 / 0.990 / 0.997 | 31 / 34 / 33 / 37 %, 0.973 / 0.985 / 0.983 / 0.989 | 15 / 16 / 20 / 19 %, 0.941 / 0.967 / 0.974 / 0.979 |
+| MP4 openh264, v01 / v02 / generated | 61 / 81 / 62 %, 0.946 / 0.974 / 0.980 | 41 / 71 / 42 %, 0.915 / 0.969 / 0.971 | 26 / 60 / 32 %, 0.863 / 0.962 / 0.960 |
+| WebM, v01 / v02 / obs / generated | 62 / 57 / 52 / 68 %, 0.977 / 0.983 / 0.990 / 0.996 | 36 / 33 / 28 / 37 %, 0.960 / 0.975 / 0.986 / 0.991 | 18 / 20 / 16 / 17 %, 0.934 / 0.963 / 0.981 / 0.986 |
+| GIF, v01 / v02 / generated | 60 / 60 / 60 % | 41 / 44 / 39 % | 17 / 18 / 18 % |
+
+Best's own SSIM for reference: JPG 0.991 / 0.999 / 0.996 (game, terminal, UI),
+WEBP graphics 1.000, AVIF 0.978 / 0.999 / 0.991, x264 0.991 to 0.999.
+
+Where the numbers fall short of the intent, and why:
+
+* JPG of a screenshot cannot reach SSIM 0.985 at half of Best's size: q99 4:4:4
+  is a very high bar for a format that rings around text. High (q95) keeps text
+  at 0.98 to 0.99; Balanced and Small are visibly softer around small text
+  (terminal text crop 0.957 and 0.918). Use WEBP or AVIF for screenshots.
+* WEBP and AVIF of flat graphics shrink little (terminal: 58 to 85 % of Best)
+  because Best is already tiny there; the larger savings are on game-like
+  screenshots and photos.
+* Photographs with fine sensor noise (the phone photo) lose SSIM fast under
+  WEBP/AVIF at Balanced and Small because the noise is smoothed away; the
+  picture still looks clean. SSIM is a harsh judge of that.
+* libopenh264 has no constant-quality mode, only a target bitrate, so the
+  presets scale the bitrate and the size follows the content: a low-motion
+  screencast at 25 % of Best's bitrate is still 60 % of its size. libx264 is
+  the main path and behaves as the table shows.
 
 ## Dependencies
 
@@ -311,7 +409,8 @@ and are only honoured when set.
   documents one at a time.
 * **Notifications**: a "Converting..." notification, replaced by a summary
   ("Converted 3 files to MP4") or, on failure, the file name and the last line
-  of the tool's error output.
+  of the tool's error output. A preset other than Best is named: "Converted 3
+  files to JPG (Balanced)", "photo.png → photo.jpg (Small)".
 * **Output cap**: a tool's stdout and stderr are read incrementally and only the
   last 64 KiB of each is kept, so a tool that prints without end cannot grow
   memory, the log or the notification (the toast text is also shortened to
@@ -365,7 +464,10 @@ meson test -C build
   `NautilusMenuProvider`, then drives the real menu provider with fake
   `NautilusFileInfo` objects (single file, same-category selection, mixed
   categories, directory, non-`file://` URI, unknown type, an invalid entry in
-  the middle of the list).
+  the middle of the list); and the preset menus: JPG/WEBP/AVIF/MP4/WebM/GIF are
+  submenus with the items Best, High, Balanced, Small (names `...::<preset>`, a
+  tooltip each), PNG, BMP, MP3, MKV and the rest are plain items, also for a
+  multi-file selection.
 * `module-probe-freeze`: the same, end to end, with a hanging fake `ffmpeg`
   first in `PATH`: right-clicking a `.txt` returns in microseconds.
 * `conversions`: generates fixtures with ImageMagick / ffmpeg / LibreOffice,
@@ -393,6 +495,13 @@ meson test -C build
   and 300 and 96 dpi ones are converted to PDF; `pdfinfo` must show an A4-sized
   page for the ones without density and the source resolution for the others,
   and `pdfimages -list` the original pixel size.
+  Presets: every preset-capable target is converted once per preset from a
+  screenshot-like and a photo fixture (real type checked, sizes must not grow
+  from Best to Small), Small must shrink a 3200 px image to 2560 and 1440p/portrait
+  video to 1080p while the other presets leave the size alone, and a batch with a
+  fake `notify-send` must name the preset in both banners. `core-logic` holds the
+  exact arguments of every target x preset x source class and a hard-coded copy of
+  the previous (Best) commands.
 
 ## License
 

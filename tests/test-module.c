@@ -10,6 +10,21 @@
 #include <nautilus-extension.h>
 #include <string.h>
 
+/* LeakSanitizer: libnautilus-extension's NautilusMenu keeps a reference to every
+ * item appended to it and never releases it (even when the menu itself is
+ * finalized), so every menu item an extension builds is leaked by the library,
+ * whoever frees the lists it hands out. Items that have a signal handler stay
+ * reachable through GLib's handler table and are not reported; the target items
+ * with a preset submenu (no handler) would be. They are the library's leak, not
+ * ours: the extension unrefs everything it creates. */
+const char *__lsan_default_suppressions (void);
+const char *
+__lsan_default_suppressions (void)
+{
+  return "leak:nautilus_menu_item_new\n";
+}
+
+
 /* ---- minimal GTypeModule ---- */
 typedef struct { GTypeModule parent; } TestModule;
 typedef struct { GTypeModuleClass parent; } TestModuleClass;
@@ -74,6 +89,26 @@ static const char *module_path;
 static GObject *provider;
 static char *work;
 
+/* Frees a list from nautilus_menu_get_items the way Nautilus does: a menu does not
+ * release its items itself, whoever takes them releases them, and the items of
+ * nested menus first. */
+static void
+free_items_deep (GList *items)
+{
+  for (GList *l = items; l; l = l->next)
+    {
+      NautilusMenu *sub = NULL;
+
+      g_object_get (l->data, "menu", &sub, NULL);
+      if (sub != NULL)
+        {
+          free_items_deep (nautilus_menu_get_items (sub));
+          g_object_unref (sub);
+        }
+    }
+  nautilus_menu_item_list_free (items);
+}
+
 /* returns the submenu labels joined by ',' or NULL when there is no menu */
 static void
 write_script (const char *path, const char *body)
@@ -116,7 +151,7 @@ menu_labels (GList *infos)
         g_string_append (s, lab);
         g_free (lab);
       }
-    nautilus_menu_item_list_free (sub_items);
+    free_items_deep (sub_items);
   }
   g_free (label);
   g_object_unref (sub);
@@ -167,6 +202,220 @@ has_label (const char *labels, const char *l)
 
   g_strfreev (v);
   return r;
+}
+
+
+/* The items of the "Convert to" submenu (release with free_items_deep),
+ * or NULL when there is no menu. */
+static GList *
+submenu_items (GList *infos)
+{
+  GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
+  NautilusMenu *sub = NULL;
+  GList *sub_items;
+
+  if (items == NULL)
+    return NULL;
+  g_assert_cmpuint (g_list_length (items), ==, 1);
+  g_object_get (items->data, "menu", &sub, NULL);
+  g_assert_nonnull (sub);
+  sub_items = nautilus_menu_get_items (sub);
+  g_object_unref (sub);
+  nautilus_menu_item_list_free (items);
+  return sub_items;
+}
+
+static GList *
+submenu_items_wait (GList *infos)
+{
+  GList *items = submenu_items (infos);
+
+  for (int i = 0; i < 250 && items == NULL; i++)
+    {
+      g_usleep (20000);
+      items = submenu_items (infos);
+    }
+  return items;
+}
+
+static char *
+item_prop (gpointer item, const char *prop)
+{
+  char *v = NULL;
+
+  g_object_get (item, prop, &v, NULL);
+  return v;
+}
+
+/* the item of this name, or NULL */
+static NautilusMenuItem *
+find_item (GList *items, const char *name)
+{
+  for (GList *l = items; l; l = l->next)
+    {
+      char *n = item_prop (l->data, "name");
+      gboolean hit = g_strcmp0 (n, name) == 0;
+
+      g_free (n);
+      if (hit)
+        return l->data;
+    }
+  return NULL;
+}
+
+/* The item has a submenu with exactly Best, High, Balanced, Small, named
+ * "<name>::best" ... and with a tooltip each. */
+static void
+assert_preset_submenu (NautilusMenuItem *item, const char *name)
+{
+  static const char *const keys[] = { "best", "high", "balanced", "small" };
+  static const char *const labels[] = { "Best", "High", "Balanced", "Small" };
+  NautilusMenu *sub = NULL;
+  GList *sub_items;
+  guint i = 0;
+
+  g_assert_nonnull (item);
+  g_object_get (item, "menu", &sub, NULL);
+  g_assert_nonnull (sub);
+  sub_items = nautilus_menu_get_items (sub);
+  g_assert_cmpuint (g_list_length (sub_items), ==, 4);
+  for (GList *l = sub_items; l; l = l->next, i++)
+    {
+      char *n = item_prop (l->data, "name"), *lab = item_prop (l->data, "label");
+      char *tip = item_prop (l->data, "tip"), *want = g_strconcat (name, "::", keys[i], NULL);
+      NautilusMenu *none = NULL;
+
+      g_assert_cmpstr (n, ==, want);
+      g_assert_cmpstr (lab, ==, labels[i]);
+      g_assert_nonnull (tip);
+      g_assert_true (g_str_has_prefix (tip, labels[i]));
+      g_object_get (l->data, "menu", &none, NULL);
+      g_assert_null (none); /* the presets are leaves */
+      g_free (n); g_free (lab); g_free (tip); g_free (want);
+    }
+  nautilus_menu_item_list_free (sub_items); /* the copy: the menu keeps its own items */
+  g_object_unref (sub);
+}
+
+static gboolean
+item_is_leaf (NautilusMenuItem *item)
+{
+  NautilusMenu *sub = NULL;
+
+  g_assert_nonnull (item);
+  g_object_get (item, "menu", &sub, NULL);
+  if (sub != NULL)
+    g_object_unref (sub);
+  return sub == NULL;
+}
+
+/* Quality presets in the real menu: JPG, WEBP, AVIF, MP4, WebM and GIF are
+ * submenus Best/High/Balanced/Small; PNG, BMP, MP3, MKV... are plain items. A
+ * multi-file selection gets the same menu. What is offered depends on the tools
+ * installed (the probes), so each target is checked when it is there. */
+static void
+test_preset_menus (void)
+{
+  GList *items, *l;
+  char *u1, *u2;
+  NautilusMenuItem *it;
+
+  touch ("p1.png"); touch ("p2.png"); touch ("p3.jpg"); touch ("p4.wav"); touch ("p5.mkv");
+  touch ("p6.mp4");
+
+  /* single PNG: JPG (and WEBP, AVIF when offered) have presets; BMP/TIFF/PDF/ICO none */
+  u1 = path_uri ("p1.png");
+  l = g_list_append (NULL, fake_new (u1, "image/png", FALSE));
+  items = submenu_items_wait (l);
+  g_assert_nonnull (items);
+  assert_preset_submenu (find_item (items, "FileConverter::image::jpg"),
+                         "FileConverter::image::jpg");
+  if ((it = find_item (items, "FileConverter::image::webp")) != NULL)
+    assert_preset_submenu (it, "FileConverter::image::webp");
+  if ((it = find_item (items, "FileConverter::image::avif")) != NULL)
+    assert_preset_submenu (it, "FileConverter::image::avif");
+  for (const char *const *k = (const char *const[]) { "bmp", "tiff", "pdf", "ico", NULL }; *k; k++)
+    {
+      char *name = g_strconcat ("FileConverter::image::", *k, NULL);
+
+      if ((it = find_item (items, name)) != NULL)
+        g_assert_true (item_is_leaf (it));
+      g_free (name);
+    }
+  g_assert_null (find_item (items, "FileConverter::image::png")); /* own format */
+  free_items_deep (items);
+
+  /* two PNGs: the same menu */
+  u2 = path_uri ("p2.png");
+  l = g_list_append (l, fake_new (u2, "image/png", FALSE));
+  items = submenu_items_wait (l);
+  g_assert_nonnull (items);
+  assert_preset_submenu (find_item (items, "FileConverter::image::jpg"),
+                         "FileConverter::image::jpg");
+  free_items_deep (items);
+  g_list_free_full (l, g_object_unref);
+  g_free (u1);
+  g_free (u2);
+
+  /* a JPEG: PNG and BMP are plain items, no JPG at all */
+  u1 = path_uri ("p3.jpg");
+  l = g_list_append (NULL, fake_new (u1, "image/jpeg", FALSE));
+  items = submenu_items_wait (l);
+  g_assert_nonnull (items);
+  g_assert_null (find_item (items, "FileConverter::image::jpg"));
+  g_assert_true (item_is_leaf (find_item (items, "FileConverter::image::png")));
+  g_assert_true (item_is_leaf (find_item (items, "FileConverter::image::bmp")));
+  assert_preset_submenu (find_item (items, "FileConverter::image::webp"),
+                         "FileConverter::image::webp");
+  free_items_deep (items);
+  g_list_free_full (l, g_object_unref);
+  g_free (u1);
+
+  /* audio: nothing has presets */
+  u1 = path_uri ("p4.wav");
+  l = g_list_append (NULL, fake_new (u1, "audio/x-wav", FALSE));
+  items = submenu_items_wait (l);
+  if (items != NULL)
+    {
+      for (GList *i = items; i; i = i->next)
+        g_assert_true (item_is_leaf (i->data));
+      if ((it = find_item (items, "FileConverter::audio::mp3")) != NULL)
+        g_assert_true (item_is_leaf (it));
+      free_items_deep (items);
+    }
+  g_list_free_full (l, g_object_unref);
+  g_free (u1);
+
+  /* video: MP4, WebM, GIF have presets, MKV and the audio-only targets do not */
+  u1 = path_uri ("p5.mkv");
+  l = g_list_append (NULL, fake_new (u1, "video/x-matroska", FALSE));
+  items = submenu_items_wait (l);
+  if (items != NULL)
+    {
+      if ((it = find_item (items, "FileConverter::video::mp4")) != NULL)
+        assert_preset_submenu (it, "FileConverter::video::mp4");
+      if ((it = find_item (items, "FileConverter::video::webm")) != NULL)
+        assert_preset_submenu (it, "FileConverter::video::webm");
+      if ((it = find_item (items, "FileConverter::video::gif")) != NULL)
+        assert_preset_submenu (it, "FileConverter::video::gif");
+      if ((it = find_item (items, "FileConverter::video::mp3")) != NULL)
+        g_assert_true (item_is_leaf (it));
+      g_assert_null (find_item (items, "FileConverter::video::mkv")); /* own format */
+      free_items_deep (items);
+    }
+  g_list_free_full (l, g_object_unref);
+  g_free (u1);
+  u1 = path_uri ("p6.mp4");
+  l = g_list_append (NULL, fake_new (u1, "video/mp4", FALSE));
+  items = submenu_items_wait (l);
+  if (items != NULL)
+    {
+      if ((it = find_item (items, "FileConverter::video::mkv")) != NULL)
+        g_assert_true (item_is_leaf (it));
+      free_items_deep (items);
+    }
+  g_list_free_full (l, g_object_unref);
+  g_free (u1);
 }
 
 static void
@@ -350,6 +599,8 @@ test_register_and_menu (void)
   g_assert_null (menu_labels (l));
   g_list_free_full (l, g_object_unref);
   g_free (u1); g_free (u2);
+
+  test_preset_menus ();
 
   /* no background items */
   {

@@ -17,6 +17,12 @@ void  nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
                               GAsyncReadyCallback callback, gpointer user_data);
 char *nfc_convert_file_finish (GAsyncResult *result, GError **error);
 
+/* The same with a quality preset (BEST = nfc_convert_file_async). A preset on a
+ * target without presets (see nfc_target_has_presets) is ignored. */
+void  nfc_convert_file_preset_async (NfcCategory cat, const char *fmt, const char *key,
+                                     NfcPreset preset, const char *ext, const char *src,
+                                     GAsyncReadyCallback callback, gpointer user_data);
+
 typedef struct {
   char    *path;
   gboolean ok;
@@ -35,6 +41,13 @@ void nfc_batch_run (NfcCategory cat, const char *key, const char *label,
                     const char *ext, const char *const *paths,
                     const char *const *fmts, guint n,
                     NfcBatchDone done, gpointer user_data);
+
+/* nfc_batch_run with a quality preset: the notifications name it when it is not
+ * Best ("Converted 3 files to JPG (Balanced)"). */
+void nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset,
+                           const char *label, const char *ext, const char *const *paths,
+                           const char *const *fmts, guint n,
+                           NfcBatchDone done, gpointer user_data);
 
 /* Module shutdown: kill the process groups of all in-flight conversions,
  * remove their work directories and hidden temp files (best effort), and

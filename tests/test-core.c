@@ -1027,6 +1027,544 @@ test_h264_encoders (void)
   }
 }
 
+
+/* ---- Best == the argv of 729ab89 (before the quality presets existed) ----
+ *
+ * The strings are what nfc_build_attempts_info produced then (fake tool paths,
+ * the "-limit" options removed because they depend on the machine's RAM):
+ * attempts separated by " ## ", the steps of an attempt by " && ". Best must
+ * never change: it is what existing users get. */
+static const struct {
+  const char *label;
+  NfcCategory cat;
+  const char *fmt, *key;
+  int enc;          /* 0: libx264, 1: libopenh264, 2: both */
+  gboolean hd;      /* 1920x1080 probe info */
+  const char *argv;
+} golden[] = {
+  { "jpg-png", NFC_CAT_IMAGE, "png", "jpg", 0, FALSE,
+    "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -background white -alpha remove -alpha off -quality 99 -sampling-factor 4:4:4 JPEG:/o/x.jpg"
+  },
+  { "jpg-jpg", NFC_CAT_IMAGE, "jpg", "jpg", 0, FALSE,
+    "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -background white -alpha remove -alpha off -quality 95 -sampling-factor 4:4:4 JPEG:/o/x.jpg"
+  },
+  { "jpg-heic", NFC_CAT_IMAGE, "heic", "jpg", 0, FALSE,
+    "/bin/nfc-decode /s/a.heic /w/decoded.png && /bin/magick -quiet PNG:/w/decoded.png[0] -auto-orient -background white -alpha remove -alpha off -quality 95 -sampling-factor 4:4:4 JPEG:/o/x.jpg"
+  },
+  { "jpg-svg", NFC_CAT_IMAGE, "svg", "jpg", 0, FALSE,
+    "/bin/magick -quiet -background none -density 192 MSVG:/s/a.svg[0] -auto-orient -background white -alpha remove -alpha off -quality 99 -sampling-factor 4:4:4 JPEG:/o/x.jpg"
+  },
+  { "webp-png", NFC_CAT_IMAGE, "png", "webp", 0, FALSE,
+    "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -resize 16383x16383> -define webp:lossless=true -define webp:method=4 WEBP:/o/x.webp"
+  },
+  { "webp-jpg", NFC_CAT_IMAGE, "jpg", "webp", 0, FALSE,
+    "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -resize 16383x16383> -quality 90 -define webp:method=6 -define webp:sharp-yuv=true WEBP:/o/x.webp"
+  },
+  { "avif-png", NFC_CAT_IMAGE, "png", "avif", 0, FALSE,
+    "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -background white -alpha remove -alpha off PNG:/w/flat.png && /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /w/flat.png -frames:v 1 -vf scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv444p -c:v libaom-av1 -crf 9 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 1 -colorspace bt709 -color_primaries bt709 -color_range pc -f avif /o/x.avif"
+    " ## /bin/magick -quiet PNG:/s/a.png[0] -auto-orient -background white -alpha remove -alpha off PNG:/w/flat.png && /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /w/flat.png -frames:v 1 -vf scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv420p -c:v libaom-av1 -crf 12 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 1 -colorspace bt709 -color_primaries bt709 -color_range pc -f avif /o/x.avif"
+  },
+  { "avif-jpg", NFC_CAT_IMAGE, "jpg", "avif", 0, FALSE,
+    "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -background white -alpha remove -alpha off PNG:/w/flat.png && /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /w/flat.png -frames:v 1 -vf scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv420p -c:v libaom-av1 -crf 12 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 1 -colorspace bt709 -color_primaries bt709 -color_range pc -f avif /o/x.avif"
+  },
+  { "avif-heic", NFC_CAT_IMAGE, "heic", "avif", 0, FALSE,
+    "/bin/nfc-decode /s/a.heic /w/decoded.png && /bin/magick -quiet PNG:/w/decoded.png[0] -auto-orient -background white -alpha remove -alpha off PNG:/w/flat.png && /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /w/flat.png -frames:v 1 -vf scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv420p -c:v libaom-av1 -crf 12 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 1 -colorspace bt709 -color_primaries bt709 -color_range pc -f avif /o/x.avif"
+  },
+  { "mp4-x264", NFC_CAT_VIDEO, "mkv", "mp4", 0, TRUE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mkv -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4"
+  },
+  { "webm", NFC_CAT_VIDEO, "mp4", "webm", 0, FALSE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -c:v libvpx-vp9 -crf 28 -b:v 0 -row-mt 1 -deadline good -cpu-used 2 -pix_fmt yuv420p -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:a libopus -b:a 128k /o/x.webm"
+  },
+  { "gif", NFC_CAT_VIDEO, "mp4", "gif", 0, FALSE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -an -sn -dn -vf fps=15,scale='min(960,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle -loop 0 /o/x.gif"
+  },
+  { "mkv-x264", NFC_CAT_VIDEO, "mp4", "mkv", 0, TRUE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -c copy /o/x.mkv"
+    " ## /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k /o/x.mkv"
+  },
+  { "mp4-oh264", NFC_CAT_VIDEO, "mkv", "mp4", 1, TRUE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mkv -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libopenh264 -rc_mode bitrate -b:v 6220800 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4"
+  },
+  { "mp4-oh264-noinfo", NFC_CAT_VIDEO, "mkv", "mp4", 1, FALSE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mkv -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libopenh264 -rc_mode bitrate -b:v 6220800 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4"
+  },
+  { "mp4-both", NFC_CAT_VIDEO, "mkv", "mp4", 2, TRUE,
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mkv -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4"
+    " ## /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mkv -map 0:v:0 -map 0:a:0? -sn -dn -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libopenh264 -rc_mode bitrate -b:v 6220800 -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4"
+  },
+};
+
+/* ------------------------------------------------------------------------
+ * Quality presets
+ * --------------------------------------------------------------------- */
+
+/* attempts as one string: " ## " between attempts, " && " between steps, the
+ * "-limit <what> <value>" options removed (they depend on the machine's RAM) */
+static char *
+attempts_string (GPtrArray *at)
+{
+  GString *s = g_string_new (NULL);
+
+  for (guint i = 0; i < at->len; i++)
+    {
+      GPtrArray *a = at->pdata[i];
+
+      if (i)
+        g_string_append (s, " ## ");
+      for (guint j = 0; j < a->len; j++)
+        {
+          char **argv = a->pdata[j];
+
+          if (j)
+            g_string_append (s, " && ");
+          for (guint k = 0; argv[k]; k++)
+            {
+              if (g_str_equal (argv[k], "-limit"))
+                {
+                  k += 2;
+                  continue;
+                }
+              g_string_append_printf (s, "%s%s", k ? " " : "", argv[k]);
+            }
+        }
+    }
+  return g_string_free (s, FALSE);
+}
+
+static void
+use_fake_tools (void)
+{
+  nfc_tools_init ();
+  g_free (nfc_tools.magick); g_free (nfc_tools.ffmpeg); g_free (nfc_tools.decode);
+  nfc_tools.magick = g_strdup ("/bin/magick");
+  nfc_tools.ffmpeg = g_strdup ("/bin/ffmpeg");
+  nfc_tools.decode = g_strdup ("/bin/nfc-decode");
+}
+
+static void
+set_encoders (int enc)
+{
+  nfc_test_set_encoders (enc == 1 ? ENC_HEADER ENC_OH264 ENC_OTHER
+                         : enc == 2 ? ENC_HEADER ENC_X264 ENC_OH264 ENC_OTHER
+                         : ENC_HEADER ENC_X264 ENC_OTHER);
+}
+
+static GPtrArray *
+build (NfcCategory cat, const char *fmt, const char *key, NfcPreset preset, gboolean hd)
+{
+  NfcImageInfo hd_info = { 1920, 1080, FALSE, 0, 0 };
+  char *src = g_strdup_printf ("/s/a.%s", fmt), *out = g_strdup_printf ("/o/x.%s", key);
+  gboolean dec;
+  GPtrArray *at = nfc_build_attempts_preset (cat, fmt, key, preset, src, out, "/w",
+                                             hd ? &hd_info : NULL, &dec);
+
+  g_free (src);
+  g_free (out);
+  g_assert_nonnull (at);
+  return at;
+}
+
+/* the argv string of the first attempt */
+static char *
+build_str (NfcCategory cat, const char *fmt, const char *key, NfcPreset preset, gboolean hd)
+{
+  GPtrArray *at = build (cat, fmt, key, preset, hd);
+  char *s = attempts_string (at);
+
+  g_ptr_array_unref (at);
+  return s;
+}
+
+/* the last step of attempt i (the ImageMagick / ffmpeg encode command) */
+static char **
+last_step (GPtrArray *at, guint i)
+{
+  GPtrArray *a = at->pdata[i];
+
+  return a->pdata[a->len - 1];
+}
+
+static gboolean
+argv_has_prefix (char **argv, const char *prefix)
+{
+  for (; *argv; argv++)
+    if (g_str_has_prefix (*argv, prefix))
+      return TRUE;
+  return FALSE;
+}
+
+#define BEST NFC_PRESET_BEST
+#define HIGH NFC_PRESET_HIGH
+#define BAL NFC_PRESET_BALANCED
+#define SMALL NFC_PRESET_SMALL
+
+/* Best is exactly what 729ab89 produced, through the old and the new API */
+static void
+test_best_argv_unchanged (void)
+{
+  use_fake_tools ();
+  for (guint i = 0; i < G_N_ELEMENTS (golden); i++)
+    {
+      NfcImageInfo hd_info = { 1920, 1080, FALSE, 0, 0 };
+      char *src = g_strdup_printf ("/s/a.%s", golden[i].fmt);
+      char *out = g_strdup_printf ("/o/x.%s", golden[i].key), *s;
+      gboolean dec;
+      GPtrArray *at;
+
+      set_encoders (golden[i].enc);
+      at = nfc_build_attempts_info (golden[i].cat, golden[i].fmt, golden[i].key, src, out, "/w",
+                                    golden[i].hd ? &hd_info : NULL, &dec);
+      g_assert_nonnull (at);
+      s = attempts_string (at);
+      g_assert_cmpstr (s, ==, golden[i].argv);
+      g_free (s);
+      g_ptr_array_unref (at);
+
+      at = nfc_build_attempts_preset (golden[i].cat, golden[i].fmt, golden[i].key, BEST, src, out,
+                                      "/w", golden[i].hd ? &hd_info : NULL, &dec);
+      g_assert_nonnull (at);
+      s = attempts_string (at);
+      g_assert_cmpstr (s, ==, golden[i].argv);
+      g_free (s);
+      g_ptr_array_unref (at);
+      g_free (src);
+      g_free (out);
+    }
+  nfc_test_set_encoders ("");
+}
+
+static void
+test_preset_names (void)
+{
+  static const char *const keys[] = { "best", "high", "balanced", "small" };
+  static const char *const labels[] = { "Best", "High", "Balanced", "Small" };
+  NfcPreset p;
+
+  g_assert_cmpuint (NFC_PRESET_N, ==, 4);
+  for (guint i = 0; i < 4; i++)
+    {
+      g_assert_cmpstr (nfc_preset_key ((NfcPreset) i), ==, keys[i]);
+      g_assert_cmpstr (nfc_preset_label ((NfcPreset) i), ==, labels[i]);
+      g_assert_true (nfc_preset_from_key (keys[i], &p));
+      g_assert_cmpint (p, ==, (int) i);
+    }
+  g_assert_false (nfc_preset_from_key ("ultra", &p));
+  g_assert_false (nfc_preset_from_key (NULL, &p));
+  g_assert_false (nfc_preset_from_key ("Best", &p)); /* the key, not the label */
+
+  /* which targets have presets */
+  {
+    const char *const image_yes[] = { "jpg", "webp", "avif" };
+    const char *const image_no[] = { "png", "bmp", "tiff", "ico", "pdf" };
+    const char *const video_yes[] = { "mp4", "webm", "gif" };
+    const char *const video_no[] = { "mkv", "mp3", "m4a" };
+    const char *const audio_no[] = { "mp3", "flac", "wav", "ogg", "opus", "m4a" };
+    const char *const doc_no[] = { "pdf", "docx", "odt", "xlsx", "ods", "csv", "pptx", "odp" };
+
+    for (guint i = 0; i < G_N_ELEMENTS (image_yes); i++)
+      g_assert_true (nfc_target_has_presets (NFC_CAT_IMAGE, image_yes[i]));
+    for (guint i = 0; i < G_N_ELEMENTS (image_no); i++)
+      g_assert_false (nfc_target_has_presets (NFC_CAT_IMAGE, image_no[i]));
+    for (guint i = 0; i < G_N_ELEMENTS (video_yes); i++)
+      g_assert_true (nfc_target_has_presets (NFC_CAT_VIDEO, video_yes[i]));
+    for (guint i = 0; i < G_N_ELEMENTS (video_no); i++)
+      g_assert_false (nfc_target_has_presets (NFC_CAT_VIDEO, video_no[i]));
+    for (guint i = 0; i < G_N_ELEMENTS (audio_no); i++)
+      g_assert_false (nfc_target_has_presets (NFC_CAT_AUDIO, audio_no[i]));
+    for (guint i = 0; i < G_N_ELEMENTS (doc_no); i++)
+      {
+        g_assert_false (nfc_target_has_presets (NFC_CAT_DOC, doc_no[i]));
+        g_assert_false (nfc_target_has_presets (NFC_CAT_SHEET, doc_no[i]));
+        g_assert_false (nfc_target_has_presets (NFC_CAT_SLIDE, doc_no[i]));
+      }
+    g_assert_false (nfc_target_has_presets (NFC_CAT_IMAGE, NULL));
+    /* a format key of the other category is not a target of this one */
+    g_assert_false (nfc_target_has_presets (NFC_CAT_IMAGE, "mp4"));
+    g_assert_false (nfc_target_has_presets (NFC_CAT_VIDEO, "jpg"));
+
+    /* tooltips: one per preset, starting with its label; Small says what it scales */
+    for (guint i = 0; i < G_N_ELEMENTS (image_yes); i++)
+      for (guint p2 = 0; p2 < NFC_PRESET_N; p2++)
+        {
+          const char *tip = nfc_preset_tooltip (NFC_CAT_IMAGE, image_yes[i], (NfcPreset) p2);
+
+          g_assert_true (g_str_has_prefix (tip, nfc_preset_label ((NfcPreset) p2)));
+          g_assert_true (p2 != NFC_PRESET_SMALL || strstr (tip, "2560") != NULL);
+        }
+    g_assert_nonnull (strstr (nfc_preset_tooltip (NFC_CAT_VIDEO, "mp4", SMALL), "1080p"));
+    g_assert_nonnull (strstr (nfc_preset_tooltip (NFC_CAT_VIDEO, "webm", SMALL), "1080p"));
+    g_assert_nonnull (strstr (nfc_preset_tooltip (NFC_CAT_VIDEO, "gif", SMALL), "480 px"));
+    g_assert_nonnull (strstr (nfc_preset_tooltip (NFC_CAT_VIDEO, "gif", HIGH), "720 px"));
+    g_assert_cmpstr (nfc_preset_tooltip (NFC_CAT_IMAGE, "png", HIGH), ==, "");
+  }
+}
+
+static void
+test_preset_jpg (void)
+{
+  static const char *const q_graphics[] = { "99", "95", "85", "75" };
+  static const char *const s_graphics[] = { "4:4:4", "4:4:4", "4:4:4", "4:2:0" };
+  static const char *const q_photo[] = { "95", "92", "80", "70" };
+  static const char *const s_photo[] = { "4:4:4", "4:2:0", "4:2:0", "4:2:0" };
+
+  use_fake_tools ();
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    for (int photo = 0; photo < 2; photo++)
+      {
+        GPtrArray *at = build (NFC_CAT_IMAGE, photo ? "jpg" : "png", "jpg", (NfcPreset) p, FALSE);
+        char **argv;
+
+        g_assert_cmpuint (at->len, ==, 1);
+        argv = last_step (at, 0);
+        g_assert_cmpstr (argv_after (argv, "-quality"), ==, (photo ? q_photo : q_graphics)[p]);
+        g_assert_cmpstr (argv_after (argv, "-sampling-factor"), ==,
+                         (photo ? s_photo : s_graphics)[p]);
+        g_assert_cmpint (argv_has (argv, "-interlace"), ==, p != BEST);
+        g_assert_cmpint (argv_has (argv, "-resize"), ==, p == SMALL);
+        if (p == SMALL)
+          g_assert_cmpstr (argv_after (argv, "-resize"), ==, "2560x2560>");
+        g_assert_true (argv_has (argv, "-alpha")); /* still flattened onto white */
+        g_ptr_array_unref (at);
+      }
+}
+
+static void
+test_preset_webp (void)
+{
+  static const char *const q_photo[] = { "90", "85", "78", "65" };
+
+  use_fake_tools ();
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    {
+      GPtrArray *at = build (NFC_CAT_IMAGE, "jpg", "webp", (NfcPreset) p, FALSE);
+      char **argv = last_step (at, 0);
+
+      /* photos: lossy, lower quality per preset, method 6 + sharp YUV throughout */
+      g_assert_cmpstr (argv_after (argv, "-quality"), ==, q_photo[p]);
+      g_assert_true (argv_has (argv, "webp:method=6"));
+      g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
+      g_assert_false (argv_has (argv, "webp:lossless=true"));
+      g_assert_cmpstr (argv_after (argv, "-resize"), ==, p == SMALL ? "2560x2560>" : "16383x16383>");
+      g_ptr_array_unref (at);
+
+      /* graphics: always lossless (never larger than Best): fewer bits (High 6,
+       * Balanced 5 per channel) or a 128-colour palette (Small) */
+      at = build (NFC_CAT_IMAGE, "png", "webp", (NfcPreset) p, FALSE);
+      argv = last_step (at, 0);
+      g_assert_true (argv_has (argv, "webp:lossless=true"));
+      g_assert_true (argv_has (argv, "webp:method=4"));
+      g_assert_false (argv_has (argv, "-quality"));
+      g_assert_cmpstr (argv_after (argv, "-depth"), ==, p == HIGH ? "6" : p == BAL ? "5" : NULL);
+      g_assert_cmpint (argv_has (argv, "-colors"), ==, p == SMALL);
+      if (p == SMALL)
+        {
+          g_assert_cmpstr (argv_after (argv, "-colors"), ==, "128");
+          g_assert_true (argv_has (argv, "+dither"));
+        }
+      g_assert_cmpstr (argv_after (argv, "-resize"), ==, p == SMALL ? "2560x2560>" : "16383x16383>");
+      g_ptr_array_unref (at);
+    }
+}
+
+static void
+test_preset_avif (void)
+{
+  static const char *const crf_graphics[] = { "9", "18", "26", "34" };
+  static const char *const crf_photo[] = { "12", "20", "28", "36" };
+
+  use_fake_tools ();
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    {
+      GPtrArray *at = build (NFC_CAT_IMAGE, "png", "avif", (NfcPreset) p, FALSE);
+      GPtrArray *a0, *a1;
+      char **flat, **enc;
+
+      /* graphics: 4:4:4 at the graphics crf, then the photo settings as the fallback */
+      g_assert_cmpuint (at->len, ==, 2);
+      a0 = at->pdata[0];
+      a1 = at->pdata[1];
+      g_assert_cmpuint (a0->len, ==, 2);
+      flat = a0->pdata[0];
+      enc = a0->pdata[1];
+      g_assert_cmpstr (argv_after (enc, "-crf"), ==, crf_graphics[p]);
+      g_assert_true (argv_has_prefix (enc, "scale=out_color_matrix=bt709"));
+      g_assert_nonnull (strstr (argv_after (enc, "-vf"), "format=yuv444p"));
+      g_assert_cmpint (argv_has (flat, "-resize"), ==, p == SMALL);
+      if (p == SMALL)
+        g_assert_cmpstr (argv_after (flat, "-resize"), ==, "2560x2560>");
+      enc = ((GPtrArray *) a1)->pdata[1];
+      g_assert_cmpstr (argv_after (enc, "-crf"), ==, crf_photo[p]);
+      g_assert_nonnull (strstr (argv_after (enc, "-vf"), "format=yuv420p"));
+      g_ptr_array_unref (at);
+
+      at = build (NFC_CAT_IMAGE, "jpg", "avif", (NfcPreset) p, FALSE);
+      g_assert_cmpuint (at->len, ==, 1);
+      a0 = at->pdata[0];
+      enc = a0->pdata[1];
+      g_assert_cmpstr (argv_after (enc, "-crf"), ==, crf_photo[p]);
+      g_assert_nonnull (strstr (argv_after (enc, "-vf"), "format=yuv420p"));
+      g_assert_cmpint (argv_has (a0->pdata[0], "-resize"), ==, p == SMALL);
+      g_ptr_array_unref (at);
+    }
+}
+
+static void
+test_preset_video (void)
+{
+  static const char *const x264_crf[] = { "18", "23", "28", "34" };
+  static const char *const vp9_crf[] = { "28", "36", "44", "52" };
+  static const char *const oh264_bps[] = { "6220800", "3732480", "2488320", "1555200" };
+  static const struct { const char *fps, *width, *colors; } gif[] = {
+    { "fps=15,", "min(960,iw)", NULL }, { "fps=15,", "min(720,iw)", NULL },
+    { "fps=12,", "min(640,iw)", NULL }, { "fps=10,", "min(480,iw)", "max_colors=128" },
+  };
+
+  use_fake_tools ();
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    {
+      GPtrArray *at;
+      char **argv;
+      const char *vf;
+
+      /* MP4, libx264 */
+      set_encoders (0);
+      at = build (NFC_CAT_VIDEO, "mkv", "mp4", (NfcPreset) p, TRUE);
+      g_assert_cmpuint (at->len, ==, 1);
+      argv = last_step (at, 0);
+      g_assert_cmpstr (argv_after (argv, "-c:v"), ==, "libx264");
+      g_assert_cmpstr (argv_after (argv, "-crf"), ==, x264_crf[p]);
+      g_assert_cmpstr (argv_after (argv, "-preset"), ==, p == SMALL ? "medium" : "slow");
+      vf = argv_after (argv, "-vf");
+      g_assert_true (g_str_has_prefix (vf, "crop=trunc(iw/2)*2:trunc(ih/2)*2"));
+      g_assert_cmpint (strstr (vf, "scale=") != NULL, ==, p == SMALL);
+      g_assert_cmpstr (argv_after (argv, "-pix_fmt"), ==, "yuv420p");
+      g_assert_cmpstr (argv_after (argv, "-b:a"), ==, "192k");
+      g_assert_true (argv_has (argv, "+faststart"));
+      g_ptr_array_unref (at);
+
+      /* MP4, libopenh264: the bitrate scales with the preset (100/60/40/25 %) */
+      set_encoders (1);
+      at = build (NFC_CAT_VIDEO, "mkv", "mp4", (NfcPreset) p, TRUE);
+      g_assert_cmpuint (at->len, ==, 1);
+      argv = last_step (at, 0);
+      g_assert_cmpstr (argv_after (argv, "-c:v"), ==, "libopenh264");
+      g_assert_cmpstr (argv_after (argv, "-b:v"), ==, oh264_bps[p]);
+      g_assert_cmpint (strstr (argv_after (argv, "-vf"), "scale=") != NULL, ==, p == SMALL);
+      g_ptr_array_unref (at);
+      /* ... never below the 0.5 Mbit/s floor */
+      {
+        NfcImageInfo tiny = { 160, 120, FALSE, 0, 0 };
+        gboolean dec;
+
+        at = nfc_build_attempts_preset (NFC_CAT_VIDEO, "mkv", "mp4", SMALL, "/s/a.mkv", "/o/x.mp4",
+                                        "/w", &tiny, &dec);
+        g_assert_cmpstr (argv_after (last_step (at, 0), "-b:v"), ==, "500000");
+        g_ptr_array_unref (at);
+      }
+
+      /* both encoders: two attempts, each at the preset */
+      set_encoders (2);
+      at = build (NFC_CAT_VIDEO, "mkv", "mp4", (NfcPreset) p, TRUE);
+      g_assert_cmpuint (at->len, ==, 2);
+      g_assert_cmpstr (argv_after (last_step (at, 0), "-crf"), ==, x264_crf[p]);
+      g_assert_cmpstr (argv_after (last_step (at, 1), "-b:v"), ==, oh264_bps[p]);
+      g_ptr_array_unref (at);
+
+      /* WebM: VP9 crf; Small shrinks above 1080p */
+      at = build (NFC_CAT_VIDEO, "mp4", "webm", (NfcPreset) p, FALSE);
+      argv = last_step (at, 0);
+      g_assert_cmpstr (argv_after (argv, "-c:v"), ==, "libvpx-vp9");
+      g_assert_cmpstr (argv_after (argv, "-crf"), ==, vp9_crf[p]);
+      g_assert_cmpstr (argv_after (argv, "-deadline"), ==, "good");
+      g_assert_cmpint (strstr (argv_after (argv, "-vf"), "scale=") != NULL, ==, p == SMALL);
+      g_assert_cmpstr (argv_after (argv, "-c:a"), ==, "libopus");
+      g_ptr_array_unref (at);
+
+      /* GIF: width cap, frame rate, palette size */
+      at = build (NFC_CAT_VIDEO, "mp4", "gif", (NfcPreset) p, FALSE);
+      vf = argv_after (last_step (at, 0), "-vf");
+      g_assert_true (g_str_has_prefix (vf, gif[p].fps));
+      g_assert_nonnull (strstr (vf, gif[p].width));
+      g_assert_cmpint (strstr (vf, "max_colors=128") != NULL, ==, gif[p].colors != NULL);
+      g_assert_nonnull (strstr (vf, "palettegen=stats_mode=diff"));
+      g_assert_nonnull (strstr (vf, "paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"));
+      g_ptr_array_unref (at);
+    }
+  nfc_test_set_encoders ("");
+}
+
+/* Every preset of a preset-capable target gives a different command, and
+ * targets without presets ignore the preset altogether (one click, one result) */
+static void
+test_preset_distinct_and_ignored (void)
+{
+  static const struct { NfcCategory cat; const char *fmt, *key; } with[] = {
+    { NFC_CAT_IMAGE, "png", "jpg" }, { NFC_CAT_IMAGE, "jpg", "jpg" },
+    { NFC_CAT_IMAGE, "png", "webp" }, { NFC_CAT_IMAGE, "jpg", "webp" },
+    { NFC_CAT_IMAGE, "png", "avif" }, { NFC_CAT_IMAGE, "jpg", "avif" },
+    { NFC_CAT_VIDEO, "mkv", "mp4" }, { NFC_CAT_VIDEO, "mp4", "webm" },
+    { NFC_CAT_VIDEO, "mp4", "gif" },
+  };
+  static const struct { NfcCategory cat; const char *fmt, *key; } without[] = {
+    { NFC_CAT_IMAGE, "jpg", "png" }, { NFC_CAT_IMAGE, "png", "bmp" },
+    { NFC_CAT_IMAGE, "png", "tiff" }, { NFC_CAT_IMAGE, "png", "ico" },
+    { NFC_CAT_IMAGE, "png", "pdf" }, { NFC_CAT_VIDEO, "mp4", "mkv" },
+    { NFC_CAT_VIDEO, "mp4", "mp3" }, { NFC_CAT_VIDEO, "mp4", "m4a" },
+    { NFC_CAT_AUDIO, "wav", "mp3" }, { NFC_CAT_AUDIO, "wav", "flac" },
+    { NFC_CAT_AUDIO, "mp3", "wav" }, { NFC_CAT_AUDIO, "wav", "ogg" },
+    { NFC_CAT_AUDIO, "wav", "opus" }, { NFC_CAT_AUDIO, "wav", "m4a" },
+  };
+
+  use_fake_tools ();
+  set_encoders (0);
+  for (guint i = 0; i < G_N_ELEMENTS (with); i++)
+    {
+      char *s[NFC_PRESET_N];
+
+      for (int p = 0; p < NFC_PRESET_N; p++)
+        s[p] = build_str (with[i].cat, with[i].fmt, with[i].key, (NfcPreset) p, TRUE);
+      for (int p = 0; p < NFC_PRESET_N; p++)
+        for (int q = p + 1; q < NFC_PRESET_N; q++)
+          g_assert_cmpstr (s[p], !=, s[q]);
+      for (int p = 0; p < NFC_PRESET_N; p++)
+        g_free (s[p]);
+    }
+  for (guint i = 0; i < G_N_ELEMENTS (without); i++)
+    {
+      char *best = build_str (without[i].cat, without[i].fmt, without[i].key, BEST, TRUE);
+
+      for (int p = 1; p < NFC_PRESET_N; p++)
+        {
+          char *s = build_str (without[i].cat, without[i].fmt, without[i].key, (NfcPreset) p, TRUE);
+
+          g_assert_cmpstr (s, ==, best);
+          g_free (s);
+        }
+      g_free (best);
+    }
+  /* an out-of-range preset is Best */
+  {
+    char *best = build_str (NFC_CAT_IMAGE, "png", "jpg", BEST, FALSE);
+    char *bad = build_str (NFC_CAT_IMAGE, "png", "jpg", (NfcPreset) 99, FALSE);
+
+    g_assert_cmpstr (best, ==, bad);
+    g_free (best);
+    g_free (bad);
+  }
+  /* the MKV re-encode fallback stays at Best's quality for every preset */
+  {
+    char *best = build_str (NFC_CAT_VIDEO, "mp4", "mkv", BEST, TRUE);
+    char *small = build_str (NFC_CAT_VIDEO, "mp4", "mkv", SMALL, TRUE);
+
+    g_assert_cmpstr (best, ==, small);
+    g_assert_nonnull (strstr (best, "-crf 18"));
+    g_free (best);
+    g_free (small);
+  }
+  nfc_test_set_encoders ("");
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1044,6 +1582,13 @@ main (int argc, char **argv)
   g_test_add_func ("/core/spill-dir", test_spill_dir);
   g_test_add_func ("/core/ico-sizes", test_ico_sizes);
   g_test_add_func ("/core/h264-encoders", test_h264_encoders); /* last: fakes the encoder probe */
+  g_test_add_func ("/core/preset-names", test_preset_names);
+  g_test_add_func ("/core/best-argv-unchanged", test_best_argv_unchanged);
+  g_test_add_func ("/core/preset-jpg", test_preset_jpg);
+  g_test_add_func ("/core/preset-webp", test_preset_webp);
+  g_test_add_func ("/core/preset-avif", test_preset_avif);
+  g_test_add_func ("/core/preset-video", test_preset_video);
+  g_test_add_func ("/core/preset-distinct-and-ignored", test_preset_distinct_and_ignored);
   g_test_add_func ("/core/failure-message", test_failure_message);
   return g_test_run ();
 }

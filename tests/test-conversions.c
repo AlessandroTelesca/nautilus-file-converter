@@ -1048,6 +1048,280 @@ test_pdf_page_size (void)
   g_free (pdfinfo); g_free (pdfimages);
 }
 
+/* ---- quality presets ---- */
+
+static char *
+convert_preset_sync (NfcCategory cat, const char *fmt, const char *key, NfcPreset preset,
+                     const char *ext, const char *src, char **err)
+{
+  Wait w = { g_main_loop_new (NULL, FALSE), NULL, NULL };
+  char *out;
+
+  nfc_convert_file_preset_async (cat, fmt, key, preset, ext, src, on_done, &w);
+  g_main_loop_run (w.loop);
+  g_main_loop_unref (w.loop);
+  out = w.out;
+  if (err)
+    *err = w.error ? g_strdup (w.error->message) : NULL;
+  g_clear_error (&w.error);
+  return out;
+}
+
+static gint64
+file_size (const char *path)
+{
+  GStatBuf st;
+
+  return path != NULL && g_stat (path, &st) == 0 ? (gint64) st.st_size : -1;
+}
+
+/* "<w>x<h>" of the first frame / video stream of a file, or NULL */
+static char *
+dims_of (const char *path, gboolean video)
+{
+  char *out = NULL, *r = NULL;
+
+  if (video)
+    run (NULL, &out, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height", "-of", "csv=s=x:p=0", path, NULL);
+  else
+    {
+      char *p0 = g_strconcat (path, "[0]", NULL);
+
+      run (NULL, &out, "magick", "identify", "-format", "%wx%h", p0, NULL);
+      g_free (p0);
+    }
+  if (out != NULL)
+    r = g_strdup (g_strstrip (out));
+  g_free (out);
+  return r;
+}
+
+/* One real conversion per preset of src_name -> key (src in dir `dir`): the real
+ * type, and Best >= High >= Balanced >= Small in size (equal allowed, for inputs
+ * where a preset changes nothing). If small_dims is set, the picture size of the
+ * Small result is checked, and that of the Best result against other_dims. */
+static void
+check_presets (const char *dir, const char *src_name, const char *key, const char *small_dims,
+               const char *other_dims)
+{
+  char *src = g_build_filename (dir, src_name, NULL), *label;
+  NfcFormat f;
+  GPtrArray *tg;
+  const NfcTarget *t = NULL;
+  gint64 size[NFC_PRESET_N] = { 0 };
+  gboolean pass = TRUE;
+  GString *detail = g_string_new (NULL);
+
+  label = g_strdup_printf ("%s presets", key);
+  if (!nfc_classify (src, NULL, &f))
+    {
+      add_row (src_name, label, FALSE, "not classified");
+      goto out;
+    }
+  tg = nfc_targets_for (f.cat, f.fmt);
+  for (guint i = 0; i < tg->len; i++)
+    if (g_str_equal (((const NfcTarget *) tg->pdata[i])->key, key))
+      t = tg->pdata[i];
+  g_ptr_array_unref (tg);
+  if (t == NULL)
+    {
+      /* e.g. no libx264 / libvpx / libaom in this ffmpeg: nothing to test */
+      add_row (src_name, label, TRUE, "not offered by this system: skipped");
+      goto out;
+    }
+  g_assert_true (nfc_target_has_presets (f.cat, key));
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    {
+      char *err = NULL, *bad = NULL;
+      char *o = convert_preset_sync (f.cat, f.fmt, t->key, (NfcPreset) p, t->ext, src, &err);
+
+      if (o == NULL)
+        {
+          g_string_append_printf (detail, "%s: %s; ", nfc_preset_label ((NfcPreset) p),
+                                  err ? err : "failed");
+          pass = FALSE;
+        }
+      else
+        {
+          bad = check_type (t->ext, o);
+          size[p] = file_size (o);
+          if (bad != NULL || size[p] <= 0)
+            {
+              g_string_append_printf (detail, "%s: %s; ", nfc_preset_label ((NfcPreset) p),
+                                      bad ? bad : "empty");
+              pass = FALSE;
+            }
+          else
+            g_string_append_printf (detail, "%s %" G_GINT64_FORMAT " ", nfc_preset_label ((NfcPreset) p),
+                                    size[p]);
+          if (pass && small_dims != NULL && (p == NFC_PRESET_BEST || p == NFC_PRESET_SMALL))
+            {
+              char *d = dims_of (o, f.cat == NFC_CAT_VIDEO);
+              const char *want = p == NFC_PRESET_SMALL ? small_dims : other_dims;
+
+              if (g_strcmp0 (d, want) != 0)
+                {
+                  g_string_append_printf (detail, "(%s is %s, expected %s) ",
+                                          nfc_preset_label ((NfcPreset) p), d ? d : "?", want);
+                  pass = FALSE;
+                }
+              g_free (d);
+            }
+        }
+      g_free (bad);
+      g_free (err);
+      g_free (o);
+    }
+  if (pass)
+    for (int p = 1; p < NFC_PRESET_N; p++)
+      if (size[p] > size[p - 1])
+        {
+          g_string_append_printf (detail, "(%s is larger than %s) ",
+                                  nfc_preset_label ((NfcPreset) p),
+                                  nfc_preset_label ((NfcPreset) (p - 1)));
+          pass = FALSE;
+        }
+  add_row (src_name, label, pass, detail->str);
+out:
+  g_string_free (detail, TRUE);
+  g_free (label);
+  g_free (src);
+}
+
+/* Notification text: a preset other than Best is named, Best is not. */
+static void
+test_preset_notifications (const char *dir)
+{
+  char *ndir = g_dir_make_tmp ("nfc-notify-XXXXXX", NULL);
+  char *script = g_build_filename (ndir, "notify-send", NULL);
+  char *log = g_build_filename (ndir, "calls.log", NULL);
+  char *content = g_strdup_printf ("#!/bin/sh\necho \"$@\" >> '%s'\necho 4242\n", log);
+  char *saved = nfc_tools.notify;
+  struct { NfcPreset preset; guint n; const char *want_start, *want_done; } c[] = {
+    { NFC_PRESET_BALANCED, 2, " -- Converting… 2 files to JPG (Balanced)",
+      " -- Conversion complete Converted 2 files to JPG (Balanced)" },
+    { NFC_PRESET_SMALL, 1, " -- Converting… n1.png to JPG (Small)",
+      " -- Conversion complete n1.png → n1.jpg (Small)" },
+    { NFC_PRESET_BEST, 2, " -- Converting… 2 files to JPG\n",
+      " -- Conversion complete Converted 2 files to JPG\n" },
+  };
+
+  g_file_set_contents (script, content, -1, NULL);
+  g_chmod (script, 0755);
+  nfc_tools.notify = script;
+  for (guint k = 0; k < G_N_ELEMENTS (c); k++)
+    {
+      char *sub = g_strdup_printf ("%s/n%u", dir, k);
+      char *paths[3] = { NULL, NULL, NULL }, *fmts[] = { (char *) "png", (char *) "png", NULL };
+      char *src = g_build_filename (dir, "n.png", NULL), *data = NULL, *logged = NULL, *label;
+      gsize len;
+      gboolean pass = FALSE;
+
+      g_mkdir_with_parents (sub, 0755);
+      g_file_get_contents (src, &data, &len, NULL);
+      for (guint i = 0; i < c[k].n; i++)
+        {
+          char *name = g_strdup_printf ("n%u.png", i + 1);
+
+          paths[i] = g_build_filename (sub, name, NULL);
+          g_file_set_contents (paths[i], data, len, NULL);
+          g_free (name);
+        }
+      g_remove (log);
+      nfc_batch_run_preset (NFC_CAT_IMAGE, "jpg", c[k].preset, "JPG", "jpg",
+                            (const char *const *) paths, (const char *const *) fmts, c[k].n,
+                            NULL, NULL);
+      for (int i = 0; i < 500 && !pass; i++)
+        {
+          g_main_context_iteration (NULL, FALSE);
+          g_usleep (20000);
+          g_clear_pointer (&logged, g_free);
+          if (g_file_get_contents (log, &logged, NULL, NULL))
+            pass = strstr (logged, "Conversion complete") != NULL ||
+                   strstr (logged, "Conversion failed") != NULL;
+        }
+      pass = pass && logged != NULL && strstr (logged, c[k].want_start) != NULL &&
+             strstr (logged, c[k].want_done) != NULL && strstr (logged, "(Best)") == NULL;
+      label = g_strdup_printf ("batch of %u, %s", c[k].n, nfc_preset_label (c[k].preset));
+      add_row ("(notifications)", label, pass, pass ? "the preset is named unless it is Best"
+                                                   : (logged ? logged : "no calls"));
+      /* the multi-file batch converted every file: same type each */
+      if (pass)
+        for (guint i = 0; i < c[k].n; i++)
+          {
+            char *want = g_strdup_printf ("n%u.jpg", i + 1);
+            char *o = g_build_filename (sub, want, NULL);
+            char *bad = check_type ("jpg", o);
+
+            add_row ("(notifications)", want, bad == NULL && non_empty (o), bad ? bad : "converted");
+            g_free (bad);
+            g_free (o);
+            g_free (want);
+          }
+      g_free (label);
+      g_free (logged);
+      g_free (data);
+      g_free (src);
+      g_free (paths[0]);
+      g_free (paths[1]);
+      g_free (sub);
+    }
+  nfc_tools.notify = saved;
+  g_free (ndir);
+  g_free (script);
+  g_free (log);
+  g_free (content);
+}
+
+static void
+test_presets (void)
+{
+  char *dir = P ("presets");
+  char *saved_notify = nfc_tools.notify;
+
+  g_mkdir_with_parents (dir, 0755);
+  nfc_tools.notify = NULL; /* no real notifications from the test */
+  /* A screenshot-like image (smooth plasma with text and a hard edge) as PNG and,
+   * for the photo class, as JPEG; a 3200x1800 image to see Small shrink; clips. */
+  fixture ("presets/gfx.png",
+           run (dir, NULL, "magick", "-seed", "7", "-size", "640x400", "plasma:fractal",
+                "-fill", "white", "-pointsize", "28", "-annotate", "+20+50", "Hello presets 12345",
+                "-fill", "black", "-draw", "rectangle 300,200 500,300", "gfx.png", NULL));
+  fixture ("presets/photo.jpg", run (dir, NULL, "magick", "gfx.png", "-quality", "92", "photo.jpg", NULL));
+  fixture ("presets/n.png", run (dir, NULL, "magick", "-size", "32x32", "xc:red", "n.png", NULL));
+  fixture ("presets/big.png", run (dir, NULL, "magick", "-size", "3200x1800", "gradient:red-blue", "big.png", NULL));
+  fixture ("presets/clip.mp4",
+           run (dir, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=d=2:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=2", "-shortest",
+                "-pix_fmt", "yuv420p", "clip.mp4", NULL));
+  fixture ("presets/clip.mkv", run (dir, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", "clip.mp4", "-c", "copy", "clip.mkv", NULL));
+  fixture ("presets/uhd.mkv",
+           run (dir, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=d=1:s=2560x1440:r=5", "-pix_fmt", "yuv420p", "uhd.mkv", NULL));
+  fixture ("presets/tall.mkv",
+           run (dir, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                "-i", "testsrc2=d=1:s=1440x2560:r=5", "-pix_fmt", "yuv420p", "tall.mkv", NULL));
+
+  /* every preset-capable target, both source classes: type and size order */
+  check_presets (dir, "gfx.png", "jpg", NULL, NULL);
+  check_presets (dir, "photo.jpg", "webp", NULL, NULL);
+  check_presets (dir, "gfx.png", "webp", NULL, NULL);
+  check_presets (dir, "gfx.png", "avif", NULL, NULL);
+  check_presets (dir, "photo.jpg", "avif", NULL, NULL);
+  check_presets (dir, "clip.mkv", "mp4", NULL, NULL);
+  check_presets (dir, "clip.mp4", "webm", NULL, NULL);
+  check_presets (dir, "clip.mp4", "gif", "480x270", "960x540");
+  /* Small shrinks what is larger than 2560 px / 1080p, the others never do */
+  check_presets (dir, "big.png", "jpg", "2560x1440", "3200x1800");
+  check_presets (dir, "uhd.mkv", "mp4", "1920x1080", "2560x1440");
+  check_presets (dir, "tall.mkv", "mp4", "1080x1920", "1440x2560");
+
+  test_preset_notifications (dir);
+  nfc_tools.notify = saved_notify;
+  g_free (dir);
+}
+
 int
 main (void)
 {
@@ -1204,6 +1478,7 @@ main (void)
   check_error ("noaudio.mp4", "mp3", "no audio track");
   check_error ("noaudio.mp4", "m4a", "no audio track");
   test_quality ();
+  test_presets ();
   test_large_image ();
   test_pdf_page_size ();
   check_many ("test.mov", k_mov);

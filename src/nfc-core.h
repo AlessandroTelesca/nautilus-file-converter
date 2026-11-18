@@ -26,6 +26,33 @@ typedef struct {
   const char *ext;   /* output extension */
 } NfcTarget;
 
+/* ---- quality presets ----
+ *
+ * The lossy image and video targets (JPG, WEBP, AVIF, MP4, WebM, GIF) offer
+ * four named presets in a submenu. BEST is what the extension has always done
+ * (its argv is unchanged); the others trade quality for size and may reduce
+ * the resolution (see README for the measured numbers). Every other target is
+ * a plain one-click item and always converts as BEST. */
+typedef enum {
+  NFC_PRESET_BEST,
+  NFC_PRESET_HIGH,
+  NFC_PRESET_BALANCED,
+  NFC_PRESET_SMALL,
+  NFC_PRESET_N
+} NfcPreset;
+
+/* "best", "high", "balanced", "small" (menu item names) */
+const char *nfc_preset_key (NfcPreset preset);
+/* "Best", "High", "Balanced", "Small" (menu labels, notifications) */
+const char *nfc_preset_label (NfcPreset preset);
+/* TRUE (and *out set) if key names a preset */
+gboolean    nfc_preset_from_key (const char *key, NfcPreset *out);
+/* Does this target (category, target key) have a preset submenu? */
+gboolean    nfc_target_has_presets (NfcCategory cat, const char *key);
+/* One-line tooltip of the preset of a target: what it trades, including any
+ * downscaling. Static string, never NULL. */
+const char *nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset);
+
 /* Result of classifying a file. fmt is a static canonical key ("jpg", "heic"). */
 typedef struct {
   NfcCategory cat;
@@ -176,6 +203,14 @@ GPtrArray *nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char
                                     const char *src, const char *out,
                                     const char *workdir, const NfcImageInfo *info,
                                     gboolean *needs_decode);
+
+/* Same as nfc_build_attempts_info with a quality preset (ignored, i.e. BEST, for
+ * targets without presets: see nfc_target_has_presets). BEST gives exactly the
+ * argv of nfc_build_attempts_info. */
+GPtrArray *nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
+                                      NfcPreset preset, const char *src, const char *out,
+                                      const char *workdir, const NfcImageInfo *info,
+                                      gboolean *needs_decode);
 
 /* dpi that makes a w x h pixel image fit an A4 page (landscape for a wide
  * image), never below 96 and never resampling; whole number. */

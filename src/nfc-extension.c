@@ -1,7 +1,7 @@
 /* nautilus-file-converter: Nautilus glue (menu provider + module entry points).
  *
- * Select files, right-click, "Convert to" > <format>. All real work happens in
- * nfc-core.c / nfc-convert.c.
+ * Select files, right-click, "Convert to" > <format> [> <quality preset>]. All
+ * real work happens in nfc-core.c / nfc-convert.c.
  */
 #include <nautilus-extension.h>
 
@@ -29,6 +29,7 @@ G_DEFINE_DYNAMIC_TYPE_EXTENDED (NfcProvider, nfc_provider, G_TYPE_OBJECT, 0,
 
 typedef struct {
   NfcCategory cat;
+  NfcPreset preset;
   char *key, *label, *ext;
   GPtrArray *paths; /* char *, owned */
   GPtrArray *fmts;  /* static strings */
@@ -54,9 +55,74 @@ on_activate (NautilusMenuItem *item G_GNUC_UNUSED, gpointer user_data)
 
   if (d == NULL || d->paths->len == 0)
     return;
-  nfc_batch_run (d->cat, d->key, d->label, d->ext,
-                 (const char *const *) d->paths->pdata,
-                 (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
+  nfc_batch_run_preset (d->cat, d->key, d->preset, d->label, d->ext,
+                        (const char *const *) d->paths->pdata,
+                        (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
+}
+
+/* A menu item that converts the whole selection to target t with this preset */
+static NautilusMenuItem *
+convert_item_new (const NfcSelection *sel, const NfcTarget *t, NfcPreset preset,
+                  const char *name, const char *label, const char *tip)
+{
+  NautilusMenuItem *item = nautilus_menu_item_new (name, label, tip, NULL);
+  ActivateData *d = g_new0 (ActivateData, 1);
+
+  d->cat = sel->cat;
+  d->preset = preset;
+  d->key = g_strdup (t->key);
+  d->label = g_strdup (t->label);
+  d->ext = g_strdup (t->ext);
+  d->paths = g_ptr_array_new_null_terminated (8, g_free, TRUE);
+  d->fmts = g_ptr_array_new_null_terminated (8, NULL, TRUE);
+  for (guint p = 0; p < sel->paths->len; p++)
+    {
+      g_ptr_array_add (d->paths, g_strdup (sel->paths->pdata[p]));
+      g_ptr_array_add (d->fmts, sel->fmts->pdata[p]);
+    }
+  g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), d,
+                         activate_data_free, 0);
+  return item;
+}
+
+/* One entry of the "Convert to" menu. Targets with quality presets get a
+ * submenu "Best / High / Balanced / Small" (item names
+ * "FileConverter::<category>::<key>::<preset>"); all others are plain items
+ * that convert as Best. Pure bookkeeping: nothing here waits. */
+static NautilusMenuItem *
+target_item_new (const NfcSelection *sel, const NfcTarget *t)
+{
+  char *name = g_strdup_printf ("FileConverter::%s::%s", nfc_category_name (sel->cat), t->key);
+  NautilusMenuItem *item;
+
+  if (!nfc_target_has_presets (sel->cat, t->key))
+    {
+      item = convert_item_new (sel, t, NFC_PRESET_BEST, name, t->label, NULL);
+      g_free (name);
+      return item;
+    }
+
+  item = nautilus_menu_item_new (name, t->label, "Choose a quality preset", NULL);
+  {
+    NautilusMenu *sub = nautilus_menu_new ();
+
+    for (guint p = 0; p < NFC_PRESET_N; p++)
+      {
+        char *pname = g_strdup_printf ("%s::%s", name, nfc_preset_key ((NfcPreset) p));
+        NautilusMenuItem *pi = convert_item_new (sel, t, (NfcPreset) p, pname,
+                                                 nfc_preset_label ((NfcPreset) p),
+                                                 nfc_preset_tooltip (sel->cat, t->key,
+                                                                     (NfcPreset) p));
+
+        nautilus_menu_append_item (sub, pi);
+        g_object_unref (pi);
+        g_free (pname);
+      }
+    nautilus_menu_item_set_submenu (item, sub);
+    g_object_unref (sub);
+  }
+  g_free (name);
+  return item;
 }
 
 /* Runs on the Nautilus main thread: it must never wait. nfc_analyze_selection
@@ -110,28 +176,10 @@ nfc_provider_get_file_items (NautilusMenuProvider *provider G_GNUC_UNUSED, GList
         {
           for (guint k = 0; k < sel.targets->len; k++)
             {
-              const NfcTarget *t = sel.targets->pdata[k];
-              char *name = g_strdup_printf ("FileConverter::%s::%s",
-                                            nfc_category_name (sel.cat), t->key);
-              NautilusMenuItem *item = nautilus_menu_item_new (name, t->label, NULL, NULL);
-              ActivateData *d = g_new0 (ActivateData, 1);
+              NautilusMenuItem *item = target_item_new (&sel, sel.targets->pdata[k]);
 
-              d->cat = sel.cat;
-              d->key = g_strdup (t->key);
-              d->label = g_strdup (t->label);
-              d->ext = g_strdup (t->ext);
-              d->paths = g_ptr_array_new_null_terminated (8, g_free, TRUE);
-              d->fmts = g_ptr_array_new_null_terminated (8, NULL, TRUE);
-              for (guint p = 0; p < sel.paths->len; p++)
-                {
-                  g_ptr_array_add (d->paths, g_strdup (sel.paths->pdata[p]));
-                  g_ptr_array_add (d->fmts, sel.fmts->pdata[p]);
-                }
-              g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), d,
-                                     activate_data_free, 0);
               nautilus_menu_append_item (sub, item);
               g_object_unref (item);
-              g_free (name);
             }
           nautilus_menu_item_set_submenu (top, sub);
           result = g_list_append (result, top);

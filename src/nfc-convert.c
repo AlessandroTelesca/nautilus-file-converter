@@ -83,6 +83,7 @@ timeout_secs (NfcCategory cat, gint64 input_bytes)
 typedef struct {
   NfcCategory cat;
   char *fmt, *key, *ext, *src, *dir, *stem;
+  NfcPreset preset;
   char *workdir, *produced, *hidden;
   gint64 src_size;
   GPtrArray *attempts;
@@ -863,8 +864,9 @@ job_start (Job *j)
       j->produced = g_strdup (j->hidden);
     }
   /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
-  j->attempts = nfc_build_attempts_info (j->cat, j->fmt, j->key, j->src, j->produced,
-                                         j->workdir, j->have_info ? &j->info : NULL, NULL);
+  j->attempts = nfc_build_attempts_preset (j->cat, j->fmt, j->key, j->preset, j->src,
+                                          j->produced, j->workdir,
+                                          j->have_info ? &j->info : NULL, NULL);
   if (j->attempts == NULL)
     {
       job_fail (j, "no converter available for this format");
@@ -875,8 +877,16 @@ job_start (Job *j)
 
 void
 nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
-                        const char *ext, const char *src_in,
+                        const char *ext, const char *src,
                         GAsyncReadyCallback callback, gpointer user_data)
+{
+  nfc_convert_file_preset_async (cat, fmt, key, NFC_PRESET_BEST, ext, src, callback, user_data);
+}
+
+void
+nfc_convert_file_preset_async (NfcCategory cat, const char *fmt, const char *key,
+                               NfcPreset preset, const char *ext, const char *src_in,
+                               GAsyncReadyCallback callback, gpointer user_data)
 {
   Job *j = g_new0 (Job, 1);
   GStatBuf st;
@@ -885,6 +895,7 @@ nfc_convert_file_async (NfcCategory cat, const char *fmt, const char *key,
   j->cat = cat;
   j->fmt = g_strdup (fmt);
   j->key = g_strdup (key);
+  j->preset = preset;
   j->ext = g_strdup (ext);
   j->src = g_canonicalize_filename (src_in, NULL);
   j->dir = g_path_get_dirname (j->src);
@@ -1093,6 +1104,8 @@ notifier_send (Notifier *n, const char *title, const char *body, const char *ico
 typedef struct {
   NfcCategory cat;
   char *key, *label, *ext, *short_label;
+  char *suffix;           /* " (Balanced)" when a preset other than Best applies, else "" */
+  NfcPreset preset;
   guint n, next, running, finished, max_workers;
   char **paths, **fmts;
   GPtrArray *results;
@@ -1148,7 +1161,7 @@ batch_finish (Batch *b)
           char *from = g_path_get_basename (r->path);
           char *to = g_path_get_basename (r->output);
 
-          g_string_printf (body, "%s → %s", from, to);
+          g_string_printf (body, "%s → %s%s", from, to, b->suffix);
           g_free (from);
           g_free (to);
         }
@@ -1168,6 +1181,8 @@ batch_finish (Batch *b)
       if (good)
         g_string_append_printf (body, "Converted %u of %u files to %s", good, b->n,
                                 b->short_label);
+      else if (b->preset != NFC_PRESET_BEST)
+        g_string_append_printf (body, "Could not convert to %s", b->short_label);
       for (guint i = 0; i < b->n && shown < 3; i++)
         {
           NfcResult *r = b->results->pdata[i];
@@ -1202,6 +1217,7 @@ batch_finish (Batch *b)
   g_free (b->label);
   g_free (b->ext);
   g_free (b->short_label);
+  g_free (b->suffix);
   g_free (b);
 }
 
@@ -1239,8 +1255,8 @@ batch_pump (Batch *b)
       it->batch = b;
       it->index = b->next++;
       b->running++;
-      nfc_convert_file_async (b->cat, b->fmts[it->index], b->key, b->ext,
-                              b->paths[it->index], batch_item_done, it);
+      nfc_convert_file_preset_async (b->cat, b->fmts[it->index], b->key, b->preset, b->ext,
+                                     b->paths[it->index], batch_item_done, it);
     }
 }
 
@@ -1248,6 +1264,14 @@ void
 nfc_batch_run (NfcCategory cat, const char *key, const char *label, const char *ext,
                const char *const *paths, const char *const *fmts, guint n,
                NfcBatchDone done, gpointer user_data)
+{
+  nfc_batch_run_preset (cat, key, NFC_PRESET_BEST, label, ext, paths, fmts, n, done, user_data);
+}
+
+void
+nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset, const char *label,
+                      const char *ext, const char *const *paths, const char *const *fmts,
+                      guint n, NfcBatchDone done, gpointer user_data)
 {
   Batch *b;
   char *what, *sp;
@@ -1271,6 +1295,16 @@ nfc_batch_run (NfcCategory cat, const char *key, const char *label, const char *
   b->short_label = g_strdup (label);
   if ((sp = strstr (b->short_label, " (")) != NULL)
     *sp = '\0';
+  b->preset = ((guint) preset < NFC_PRESET_N && nfc_target_has_presets (cat, key))
+                ? preset : NFC_PRESET_BEST;
+  b->suffix = b->preset == NFC_PRESET_BEST ? g_strdup ("")
+                                           : g_strdup_printf (" (%s)", nfc_preset_label (b->preset));
+  {
+    char *with = g_strconcat (b->short_label, b->suffix, NULL);
+
+    g_free (b->short_label);
+    b->short_label = with;
+  }
   b->n = n;
   b->paths = g_new0 (char *, n + 1);
   b->fmts = g_new0 (char *, n + 1);
