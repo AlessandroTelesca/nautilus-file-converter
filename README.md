@@ -643,6 +643,38 @@ pipes open), the temp files are removed, and the job fails with "timed out"
 `NFC_TEST_PROBE_TIMEOUT_SECS` override the timeouts; they exist for the tests
 and are only honoured when set.
 
+## Tray icon
+
+While a conversion, reduce, resize or upscale job is running or queued, a
+tray icon (the circular arrows, `view-refresh-symbolic`) shows that the extension
+is busy; it goes away when everything is done.
+
+* **Tooltip**: what is running, e.g. "Converting 5 files to JPG (Balanced): 2 done…",
+  "Converting photo.png to JPG…", "Upscaling photo.png 4×…", "Resizing 3 files to 1080p",
+  or, with several operations at once, "2 operations, 3 of 9 files done…".
+* **Menu** (right click, and left click): one greyed line per job in flight
+  ("photo.png → JPG", "photo.png (upscale 4×, waiting)": waiting for memory or the
+  GPU; at most 8, then "… and N more"), and **Cancel all**: every running job is
+  killed and its temp files removed, jobs waiting for memory and the files of the
+  batches that have not started yet are dropped, and each one ends as "cancelled" in
+  its notification, like at shutdown. Conversions started afterwards run normally.
+* **When**: the icon shows after something has been in flight for 300 ms (a
+  conversion of a few small files never flashes it) and stays 1 s after the last
+  job ends, so a series of quick conversions does not make it blink. It is updated at most
+  twice a second.
+* **How**: no GTK and no `libappindicator`. The extension speaks the
+  StatusNotifierItem protocol (what KDE and the GNOME *AppIndicator and
+  KStatusNotifierItem Support* extension implement) directly over GDBus, with a small
+  `com.canonical.dbusmenu` for the menu, all asynchronous in Nautilus's main loop. The
+  icon is on the bus as `org.kde.StatusNotifierItem-<pid>-<n>` only while it shows. If
+  there is no `org.kde.StatusNotifierWatcher` on the session bus (a stock GNOME
+  without that extension) or any bus call fails, it silently does nothing; if the
+  watcher appears later (the extension is enabled, the shell restarts) the icon is
+  registered then.
+* **Off**: put `tray=false` (also `no`, `off`, `0`) in
+  `~/.config/nautilus-file-converter/config`, the same `key=value` file that holds
+  `upscale-model=`, and restart Nautilus (`nautilus -q`). The file is read once, at start.
+
 ## Behaviour
 
 * **Output names**: written next to the source with the new extension.
@@ -713,6 +745,19 @@ meson test -C build
 * `decode-limits`: `nfc-decode` refuses (exit 1, quickly, with a message) PNGs
   of 20000x20000, just over 100 MP, and over 30000 pixels on a side, and still
   decodes exactly 100 MP, a small PNG and (with `NFC_HEIC_SAMPLE`) a real HEIC.
+* `tray-icon`: the tray icon (`tests/test-tray.c`), under `dbus-run-session` on a
+  private session bus (it refuses to run without `NFC_TEST_PRIVATE_BUS`, which meson
+  sets, so it can never touch the real bus; skipped when `dbus-run-session` is
+  missing), with a fake `StatusNotifierWatcher` and a fake `ffmpeg`: the item registers
+  when a job has run 300 ms, its properties, tooltip and menu (job lines, "… and N
+  more", separator, "Cancel all") describe the jobs and follow them with `NewToolTip`
+  / `LayoutUpdated`; the `Event` "clicked" on "Cancel all" ends every job and every
+  not-yet-started file of three batches as "cancelled" with no work directory or
+  hidden file left, and the module still converts afterwards; the bus name is
+  released once the jobs are done and the debounce is over; a job shorter than
+  the delay never shows it; no watcher means nothing registered and jobs that still
+  work, a watcher that appears later (or restarts) gets the item; `tray=false`,
+  as text and as a real config file, puts nothing on the bus.
 * `module-load-and-menu`: loads the built `.so` without installing it, checks
   the three Nautilus entry points and that the registered type implements
   `NautilusMenuProvider`, then drives the real menu provider with fake

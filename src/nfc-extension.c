@@ -10,6 +10,7 @@
 
 #include "nfc-convert.h"
 #include "nfc-core.h"
+#include "nfc-tray.h"
 
 #define NFC_TYPE_PROVIDER (nfc_provider_get_type ())
 
@@ -401,11 +402,14 @@ nautilus_module_initialize (GTypeModule *module)
   /* probe ffmpeg encoders / ImageMagick formats / pixbuf loaders in background
    * threads (each with a timeout); get_file_items never waits for them */
   nfc_probe_start ();
+  /* the tray icon while a job is in flight (off with tray=false in the config) */
+  nfc_tray_init ();
 }
 
 void
 nautilus_module_shutdown (void)
 {
+  nfc_tray_shutdown ();
   /* kill in-flight conversions and remove their temp files (best effort) */
   nfc_shutdown ();
 }

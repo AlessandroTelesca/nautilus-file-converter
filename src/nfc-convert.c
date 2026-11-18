@@ -110,6 +110,7 @@ typedef struct {
   gboolean have_info;
   guint64 pixels, est;    /* pixels (SVG: as rendered) and estimated peak bytes */
   gboolean queued;        /* waiting for memory in the admission queue */
+  gboolean compress;      /* Compress job (reference size = the source) */
   gboolean reserved;      /* its estimate is counted in reserved_bytes */
   char *spill;            /* disk-backed temp dir for ImageMagick (images only) */
   GTask *task;
@@ -118,6 +119,18 @@ typedef struct {
 /* Jobs in flight; touched from the main thread only. */
 static GHashTable *active_jobs = NULL;
 static gboolean shutting_down = FALSE;
+static GList *active_batches = NULL;      /* Batch *, newest first; main thread only */
+static NfcActivityObserver activity_observer = NULL;
+static gpointer activity_observer_data = NULL;
+
+static void
+activity_changed (void)
+{
+  if (activity_observer != NULL)
+    activity_observer (activity_observer_data);
+}
+
+static void batches_cancel (void);
 
 static void run_step (Job *j);
 static void job_start (Job *j);
@@ -169,6 +182,7 @@ job_free (Job *j)
   admission_release (j);
   if (active_jobs != NULL)
     g_hash_table_remove (active_jobs, j);
+  activity_changed ();
   if (j->timeout_id)
     g_source_remove (j->timeout_id);
   g_clear_object (&j->proc);
@@ -897,6 +911,7 @@ admission_reserve (Job *j)
   n_reserved++;
   if (j->upscale != NULL)
     n_gpu++;
+  activity_changed (); /* no longer waiting */
 }
 
 static void
@@ -979,6 +994,7 @@ admission_submit (Job *j)
       j->pixels = j->info.width * f * j->info.height * f;
       j->queued = TRUE;
       g_queue_push_tail (&admit_queue, j);
+      activity_changed ();
       admission_pump ();
       return;
     }
@@ -994,6 +1010,7 @@ admission_submit (Job *j)
     }
   j->queued = TRUE;
   g_queue_push_tail (&admit_queue, j);
+  activity_changed ();
   admission_pump ();
 }
 
@@ -1260,6 +1277,7 @@ nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
         j->ref_size = opts->reference_size;
       else if (opts->reference_size == NFC_REFERENCE_SOURCE && j->src_size > 0)
         j->ref_size = j->src_size; /* unreadable source: nothing to compare with */
+      j->compress = opts->reference_size == NFC_REFERENCE_SOURCE;
     }
 
   if (shutting_down)
@@ -1270,6 +1288,7 @@ nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
   if (active_jobs == NULL)
     active_jobs = g_hash_table_new (g_direct_hash, g_direct_equal);
   g_hash_table_add (active_jobs, j);
+  activity_changed ();
 
   if (cat == NFC_CAT_IMAGE)
     probe_start (j); /* then the admission decides when job_start runs */
@@ -1289,14 +1308,17 @@ nfc_convert_file_finish (GAsyncResult *result, GError **error)
   return g_task_propagate_pointer (G_TASK (result), error);
 }
 
-void
-nfc_shutdown (void)
+/* Abort every job in flight (killing its process group, removing its files) and
+ * fail the ones waiting for memory, all with "cancelled". The module stays
+ * usable: jobs made later run normally. A job already moving its output into
+ * place is left to finish. */
+static void
+jobs_abort_all (void)
 {
   GHashTableIter it;
   gpointer key;
   GList *waiting = NULL;
 
-  shutting_down = TRUE;
   /* jobs waiting for memory have started nothing: fail them (after the loop
    * below, which must not see the table change under it) */
   while (!g_queue_is_empty (&admit_queue))
@@ -1333,6 +1355,20 @@ nfc_shutdown (void)
   for (GList *l = waiting; l != NULL; l = l->next)
     job_fail (l->data, "cancelled");
   g_list_free (waiting);
+}
+
+void
+nfc_cancel_all (void)
+{
+  batches_cancel (); /* first: the batches start nothing more while the jobs end */
+  jobs_abort_all ();
+}
+
+void
+nfc_shutdown (void)
+{
+  shutting_down = TRUE;
+  jobs_abort_all ();
 }
 
 /* -------------------------------------------------------------------------
@@ -1474,6 +1510,7 @@ typedef struct {
   const NfcResizePreset *resize; /* nfc_batch_run_resize: key/ext/cat are per file */
   const NfcUpscalePreset *upscale; /* nfc_batch_run_upscale: key/ext are per file */
   guint n, next, running, finished, max_workers;
+  gboolean cancelled;     /* nfc_cancel_all: start no more files, end the rest as "cancelled" */
   char **paths, **fmts;
   GPtrArray *results;
   Notifier *notifier;
@@ -1884,6 +1921,9 @@ batch_finish (Batch *b)
   guint good = 0;
   GString *body = g_string_new (NULL);
 
+  active_batches = g_list_remove (active_batches, b);
+  activity_changed ();
+
   for (guint i = 0; i < b->n; i++)
     if (((NfcResult *) b->results->pdata[i])->ok)
       good++;
@@ -2028,14 +2068,16 @@ batch_item_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data
   g_clear_error (&error);
 }
 
-/* a file that cannot be compressed: ends from an idle, never from inside
- * batch_pump (which would find its batch freed) */
+/* a file that cannot be converted, or that a cancelled batch never started: ends
+ * from an idle, never from inside batch_pump (which would find its batch freed) */
 static gboolean
 batch_item_unsupported (gpointer data)
 {
   BatchItem *it = data;
   GError *error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                                       it->batch->upscale != NULL
+                                       it->batch->cancelled
+                                       ? "cancelled"
+                                       : it->batch->upscale != NULL
                                          ? "this format cannot be upscaled"
                                          : it->batch->resize != NULL
                                            ? "this format cannot be resized"
@@ -2056,6 +2098,11 @@ batch_pump (Batch *b)
       it->batch = b;
       it->index = b->next++;
       b->running++;
+      if (b->cancelled)
+        {
+          g_idle_add (batch_item_unsupported, it); /* ends as "cancelled" */
+          continue;
+        }
       if (b->upscale != NULL)
         {
           NfcUpscaleTarget ut;
@@ -2169,6 +2216,8 @@ batch_start (gboolean compress, const NfcResizePreset *resize, const NfcUpscaleP
       g_ptr_array_add (b->results, r);
     }
   b->max_workers = upscale != NULL ? 1 : workers_for (cat, n); /* the GPU takes one at a time */
+  active_batches = g_list_prepend (active_batches, b);
+  activity_changed ();
   b->done = done;
   b->user_data = user_data;
 
@@ -2265,4 +2314,163 @@ nfc_batch_run_upscale (const char *preset_key, const char *const *paths, const c
     }
   batch_start (FALSE, NULL, p, NFC_CAT_IMAGE, "", NFC_PRESET_BEST, "Upscale", "", paths, fmts, n,
                done, user_data);
+}
+
+/* -------------------------------------------------------------------------
+ * Activity: what is running now (the tray icon)
+ * ---------------------------------------------------------------------- */
+
+static void
+batches_cancel (void)
+{
+  for (GList *l = active_batches; l != NULL; l = l->next)
+    ((Batch *) l->data)->cancelled = TRUE;
+}
+
+void
+nfc_activity_set_observer (NfcActivityObserver cb, gpointer user_data)
+{
+  activity_observer = cb;
+  activity_observer_data = user_data;
+}
+
+void
+nfc_activity_clear (NfcActivity *a)
+{
+  g_clear_pointer (&a->summary, g_free);
+  g_clear_pointer (&a->lines, g_ptr_array_unref);
+  a->n_jobs = a->n_waiting = a->n_unstarted = 0;
+}
+
+/* "photo.png → JPG", "photo.png (resize to 1080p)", ... */
+static char *
+job_line (const Job *j)
+{
+  char *base = g_path_get_basename (j->src);
+  char *what, *line;
+
+  if (j->upscale != NULL)
+    what = g_strdup_printf ("upscale %s", j->upscale->label);
+  else if (j->resize != NULL)
+    what = g_strdup_printf ("resize to %s", j->resize->name);
+  else if (j->compress)
+    what = g_strdup ("reduce file size");
+  else
+    what = NULL;
+  if (what != NULL)
+    line = g_strdup_printf ("%s (%s%s)", base, what, j->queued ? ", waiting" : "");
+  else
+    {
+      char *up = g_ascii_strup (j->key, -1);
+
+      line = g_strdup_printf ("%s → %s%s", base, up, j->queued ? " (waiting)" : "");
+      g_free (up);
+    }
+  g_free (base);
+  g_free (what);
+  return line;
+}
+
+static const char *
+batch_verb (const Batch *b)
+{
+  return b->upscale != NULL ? "Upscaling" : b->resize != NULL ? "Resizing"
+         : b->compress ? "Reducing file size of" : "Converting";
+}
+
+/* the tooltip text for the batches in flight */
+static char *
+activity_summary (guint n_jobs)
+{
+  guint n_batches = g_list_length (active_batches);
+
+  if (n_batches == 1)
+    {
+      const Batch *b = active_batches->data;
+      GString *s = g_string_new (batch_verb (b));
+
+      if (b->n == 1)
+        {
+          char *base = g_path_get_basename (b->paths[0]);
+
+          g_string_append_printf (s, " %s", base);
+          g_free (base);
+        }
+      else
+        g_string_append_printf (s, " %u files", b->n);
+      if (b->upscale != NULL)
+        g_string_append_printf (s, " %s", b->upscale->label);
+      else if (b->resize != NULL)
+        g_string_append_printf (s, " to %s", b->resize->name);
+      else if (b->compress)
+        g_string_append (s, b->suffix);
+      else
+        g_string_append_printf (s, " to %s", b->short_label);
+      if (b->n > 1 && b->finished > 0)
+        g_string_append_printf (s, ": %u done", b->finished);
+      g_string_append (s, "…");
+      return g_string_free (s, FALSE);
+    }
+  if (n_batches > 1)
+    {
+      guint total = 0, done = 0;
+
+      for (const GList *l = active_batches; l != NULL; l = l->next)
+        {
+          total += ((const Batch *) l->data)->n;
+          done += ((const Batch *) l->data)->finished;
+        }
+      return g_strdup_printf ("%u operations, %u of %u files done…", n_batches, done, total);
+    }
+  /* jobs without a batch (the API used directly) */
+  return g_strdup_printf ("%u %s running", n_jobs, n_jobs == 1 ? "job" : "jobs");
+}
+
+static gint
+job_line_cmp (gconstpointer a, gconstpointer b)
+{
+  /* stable for the menu: sorted by file name */
+  return g_utf8_collate (*(char *const *) a, *(char *const *) b);
+}
+
+gboolean
+nfc_activity_get (NfcActivity *a)
+{
+  guint waiting_jobs = 0, unstarted = 0;
+
+  memset (a, 0, sizeof *a);
+  if (active_jobs == NULL || g_hash_table_size (active_jobs) == 0)
+    {
+      if (active_batches == NULL)
+        return FALSE;
+    }
+  a->lines = g_ptr_array_new_with_free_func (g_free);
+  if (active_jobs != NULL)
+    {
+      GHashTableIter it;
+      gpointer key;
+
+      g_hash_table_iter_init (&it, active_jobs);
+      while (g_hash_table_iter_next (&it, &key, NULL))
+        {
+          const Job *j = key;
+
+          if (j->queued)
+            waiting_jobs++;
+          g_ptr_array_add (a->lines, job_line (j));
+        }
+      /* hash order is arbitrary: the menu must not shuffle between updates */
+      g_ptr_array_sort (a->lines, job_line_cmp);
+    }
+  for (const GList *l = active_batches; l != NULL; l = l->next)
+    {
+      const Batch *b = l->data;
+
+      unstarted += b->n - b->next;
+    }
+  a->n_jobs = a->lines->len;
+  a->n_waiting = waiting_jobs;
+  a->n_unstarted = unstarted;
+  a->summary = activity_summary (a->n_jobs);
+  return TRUE;
 }

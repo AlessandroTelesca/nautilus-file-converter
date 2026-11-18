@@ -33,7 +33,8 @@ nfc_decode = executable('nfc-decode', 'src/nfc-decode.c',
 # Pure logic + async runner: no Nautilus and no gdk-pixbuf dependency, also
 # linked by the tests.
 core_lib = static_library('nfc-core',
-  ['src/nfc-core.c', 'src/nfc-convert.c', 'src/nfc-util.c', 'src/nfc-header.c'],
+  ['src/nfc-core.c', 'src/nfc-convert.c', 'src/nfc-util.c', 'src/nfc-header.c',
+   'src/nfc-tray.c'],
   dependencies: [glib_dep, gio_dep, gobject_dep],
   include_directories: include_directories('src', '.'),
 )

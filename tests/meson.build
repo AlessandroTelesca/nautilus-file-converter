@@ -58,3 +58,18 @@ test_decode = executable('test-decode', 'test-decode.c',
   dependencies: [glib_dep, dependency('zlib')],
 )
 test('decode-limits', test_decode, timeout: 120, env: test_env, depends: nfc_decode)
+
+# The tray icon talks D-Bus: under a private session bus (dbus-run-session), never
+# the user's; the test refuses to run without NFC_TEST_PRIVATE_BUS.
+test_tray = executable('test-tray', 'test-tray.c',
+  dependencies: core_dep,
+)
+dbus_run_session = find_program('dbus-run-session', required: false)
+if dbus_run_session.found()
+  tray_env = environment()
+  tray_env.set('NFC_TEST_PRIVATE_BUS', '1')
+  test('tray-icon', dbus_run_session, args: ['--', test_tray], timeout: 240,
+    env: tray_env, is_parallel: false)
+else
+  message('dbus-run-session not found: the tray-icon test is skipped')
+endif

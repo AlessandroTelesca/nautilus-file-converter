@@ -161,4 +161,32 @@ void nfc_batch_run_upscale (const char *preset_key, const char *const *paths,
  * main loop keeps running. */
 void nfc_shutdown (void);
 
+/* ---- activity: what is in flight (for the tray icon) ---- */
+
+typedef struct {
+  guint      n_jobs;    /* jobs in flight: probing, running or waiting for memory */
+  guint      n_waiting; /* of those jobs, the ones waiting for memory */
+  guint      n_unstarted; /* files of the batches in flight that have no job yet */
+  char      *summary;   /* one line for a tooltip: "Converting 5 files to JPG (Balanced): 2 done…" */
+  GPtrArray *lines;     /* one line (char *) per job in flight, sorted: "a.png → JPG" */
+} NfcActivity;
+
+/* Fill *a with what is in flight now and return TRUE, or return FALSE (a is then
+ * zeroed) when nothing is. Free with nfc_activity_clear. */
+gboolean nfc_activity_get (NfcActivity *a);
+void     nfc_activity_clear (NfcActivity *a);
+
+/* cb (user_data) is called, on the main thread, whenever a job or batch starts,
+ * changes state or ends. It must be cheap and must not start or cancel jobs
+ * itself. One observer; NULL removes it. */
+typedef void (*NfcActivityObserver) (gpointer user_data);
+void nfc_activity_set_observer (NfcActivityObserver cb, gpointer user_data);
+
+/* Cancel everything in flight and queued: running jobs are killed and their files
+ * removed, jobs waiting for memory fail, and the files of the running batches not
+ * started yet are not started. Every one ends "cancelled" (a shutdown or the user
+ * wins over a step timeout that fired at the same moment). Unlike nfc_shutdown
+ * the module stays usable: later jobs run normally. */
+void nfc_cancel_all (void);
+
 G_END_DECLS
