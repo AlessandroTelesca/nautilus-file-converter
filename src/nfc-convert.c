@@ -614,9 +614,12 @@ step_finished (StepIO *io)
       gboolean final = j->timed_out || j->aborted;
       const char *why = io->io_error != NULL ? io->io_error : "Operation was cancelled";
 
-      msg = g_strdup (j->timed_out ? timed_out_text (j) : j->aborted ? "cancelled" : why);
+      /* shutdown wins over a timeout that fired just before it (the step's
+       * cancellation was already on its way): the user closed Nautilus, the job
+       * did not time out */
+      msg = g_strdup (j->aborted ? "cancelled" : j->timed_out ? timed_out_text (j) : why);
       nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  %s", j->src, j->key,
-               j->timed_out ? "timeout" : j->aborted ? "cancelled" : "I/O error", cmd, why);
+               j->aborted ? "cancelled" : j->timed_out ? "timeout" : "I/O error", cmd, why);
       /* a timeout or shutdown already killed the group while the leader was
        * alive; only a broken pipe leaves it to us */
       if (!final && step_leader_alive (j))
@@ -648,11 +651,13 @@ step_finished (StepIO *io)
         char *so = tail_text (&io->tail[0], STEP_KEEP_BYTES, FALSE);
         char *log_se = tail_text (&io->tail[1], LOG_ERR_BYTES, TRUE);
         char *log_so = tail_text (&io->tail[0], LOG_OUT_BYTES, TRUE);
-        gboolean final = j->timed_out; /* killed by the timeout: final */
+        gboolean final = j->timed_out || j->aborted; /* killed by the timeout or shutdown: final */
 
-        msg = j->timed_out ? NULL : no_audio_message (argv, se);
+        msg = (j->timed_out || j->aborted) ? NULL : no_audio_message (argv, se);
         if (msg != NULL)
           final = TRUE; /* no other attempt can find audio that is not there */
+        else if (j->aborted)
+          msg = g_strdup ("cancelled"); /* shutdown wins over a timeout that fired just before it */
         else if (j->timed_out)
           msg = g_strdup (timed_out_text (j));
         else
@@ -662,7 +667,8 @@ step_finished (StepIO *io)
         if (msg == NULL)
           msg = g_strdup_printf ("exit code %d", status);
         nfc_log ("FAIL %s -> %s (%s)\n  cmd: %s\n  stderr:\n%s\n  stdout:\n%s",
-                 j->src, j->key, j->timed_out ? "timeout" : "exit status", cmd, log_se, log_so);
+                 j->src, j->key, j->aborted ? "cancelled" : j->timed_out ? "timeout" : "exit status",
+                 cmd, log_se, log_so);
         g_free (cmd);
         g_free (so);
         g_free (se);

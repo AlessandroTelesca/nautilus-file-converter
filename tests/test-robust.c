@@ -843,7 +843,7 @@ find_real_magick (void)
 }
 
 static void
-write_fake_magick (const char *path, const char *logfile)
+write_fake_magick (const char *path, const char *logfile, int run_secs)
 {
   char *body = g_strdup_printf (
     "REAL='%s'\n"
@@ -853,9 +853,9 @@ write_fake_magick (const char *path, const char *logfile)
     "now() { date +%%s.%%N; }\n"
     "echo \"start $(now) $$\" >> '%s'\n"
     "echo \"env $MAGICK_TEMPORARY_PATH $(ls -d \"$MAGICK_TEMPORARY_PATH\"/nfc-* 2>/dev/null | wc -l)\" >> '%s'\n"
-    "sleep 1\n"
+    "sleep %d\n"
     "printf data > \"$out\"\n"
-    "echo \"end $(now) $$\" >> '%s'\n", real_magick, logfile, logfile, logfile);
+    "echo \"end $(now) $$\" >> '%s'\n", real_magick, logfile, logfile, run_secs, logfile);
 
   write_script (path, body);
   g_free (body);
@@ -970,7 +970,7 @@ test_admission_batch (void)
   if (!admission_setup ())
     goto out;
   nfc_tools_init ();
-  write_fake_magick (fake, logfile);
+  write_fake_magick (fake, logfile, 1);
   write_script (notify, "echo 1\n");
   nfc_tools.magick = fake;
   nfc_tools.notify = notify;
@@ -1078,7 +1078,7 @@ queued_shutdown_begin (QueuedShutdown *q)
   q->spill = B (g_get_user_cache_dir (), "nautilus-file-converter/tmp");
   q->saved_magick = nfc_tools.magick;
   nfc_tools_init ();
-  write_fake_magick (q->fake, q->logfile);
+  write_fake_magick (q->fake, q->logfile, 30); /* outlives the wait for the shutdown */
   nfc_tools.magick = q->fake;
   g_setenv ("NFC_TEST_MEMAVAILABLE_KB", "4000000", TRUE);
   g_free (make_images (q->huge_dir, "h", "12000x8000", 3));
@@ -1130,6 +1130,15 @@ queued_shutdown_end (QueuedShutdown *q)
   g_free (q->spill); g_free (q->fake); g_free (q->logfile); g_free (q->huge_dir);
 }
 
+/* test timer firing together with a job's step timeout: shuts the module down */
+static gboolean
+shutdown_with_timeout (gpointer data)
+{
+  nfc_shutdown ();
+  *(gboolean *) data = TRUE;
+  return G_SOURCE_REMOVE;
+}
+
 /* module shutdown: in-flight jobs are killed and their files removed */
 static void
 test_cancel_on_shutdown (void)
@@ -1139,15 +1148,23 @@ test_cancel_on_shutdown (void)
   char *body, *src;
   Wait w = { g_main_loop_new (NULL, FALSE), NULL, NULL };
   Wait w2 = { g_main_loop_new (NULL, FALSE), NULL, NULL };
+  Wait w3 = { g_main_loop_new (NULL, FALSE), NULL, NULL };
   char *ffscript = B (bindir, "ffmpeg-partial2"), *shutdir = B (datadir, "shut"), *vsrc;
   char *saved_ff = nfc_tools.ffmpeg;
-  guint wd = g_timeout_add_seconds (40, watchdog, NULL);
+  guint wd = g_timeout_add_seconds (120, watchdog, NULL);
   GArray *pids;
   guint before = count_entries (base, "nfc-");
-  gint64 t0 = g_get_monotonic_time ();
+  gint64 t0;
   QueuedShutdown qs;
+  gboolean sdone = FALSE;
 
-  body = g_strdup_printf ("sleep 30 &\necho $! > '%s'\necho $$ >> '%s'\nexec sleep 30\n", pidfile, pidfile);
+  /* The steps must still be running when nfc_shutdown() is called, however slow
+   * the machine is: the 2 s step timeout of the other tests would race with the
+   * setup below under load and report "timed out" instead of "cancelled". The
+   * 120 s watchdog still bounds the test. */
+  g_setenv ("NFC_TEST_TIMEOUT_SECS", "600", TRUE);
+  queued_shutdown_begin (&qs); /* image jobs waiting for memory (defined below); first: it is the slow part */
+  body = g_strdup_printf ("sleep 60 &\necho $! > '%s'\necho $$ >> '%s'\nexec sleep 60\n", pidfile, pidfile);
   write_script (script, body);
   g_free (body);
   g_free (nfc_tools.soffice);
@@ -1171,7 +1188,7 @@ test_cancel_on_shutdown (void)
   /* a second job in flight: a video whose fake ffmpeg wrote partial output to
    * the hidden temp file next to the source and then hangs */
   nfc_tools.ffmpeg = ffscript;
-  write_script (ffscript, "for a; do last=\"$a\"; done\nprintf partial > \"$last\"\nsleep 30 &\nwait\n");
+  write_script (ffscript, "for a; do last=\"$a\"; done\nprintf partial > \"$last\"\nsleep 60 &\nwait\n");
   g_assert_cmpint (g_mkdir_with_parents (shutdir, 0755), ==, 0);
   touch (shutdir, "clip.mp4");
   vsrc = B (shutdir, "clip.mp4");
@@ -1183,13 +1200,37 @@ test_cancel_on_shutdown (void)
     }
   g_assert_cmpuint (count_entries (shutdir, "."), ==, 1); /* the hidden temp file exists */
   g_assert_cmpuint (count_entries (base, "nfc-"), ==, before + 2); /* both workdirs exist */
-  queued_shutdown_begin (&qs); /* image jobs waiting for memory (defined below) */
-  nfc_shutdown ();
+  /* A third job whose step timeout fires in the very main-loop iteration in
+   * which nfc_shutdown() runs (a 1 s step timeout and a 1 s test timer, which
+   * GLib fires together; the step's timer was created first, so it runs first:
+   * the group is killed and the cancellation is on its way, the result not yet
+   * delivered). Shutdown must win: "cancelled", not "timed out". No wall-clock
+   * margin involved. */
+  {
+    char *pf3 = B (base, "shutdown3.pids"), *sc3 = B (bindir, "soffice-hang3");
+    char *b3 = g_strdup_printf ("echo $$ > '%s'\nexec sleep 60\n", pf3);
+    char *src3 = B (datadir, "doc3.txt");
+
+    write_script (sc3, b3);
+    touch (datadir, "doc3.txt");
+    nfc_tools.soffice = sc3;
+    g_setenv ("NFC_TEST_TIMEOUT_SECS", "1", TRUE);
+    nfc_convert_file_async (NFC_CAT_DOC, "txt", "pdf", "pdf", src3, on_done, &w3);
+    g_setenv ("NFC_TEST_TIMEOUT_SECS", "600", TRUE);
+    nfc_tools.soffice = script;
+    t0 = g_get_monotonic_time ();
+    g_timeout_add_seconds (1, shutdown_with_timeout, &sdone);
+    while (!sdone)
+      g_main_context_iteration (NULL, TRUE);
+    g_free (b3); g_free (pf3); g_free (src3); g_free (sc3);
+  }
   queued_shutdown_end (&qs);
   g_assert_cmpuint (count_entries (base, "nfc-"), ==, before);     /* ... and are gone */
   g_assert_cmpuint (count_entries (shutdir, "."), ==, 0);          /* hidden temp file removed */
-  while ((w.out == NULL && w.error == NULL) || (w2.out == NULL && w2.error == NULL))
+  while ((w.out == NULL && w.error == NULL) || (w2.out == NULL && w2.error == NULL) ||
+         (w3.out == NULL && w3.error == NULL))
     g_main_context_iteration (NULL, TRUE);
+  g_setenv ("NFC_TEST_TIMEOUT_SECS", G_STRINGIFY (TEST_TIMEOUT), TRUE);
   g_source_remove (wd);
   g_assert_null (w.out);
   g_assert_nonnull (w.error);
@@ -1197,13 +1238,19 @@ test_cancel_on_shutdown (void)
   g_assert_null (w2.out);
   g_assert_nonnull (w2.error);
   g_assert_cmpstr (w2.error->message, ==, "cancelled");
+  g_assert_null (w3.out);
+  g_assert_nonnull (w3.error);
+  g_assert_cmpstr (w3.error->message, ==, "cancelled"); /* not "timed out" */
+  g_clear_error (&w3.error);
+  g_main_loop_unref (w3.loop);
   g_assert_cmpuint (count_entries (shutdir, "."), ==, 0);
   g_assert_cmpuint (count_entries (shutdir, "clip.mkv"), ==, 0);
   g_clear_error (&w2.error);
   g_main_loop_unref (w2.loop);
   nfc_tools.ffmpeg = saved_ff;
   g_free (vsrc); g_free (shutdir); g_free (ffscript);
-  g_assert_cmpint (g_get_monotonic_time () - t0, <, 10 * G_USEC_PER_SEC);
+  /* shutdown ends the jobs now; the fake steps would run 60 s */
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, 50 * G_USEC_PER_SEC);
   pids = read_pids (pidfile);
   g_assert_cmpuint (pids->len, ==, 2);
   for (guint i = 0; i < pids->len; i++)
