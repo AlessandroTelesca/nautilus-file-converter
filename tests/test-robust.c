@@ -400,6 +400,51 @@ test_soffice_timeout (void)
   g_free (err); g_free (out); g_free (src); g_free (script); g_free (pidfile);
 }
 
+/* The leader exits at once and is reaped, but a grandchild in its process group
+ * keeps our stdout/stderr pipes open (a wrapper script that starts the real
+ * program in the background). The timeout must still end the job and kill that
+ * grandchild: the group id is pinned by the living grandchild, so kill(-pgid) is
+ * safe even though the leader is long gone. */
+static void
+test_leader_gone_grandchild_holds_pipes (void)
+{
+  char *pidfile = B (base, "orphan.pids");
+  char *script = B (bindir, "soffice-orphan");
+  char *body, *src, *err = NULL, *out;
+  char *saved = nfc_tools.soffice;
+  gint64 us;
+  GArray *pids;
+  guint before = count_entries (base, "nfc-");
+
+  /* `sleep 30 &` inherits the pipes (stdout/stderr are not redirected) */
+  body = g_strdup_printf ("sleep 30 &\necho $! > '%s'\nexit 0\n", pidfile);
+  write_script (script, body);
+  g_free (body);
+  nfc_tools.soffice = script;
+  touch (datadir, "orphan.txt");
+  src = B (datadir, "orphan.txt");
+
+  out = convert_sync (NFC_CAT_DOC, "txt", "pdf", src, &err, &us);
+  g_print ("leader gone, grandchild holds pipes: failed after %.2f s: %s\n", us / 1e6,
+           err ? err : "(no error)");
+  pids = read_pids (pidfile);
+  g_assert_cmpuint (pids->len, ==, 1);
+  if (!wait_pid_gone (g_array_index (pids, long, 0), 3))
+    {
+      kill ((pid_t) g_array_index (pids, long, 0), SIGKILL); /* do not leave it behind */
+      g_error ("the grandchild survived the timeout");
+    }
+  g_array_free (pids, TRUE);
+  g_assert_null (out);
+  g_assert_cmpstr (err, ==, "timed out");
+  g_assert_cmpint (us, >=, (TEST_TIMEOUT - 1) * G_USEC_PER_SEC);
+  g_assert_cmpint (us, <, (TEST_TIMEOUT + 2) * G_USEC_PER_SEC);
+  g_assert_cmpuint (count_entries (base, "nfc-"), ==, before);
+
+  nfc_tools.soffice = saved;
+  g_free (err); g_free (out); g_free (src); g_free (script); g_free (pidfile);
+}
+
 /* a hung ffmpeg that already wrote partial output */
 static void
 test_ffmpeg_timeout_cleanup (void)
@@ -733,6 +778,7 @@ main (int argc, char **argv)
   /* order matters: the probe test needs fresh probe state, shutdown goes last */
   g_test_add_func ("/robust/probe-freeze", test_probe_freeze);
   g_test_add_func ("/robust/soffice-timeout", test_soffice_timeout);
+  g_test_add_func ("/robust/leader-gone-grandchild-holds-pipes", test_leader_gone_grandchild_holds_pipes);
   g_test_add_func ("/robust/ffmpeg-timeout-cleanup", test_ffmpeg_timeout_cleanup);
   g_test_add_func ("/robust/log-mode-and-rotation", test_log_mode_and_rotation);
   g_test_add_func ("/robust/output-flood", test_output_flood);

@@ -426,11 +426,11 @@ step_start_io (Job *j)
 }
 
 /* Is the step's leader still unreaped? g_subprocess_get_identifier() is NULL
- * once GLib has reaped it, and from then on j->pgid is a stale number that the
- * kernel may hand to an unrelated process: kill(-pgid) would hit a stranger's
- * group. So every kill of the step's group is guarded by this, and none is
- * repeated after the first (step_timeout and nfc_shutdown kill while the leader
- * is alive; grandchildren in the group die with that kill). */
+ * once GLib has reaped it. Then j->pgid is stale unless a group member survives
+ * (a living member pins the number, see step_timeout), so the kills at the end
+ * of a step and at shutdown only happen while the leader is alive, and none is
+ * repeated after the timeout kill. step_timeout itself does not use this guard:
+ * it must also reach grandchildren of a leader that is already gone. */
 static gboolean
 step_leader_alive (Job *j)
 {
@@ -536,8 +536,16 @@ step_timeout (gpointer data)
 
   j->timeout_id = 0;
   j->timed_out = TRUE;
-  if (step_leader_alive (j)) /* the one kill of this step's group, see step_leader_alive() */
-    nfc_kill_group (j->pgid);
+  /* Unconditional, unlike the other kills (see step_leader_alive): the leader may
+   * already be reaped while a grandchild still holds the pipes (a wrapper script
+   * that exited), which is exactly what must die here. That is safe: Linux does
+   * not reuse a pid number while it is still the PGID or SID of any living
+   * process, so as long as a member of the group survives, j->pgid is pinned and
+   * can only mean our group. If nothing survives, the kill is a no-op (the only
+   * leftover risk is a pid wrap-around where the new process also makes itself a
+   * group leader with that very id, which is negligible next to leaving an orphan
+   * running). */
+  nfc_kill_group (j->pgid);
   if (j->proc != NULL)
     g_subprocess_force_exit (j->proc);
   if (j->cancel != NULL)

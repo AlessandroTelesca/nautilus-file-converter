@@ -27,9 +27,14 @@ GSubprocessLauncher *nfc_launcher_new (GSubprocessFlags flags);
  * already reaped). */
 pid_t nfc_subprocess_pgid (GSubprocess *proc);
 
-/* SIGKILL every process of group pgid (no-op for pgid <= 1). Only call it while
- * the group leader is unreaped (g_subprocess_get_identifier() != NULL): after
- * GLib has reaped it the pgid is stale and may belong to an unrelated process. */
+/* SIGKILL every process of group pgid (no-op for pgid <= 1).
+ *
+ * Callers: pgid is stale once GLib has reaped the group leader, unless some
+ * member of the group is still alive: Linux does not reuse a pid number while it
+ * is the PGID or SID of a living process, so a surviving grandchild pins it.
+ * Hence the step timeout kills unconditionally (it must reach grandchildren that
+ * outlive an exited leader), while every other caller only kills while
+ * g_subprocess_get_identifier() != NULL (leader unreaped). */
 void nfc_kill_group (pid_t pgid);
 
 G_END_DECLS
