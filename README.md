@@ -4,7 +4,9 @@ A "Convert to" submenu for Nautilus (GNOME Files), similar to the Windows app
 *File Converter*. Select one or more files, right-click, choose a target
 format; the converted copies appear next to the originals. For JPG, WEBP, AVIF,
 MP4, WebM and GIF the target opens a small submenu of quality presets (Best, High,
-Balanced, Small; see "Quality presets" below).
+Balanced, Small; see "Quality presets" below). A second entry, "Compress"
+(High, Balanced, Small), makes a smaller copy of a JPG, WEBP, AVIF, MP4, WebM or
+GIF in the same format (see "Compress" below).
 
 Written in C against `libnautilus-extension-4` (Nautilus 43+ / GTK 4) and built
 with meson. There is no scripting-language runtime involved: no Python, no
@@ -184,7 +186,7 @@ Settings (the source classes are as above: *graphics* = lossless sources,
 |---|---|---|---|---|
 | JPG graphics | q99, 4:4:4 | q95, 4:4:4, progressive | q85, 4:4:4, progressive | q75, 4:2:0, progressive, max 2560 px |
 | JPG photo | q95, 4:4:4 | q92, 4:2:0, progressive | q80, 4:2:0, progressive | q70, 4:2:0, progressive, max 2560 px |
-| WEBP graphics | lossless | lossless, 6 bits per channel | lossless, 5 bits per channel | lossless, 128-colour palette, max 2560 px |
+| WEBP graphics | lossless, method 4 | lossy q95 *or* the lossless file of Best, whichever is smaller | lossy q88 *or* lossless, whichever is smaller | lossy q75 *or* lossless, whichever is smaller, max 2560 px |
 | WEBP photo | lossy q90 | q85 | q78 | q65, max 2560 px |
 | AVIF graphics (4:4:4) | CRF 9 | CRF 18 | CRF 26 | CRF 34, max 2560 px |
 | AVIF photo (4:2:0) | CRF 12 | CRF 20 | CRF 28 | CRF 36, max 2560 px |
@@ -193,13 +195,23 @@ Settings (the source classes are as above: *graphics* = lossless sources,
 | WebM VP9 | CRF 28 | CRF 36 | CRF 44 | CRF 52, max 1080p |
 | GIF | 960 px, 15 fps | 720 px, 15 fps | 640 px, 12 fps | 480 px, 10 fps, 128 colours |
 
-Why WEBP graphics are lossless in every preset: for flat screenshots (a
-terminal, a UI) the lossless file is already smaller than any lossy WEBP (a
-1160x747 terminal screenshot: lossless 32 KB, lossy q60 59 KB, q98 135 KB), so
-a lossy preset would make "Small" larger than "Best". ImageMagick's
-`webp:near-lossless` has no effect. Instead the information in the pixels is
-reduced (6 or 5 bits per channel, or a 128-colour palette) and the result is
-encoded losslessly, which never makes the file larger.
+WEBP graphics (High, Balanced, Small) are encoded twice and the smaller file is
+kept: a lossy WEBP (q95 / q88 / q75, method 6, `webp:use-sharp-yuv=true`,
+`webp:alpha-quality=100`) and the lossless one of Best. Flat text
+screenshots (a terminal) are smaller lossless than at any lossy quality (a
+1160x747 terminal screenshot: lossless 33 KB, lossy q75 72 KB, q95 130 KB), so
+for them every preset is Best's file; screenshots with gradients, shadows or
+photos inside are 3 to 10 times smaller lossy. The lossless encode is only made
+for images below 25 megapixels (it costs time and memory: bigger images get the lossy encode alone) and if it fails the lossy encode is run
+alone. The choice is the general "keep only what is smaller" rule of the runner,
+also used by Compress (below). An earlier version posterised the pixels
+(6 or 5 bits per channel, a 128-colour palette) and encoded them losslessly
+instead; that is gone.
+
+(`webp:near-lossless` has no effect in ImageMagick. The define
+`webp:sharp-yuv` that Best's photo preset passes is not an ImageMagick option
+and has never done anything; `webp:use-sharp-yuv` is the real one and is used for
+the graphics presets only, so that Best's commands stay as they were.)
 
 Measured (SSIM from ffmpeg's `ssim` filter, RGB for images and 4:2:0 luma+chroma
 for video, against the source; the "text" column is SSIM of a 400x200 crop of the
@@ -218,9 +230,9 @@ a generated 720p test clip.
 | JPG, terminal | 64 %, 0.995, 0.989 | 42 %, 0.979, 0.957 | 29 %, 0.958, 0.918 |
 | JPG, UI | 53 %, 0.984, 0.982 | 32 %, 0.971, 0.967 | 22 %, 0.948, 0.941 |
 | JPG, phone photo / big photo / HEIC | 73 / 53 / 68 %, 0.984 / 0.986 / 0.981 | 41 / 26 / 40 %, 0.941 / 0.980 / 0.959 | 13 / 4 / 14 %, 0.928 / 0.969 / 0.931 |
-| WEBP, game screenshot | 69 %, 0.990, - | 51 %, 0.967, - | 23 %, 0.939, - |
-| WEBP, terminal | 85 %, 0.999, 1.000 | 77 %, 0.994, 0.996 | 75 %, 0.996, 1.000 |
-| WEBP, UI | 56 %, 0.993, 0.995 | 43 %, 0.978, 0.989 | 29 %, 0.991, 0.995 |
+| WEBP, game screenshot | 27 %, 0.954, - | 17 %, 0.942, - | 9 %, 0.910, - |
+| WEBP, terminal | 100 %, 1.000, 1.000 | 100 %, 1.000, 1.000 | 100 %, 1.000, 1.000 |
+| WEBP, UI | 31 %, 0.988, 0.994 | 19 %, 0.982, 0.983 | 12 %, 0.963, 0.962 |
 | WEBP, phone photo / big photo / HEIC | 62 / 67 / 69 %, 0.927 / 0.976 / 0.956 | 34 / 46 / 44 %, 0.896 / 0.971 / 0.929 | 9 / 9 / 15 %, 0.915 / 0.964 / 0.896 |
 | AVIF, game screenshot | 64 %, 0.966, - | 45 %, 0.951, - | 28 %, 0.922, - |
 | AVIF, terminal | 73 %, 0.998, 0.998 | 64 %, 0.998, 0.997 | 58 %, 0.996, 0.996 |
@@ -240,9 +252,16 @@ Where the numbers fall short of the intent, and why:
   is a very high bar for a format that rings around text. High (q95) keeps text
   at 0.98 to 0.99; Balanced and Small are visibly softer around small text
   (terminal text crop 0.957 and 0.918). Use WEBP or AVIF for screenshots.
-* WEBP and AVIF of flat graphics shrink little (terminal: 58 to 85 % of Best)
-  because Best is already tiny there; the larger savings are on game-like
-  screenshots and photos.
+* AVIF of flat graphics shrinks little (terminal: 58 to 73 % of Best) because
+  Best is already tiny there; WEBP of the terminal does not shrink at all: the
+  lossless file (33 KB) beats every lossy one, so each preset gives Best's file
+  (lossy q95 would be 130 KB). The larger savings are on game-like screenshots,
+  UIs with shadows or gradients and photos. The WEBP SSIM of the game screenshot
+  (0.954 / 0.942 / 0.910) is lower than the 0.990 / 0.967 / 0.939 of the earlier
+  posterised-lossless presets, at 27 / 17 / 9 % of Best's size instead of
+  69 / 51 / 23 %: lossy WEBP (4:2:0 chroma) cannot keep the hard colour edges of
+  that screenshot, but at the same size it is better (the earlier Balanced
+  was 51 % at 0.967, the new High 27 % at 0.954).
 * Photographs with fine sensor noise (the phone photo) lose SSIM fast under
   WEBP/AVIF at Balanced and Small because the noise is smoothed away; the
   picture still looks clean. SSIM is a harsh judge of that.
@@ -250,6 +269,46 @@ Where the numbers fall short of the intent, and why:
   presets scale the bitrate and the size follows the content: a low-motion
   screencast at 25 % of Best's bitrate is still 60 % of its size. libx264 is
   the main path and behaves as the table shows.
+
+### Compress
+
+Next to "Convert to" the menu has **Compress**, with the presets **High /
+Balanced / Small** (item names `FileConverter::Compress::<high|balanced|small>`).
+It makes a smaller copy of a file in the *same* format, with the settings of
+that preset from the table above.
+
+* **Offered** only when every selected file is a JPG/JPEG, WEBP, AVIF, MP4/M4V,
+  WebM or GIF (the formats that have presets): not for PNG, HEIC, MKV, audio,
+  documents, folders, and not for a mixed selection such as JPG + PNG. A selection
+  of several of these formats (JPG + WEBP, MP4 + WebM) is fine: each file is
+  compressed in its own format.
+* **What it does**: JPG, WEBP and AVIF as above (the photo settings, since all
+  three are lossy sources); MP4/M4V is re-encoded as H.264 (libx264 or libopenh264),
+  WebM as VP9, GIF with the GIF presets (a `.gif` is an image to Nautilus but
+  is compressed with the video tooling, palette and all). Small also scales
+  down: images beyond 2560 px, video above 1080p, GIF to 480 px.
+* **Name**: `photo (compressed).jpg`, through the normal no-overwrite
+  publishing (`photo (compressed) (1).jpg` if that exists). `.jpeg` gives
+  `.jpg`, `.m4v` gives `.mp4`. The original is never touched.
+* **Only if smaller**: the copy is kept only when it is strictly smaller than
+  the original. Otherwise it is deleted (nothing is left behind, not even the
+  hidden temporary file), the file counts as skipped, not failed, and the
+  notification says so. Re-encoding an already well-compressed file at a high
+  quality often makes it bigger: "photo.jpg is already as small as it gets".
+* **Notifications**: "Compressing…", then "photo.jpg → photo (compressed).jpg
+  (Balanced), −62%", or "Compressed 3 files (Balanced), −54%" (the percentage is
+  the saving over all compressed files), plus a line "photo.jpg is already as
+  small as it gets" / "2 files are already as small as they get" for skipped
+  files, and "Failed: ..." lines as usual.
+
+The rule behind the last point is a general runner feature, so that further
+features (resizing, upscaling) can reuse it: `NfcConvertOptions` of
+`nfc_convert_file_opts_async` carries a `reference_size` (`NFC_REFERENCE_SOURCE`,
+`NFC_REFERENCE_NONE` or a size in bytes) and an optional `name_suffix`; an output
+that is not strictly smaller than the reference ends the job with
+`NFC_CONVERT_ERROR_NOT_SMALLER` after deleting it. The same rule
+(`nfc_is_smaller`) picks between two candidate encodes inside one conversion (the
+internal step `NFC_STEP_KEEP_SMALLEST`, used by the WEBP graphics presets).
 
 ## Dependencies
 
@@ -410,7 +469,8 @@ and are only honoured when set.
 * **Notifications**: a "Converting..." notification, replaced by a summary
   ("Converted 3 files to MP4") or, on failure, the file name and the last line
   of the tool's error output. A preset other than Best is named: "Converted 3
-  files to JPG (Balanced)", "photo.png → photo.jpg (Small)".
+  files to JPG (Balanced)", "photo.png → photo.jpg (Small)". Compress has its
+  own texts (see "Compress").
 * **Output cap**: a tool's stdout and stderr are read incrementally and only the
   last 64 KiB of each is kept, so a tool that prints without end cannot grow
   memory, the log or the notification (the toast text is also shortened to
@@ -467,7 +527,9 @@ meson test -C build
   the middle of the list); and the preset menus: JPG/WEBP/AVIF/MP4/WebM/GIF are
   submenus with the items Best, High, Balanced, Small (names `...::<preset>`, a
   tooltip each), PNG, BMP, MP3, MKV and the rest are plain items, also for a
-  multi-file selection.
+  multi-file selection; and "Compress" (High, Balanced, Small): offered for a
+  JPG, `.jpeg`, two JPGs, JPG + WEBP, MP4, M4V, WebM and GIF, not for PNG, BMP, HEIC,
+  JPG + PNG, MP4 + MKV, MKV, audio, a document, a directory.
 * `module-probe-freeze`: the same, end to end, with a hanging fake `ffmpeg`
   first in `PATH`: right-clicking a `.txt` returns in microseconds.
 * `conversions`: generates fixtures with ImageMagick / ffmpeg / LibreOffice,
@@ -502,6 +564,20 @@ meson test -C build
   fake `notify-send` must name the preset in both banners. `core-logic` holds the
   exact arguments of every target x preset x source class and a hard-coded copy of
   the previous (Best) commands.
+  Compress: every compressible format (JPG, `.jpeg`, WEBP, AVIF, MP4, `.m4v`,
+  WebM, GIF) is compressed with High, Balanced and Small from a generated fixture:
+  same real type, named `<name> (compressed).<ext>`, smaller than the original,
+  sizes decreasing from High to Small, the original unchanged (checksum) and no
+  file left in the directory. A tiny q40 JPG compressed with High/Balanced is
+  "already as small as it gets": no file, no hidden temporary file, the error is
+  `NFC_CONVERT_ERROR_NOT_SMALLER`; an explicit reference size of 1 byte discards
+  a conversion, one of 1 TiB keeps it under the plain name. A second and third
+  compress of the same file become `(compressed) (1)` and `(2)` and never touch
+  the first. A JPG + WEBP + GIF batch compresses each in its own format; the
+  notification texts (one file, three files, skipped, one good + one skipped, one
+  good + one broken) are compared with a fake `notify-send`. WEBP graphics: a
+  flat text image comes out at exactly Best's (lossless) size for every preset, a
+  plasma image at less than half of it, decreasing, with no `.alt` file left.
 
 ## License
 

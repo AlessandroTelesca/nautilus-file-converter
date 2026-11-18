@@ -1329,10 +1329,31 @@ test_preset_jpg (void)
       }
 }
 
+/* does any step of the attempt start with this program/marker? */
+static char **
+find_step (GPtrArray *attempt, const char *first_arg, const char *needle)
+{
+  for (guint i = 0; i < attempt->len; i++)
+    {
+      char **step = attempt->pdata[i];
+
+      if (first_arg != NULL && !g_str_equal (step[0], first_arg))
+        continue;
+      if (needle == NULL || argv_has (step, needle))
+        return step;
+    }
+  return NULL;
+}
+
 static void
 test_preset_webp (void)
 {
   static const char *const q_photo[] = { "90", "85", "78", "65" };
+  static const char *const q_graphics[] = { "100", "95", "88", "75" };
+  NfcImageInfo small_info = { 1920, 1080, FALSE, 0, 0 };
+  NfcImageInfo big_info = { 6000, 5000, FALSE, 0, 0 }; /* 30 MP */
+  NfcImageInfo edge_info = { 5000, 4999, FALSE, 0, 0 }; /* just below 25 MP */
+  NfcImageInfo edge2_info = { 5000, 5000, FALSE, 0, 0 }; /* exactly 25 MP */
 
   use_fake_tools ();
   for (int p = 0; p < NFC_PRESET_N; p++)
@@ -1340,31 +1361,210 @@ test_preset_webp (void)
       GPtrArray *at = build (NFC_CAT_IMAGE, "jpg", "webp", (NfcPreset) p, FALSE);
       char **argv = last_step (at, 0);
 
-      /* photos: lossy, lower quality per preset, method 6 + sharp YUV throughout */
+      /* photos: lossy, lower quality per preset, method 6; one encode only.
+       * (webp:sharp-yuv is not an ImageMagick option and does nothing: Best's
+       * argv keeps it; the graphics presets use webp:use-sharp-yuv) */
+      g_assert_cmpuint (at->len, ==, 1);
+      g_assert_cmpuint (((GPtrArray *) at->pdata[0])->len, ==, 1);
       g_assert_cmpstr (argv_after (argv, "-quality"), ==, q_photo[p]);
       g_assert_true (argv_has (argv, "webp:method=6"));
       g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
       g_assert_false (argv_has (argv, "webp:lossless=true"));
       g_assert_cmpstr (argv_after (argv, "-resize"), ==, p == SMALL ? "2560x2560>" : "16383x16383>");
       g_ptr_array_unref (at);
-
-      /* graphics: always lossless (never larger than Best): fewer bits (High 6,
-       * Balanced 5 per channel) or a 128-colour palette (Small) */
-      at = build (NFC_CAT_IMAGE, "png", "webp", (NfcPreset) p, FALSE);
-      argv = last_step (at, 0);
-      g_assert_true (argv_has (argv, "webp:lossless=true"));
-      g_assert_true (argv_has (argv, "webp:method=4"));
-      g_assert_false (argv_has (argv, "-quality"));
-      g_assert_cmpstr (argv_after (argv, "-depth"), ==, p == HIGH ? "6" : p == BAL ? "5" : NULL);
-      g_assert_cmpint (argv_has (argv, "-colors"), ==, p == SMALL);
-      if (p == SMALL)
-        {
-          g_assert_cmpstr (argv_after (argv, "-colors"), ==, "128");
-          g_assert_true (argv_has (argv, "+dither"));
-        }
-      g_assert_cmpstr (argv_after (argv, "-resize"), ==, p == SMALL ? "2560x2560>" : "16383x16383>");
-      g_ptr_array_unref (at);
     }
+
+  /* graphics, Best: lossless method 4, one encode, as always */
+  {
+    GPtrArray *at = build (NFC_CAT_IMAGE, "png", "webp", BEST, TRUE);
+    char **argv = last_step (at, 0);
+
+    g_assert_cmpuint (at->len, ==, 1);
+    g_assert_cmpuint (((GPtrArray *) at->pdata[0])->len, ==, 1);
+    g_assert_true (argv_has (argv, "webp:lossless=true"));
+    g_assert_true (argv_has (argv, "webp:method=4"));
+    g_assert_false (argv_has (argv, "-quality"));
+    g_assert_false (argv_has (argv, "-depth"));
+    g_assert_false (argv_has (argv, "-colors"));
+    g_ptr_array_unref (at);
+  }
+
+  /* graphics, High/Balanced/Small: a lossy encode (q95/88/75, method 6, sharp YUV,
+   * alpha q100) AND the lossless one; the smaller file stays. Attempt 1 is
+   * [lossless -> out.alt, lossy -> out, keep the smallest of out and out.alt],
+   * attempt 2 (if attempt 1 fails) the lossy encode alone. No posterising. */
+  for (int p = HIGH; p < NFC_PRESET_N; p++)
+    {
+      NfcImageInfo *infos[] = { &small_info, &edge_info };
+
+      for (guint k = 0; k < G_N_ELEMENTS (infos); k++)
+        {
+          NfcImageInfo info = *infos[k];
+          char *src = g_strdup ("/s/a.png"), *out = g_strdup ("/o/x.webp");
+          gboolean dec;
+          GPtrArray *at = nfc_build_attempts_preset (NFC_CAT_IMAGE, "png", "webp", (NfcPreset) p,
+                                                     src, out, "/w", &info, &dec);
+          GPtrArray *a0, *a1;
+          char **lossless, **lossy, **keep;
+
+          g_assert_nonnull (at);
+          g_assert_cmpuint (at->len, ==, 2);
+          a0 = at->pdata[0];
+          a1 = at->pdata[1];
+          g_assert_cmpuint (a0->len, ==, 3);
+          g_assert_cmpuint (a1->len, ==, 1);
+          lossless = a0->pdata[0];
+          lossy = a0->pdata[1];
+          keep = a0->pdata[2];
+
+          g_assert_true (argv_has (lossless, "webp:lossless=true"));
+          g_assert_true (argv_has (lossless, "webp:method=4"));
+          g_assert_false (argv_has (lossless, "-quality"));
+          g_assert_cmpstr (lossless[g_strv_length (lossless) - 1], ==, "WEBP:/o/x.webp.alt");
+
+          g_assert_cmpstr (argv_after (lossy, "-quality"), ==, q_graphics[p]);
+          g_assert_true (argv_has (lossy, "webp:method=6"));
+          g_assert_true (argv_has (lossy, "webp:use-sharp-yuv=true"));
+          g_assert_true (argv_has (lossy, "webp:alpha-quality=100"));
+          g_assert_false (argv_has (lossy, "webp:lossless=true"));
+          g_assert_cmpstr (lossy[g_strv_length (lossy) - 1], ==, "WEBP:/o/x.webp");
+          for (guint i = 0; i < 2; i++)
+            {
+              char **v = i ? lossy : lossless;
+
+              /* no posterising any more, and the same resize for both candidates */
+              g_assert_false (argv_has (v, "-depth"));
+              g_assert_false (argv_has (v, "-colors"));
+              g_assert_false (argv_has (v, "+dither"));
+              g_assert_cmpstr (argv_after (v, "-resize"), ==,
+                               p == SMALL ? "2560x2560>" : "16383x16383>");
+            }
+
+          g_assert_cmpstr (keep[0], ==, NFC_STEP_KEEP_SMALLEST);
+          g_assert_cmpstr (keep[1], ==, "/o/x.webp");
+          g_assert_cmpstr (keep[2], ==, "/o/x.webp.alt");
+          g_assert_null (keep[3]);
+
+          /* the fallback: the lossy encode alone */
+          g_assert_cmpstr (argv_after (a1->pdata[0], "-quality"), ==, q_graphics[p]);
+          g_assert_false (find_step (a1, NFC_STEP_KEEP_SMALLEST, NULL) != NULL);
+          g_ptr_array_unref (at);
+          g_free (src);
+          g_free (out);
+        }
+
+      /* 25 MP and up, or a size nobody knows: the lossy encode alone */
+      {
+        NfcImageInfo *lossy_only[] = { &big_info, &edge2_info, NULL };
+
+        for (guint k = 0; k < G_N_ELEMENTS (lossy_only); k++)
+          {
+            gboolean dec;
+            GPtrArray *at = nfc_build_attempts_preset (NFC_CAT_IMAGE, "png", "webp", (NfcPreset) p,
+                                                       "/s/a.png", "/o/x.webp", "/w",
+                                                       lossy_only[k], &dec);
+            char **argv = last_step (at, 0);
+
+            g_assert_cmpuint (at->len, ==, 1);
+            g_assert_cmpuint (((GPtrArray *) at->pdata[0])->len, ==, 1);
+            g_assert_cmpstr (argv_after (argv, "-quality"), ==, q_graphics[p]);
+            g_assert_false (argv_has (argv, "webp:lossless=true"));
+            g_ptr_array_unref (at);
+          }
+      }
+    }
+}
+
+/* nfc_is_smaller: the one rule of "keep only if smaller" */
+static void
+test_is_smaller (void)
+{
+  g_assert_true (nfc_is_smaller (99, 100));
+  g_assert_true (nfc_is_smaller (1, 2));
+  g_assert_false (nfc_is_smaller (100, 100)); /* equal is not smaller: discarded */
+  g_assert_false (nfc_is_smaller (101, 100));
+  g_assert_false (nfc_is_smaller (0 + 5, 0));
+  g_assert_false (nfc_is_smaller (-1, 100)); /* unknown sizes never win */
+  g_assert_false (nfc_is_smaller (10, -1));
+}
+
+/* Compress targets: which source formats, which key/extension */
+static void
+test_compress_targets (void)
+{
+  static const struct { NfcCategory cat; const char *fmt, *key, *ext; NfcCategory tcat; } yes[] = {
+    { NFC_CAT_IMAGE, "jpg",  "jpg",  "jpg",  NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "webp", "webp", "webp", NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "avif", "avif", "avif", NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "gif",  "gif",  "gif",  NFC_CAT_VIDEO }, /* the GIF presets are the video ones */
+    { NFC_CAT_VIDEO, "mp4",  "mp4",  "mp4",  NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "m4v",  "mp4",  "mp4",  NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "webm", "webm", "webm", NFC_CAT_VIDEO },
+  };
+  static const struct { NfcCategory cat; const char *fmt; } no[] = {
+    { NFC_CAT_IMAGE, "png" }, { NFC_CAT_IMAGE, "bmp" }, { NFC_CAT_IMAGE, "tiff" },
+    { NFC_CAT_IMAGE, "heic" }, { NFC_CAT_IMAGE, "svg" }, { NFC_CAT_IMAGE, "ico" },
+    { NFC_CAT_VIDEO, "mkv" }, { NFC_CAT_VIDEO, "mov" }, { NFC_CAT_VIDEO, "avi" },
+    { NFC_CAT_AUDIO, "mp3" }, { NFC_CAT_AUDIO, "flac" }, { NFC_CAT_AUDIO, "m4a" },
+    { NFC_CAT_DOC, "docx" }, { NFC_CAT_SHEET, "csv" }, { NFC_CAT_SLIDE, "pptx" },
+    { NFC_CAT_VIDEO, "jpg" }, { NFC_CAT_IMAGE, "mp4" }, /* the wrong category */
+  };
+  NfcFormat f;
+
+  for (guint i = 0; i < G_N_ELEMENTS (yes); i++)
+    {
+      NfcCompressTarget t;
+
+      g_assert_true (nfc_compress_target (yes[i].cat, yes[i].fmt, &t));
+      g_assert_cmpstr (t.key, ==, yes[i].key);
+      g_assert_cmpstr (t.ext, ==, yes[i].ext);
+      g_assert_cmpint (t.cat, ==, yes[i].tcat);
+      g_assert_true (nfc_target_has_presets (t.cat, t.key));
+    }
+  for (guint i = 0; i < G_N_ELEMENTS (no); i++)
+    g_assert_false (nfc_compress_target (no[i].cat, no[i].fmt, NULL));
+  g_assert_false (nfc_compress_target (NFC_CAT_IMAGE, NULL, NULL));
+  /* .jpeg, .jpe and .m4v files classify to the keys above */
+  g_assert_true (nfc_classify ("/x/a.JPEG", NULL, &f));
+  g_assert_true (nfc_compress_target (f.cat, f.fmt, NULL));
+  g_assert_true (nfc_classify ("/x/a.m4v", NULL, &f));
+  g_assert_true (nfc_compress_target (f.cat, f.fmt, NULL));
+  g_assert_cmpstr (nfc_compress_tooltip (HIGH), !=, "");
+  g_assert_true (g_str_has_prefix (nfc_compress_tooltip (HIGH), "High"));
+  g_assert_true (g_str_has_prefix (nfc_compress_tooltip (BAL), "Balanced"));
+  g_assert_nonnull (strstr (nfc_compress_tooltip (SMALL), "2560"));
+  g_assert_cmpstr (nfc_compress_tooltip (BEST), ==, "");
+}
+
+/* what Compress builds: the preset's argv for the source's own format */
+static void
+test_compress_argv (void)
+{
+  use_fake_tools ();
+  set_encoders (0);
+  /* a JPG compressed: the photo table of JPG (q92/80/70) */
+  {
+    GPtrArray *at = build (NFC_CAT_IMAGE, "jpg", "jpg", HIGH, FALSE);
+
+    g_assert_cmpstr (argv_after (last_step (at, 0), "-quality"), ==, "92");
+    g_ptr_array_unref (at);
+  }
+  /* an MP4 with libx264, a WebM with VP9, a GIF with the GIF palette chain */
+  {
+    GPtrArray *at = build (NFC_CAT_VIDEO, "mp4", "mp4", BAL, FALSE);
+
+    g_assert_cmpstr (argv_after (last_step (at, 0), "-crf"), ==, "28");
+    g_assert_true (argv_has (last_step (at, 0), "libx264"));
+    g_ptr_array_unref (at);
+    at = build (NFC_CAT_VIDEO, "webm", "webm", BAL, FALSE);
+    g_assert_cmpstr (argv_after (last_step (at, 0), "-crf"), ==, "44");
+    g_assert_true (argv_has (last_step (at, 0), "libvpx-vp9"));
+    g_ptr_array_unref (at);
+    at = build (NFC_CAT_VIDEO, "gif", "gif", SMALL, FALSE);
+    g_assert_nonnull (strstr (argv_after (last_step (at, 0), "-vf"), "min(480,iw)"));
+    g_ptr_array_unref (at);
+  }
+  nfc_test_set_encoders ("");
 }
 
 static void
@@ -1586,6 +1786,9 @@ main (int argc, char **argv)
   g_test_add_func ("/core/best-argv-unchanged", test_best_argv_unchanged);
   g_test_add_func ("/core/preset-jpg", test_preset_jpg);
   g_test_add_func ("/core/preset-webp", test_preset_webp);
+  g_test_add_func ("/core/is-smaller", test_is_smaller);
+  g_test_add_func ("/core/compress-targets", test_compress_targets);
+  g_test_add_func ("/core/compress-argv", test_compress_argv);
   g_test_add_func ("/core/preset-avif", test_preset_avif);
   g_test_add_func ("/core/preset-video", test_preset_video);
   g_test_add_func ("/core/preset-distinct-and-ignored", test_preset_distinct_and_ignored);

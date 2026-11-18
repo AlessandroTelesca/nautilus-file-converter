@@ -120,27 +120,94 @@ write_script (const char *path, const char *body)
   g_free (content);
 }
 
+static void
+free_top (GList *items)
+{
+  if (items != NULL) /* the library asserts on an empty list */
+    nautilus_menu_item_list_free (items);
+}
+
+/* The top-level items of the selection ("Convert to", "Compress"): never any other,
+ * each at most once, "Convert to" first. */
+static GList *
+top_items (GList *infos)
+{
+  GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
+  guint n_convert = 0, n_compress = 0, pos = 0;
+
+  for (GList *l = items; l; l = l->next, pos++)
+    {
+      char *label = NULL;
+
+      g_object_get (l->data, "label", &label, NULL);
+      if (g_strcmp0 (label, "Convert to") == 0)
+        {
+          n_convert++;
+          g_assert_cmpuint (pos, ==, 0);
+        }
+      else if (g_strcmp0 (label, "Compress") == 0)
+        n_compress++;
+      else
+        g_error ("unexpected top-level item '%s'", label);
+      g_free (label);
+    }
+  g_assert_cmpuint (n_convert, <=, 1);
+  g_assert_cmpuint (n_compress, <=, 1);
+  return items;
+}
+
+/* the top-level item with this label (borrowed from items), or NULL */
+static NautilusMenuItem *
+find_top (GList *items, const char *want)
+{
+  for (GList *l = items; l; l = l->next)
+    {
+      char *label = NULL;
+      gboolean hit;
+
+      g_object_get (l->data, "label", &label, NULL);
+      hit = g_strcmp0 (label, want) == 0;
+      g_free (label);
+      if (hit)
+        return l->data;
+    }
+  return NULL;
+}
+
+/* the items of the submenu of the top-level item "label" (release with
+ * free_items_deep), or NULL when there is no such item */
+static GList *
+top_submenu (GList *infos, const char *label)
+{
+  GList *items = top_items (infos);
+  NautilusMenuItem *top = find_top (items, label);
+  NautilusMenu *sub = NULL;
+  GList *sub_items = NULL;
+
+  if (top != NULL)
+    {
+      g_object_get (top, "menu", &sub, NULL);
+      g_assert_nonnull (sub);
+      sub_items = nautilus_menu_get_items (sub);
+      g_object_unref (sub);
+    }
+  free_top (items);
+  return sub_items;
+}
+
 static char *
 menu_labels (GList *infos)
 {
-  GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
-  NautilusMenu *sub = NULL;
   GString *s = g_string_new (NULL);
-  char *label = NULL;
+  GList *sub_items = top_submenu (infos, "Convert to");
 
-  if (items == NULL)
+  if (sub_items == NULL)
     {
       g_string_free (s, TRUE);
       return NULL;
     }
-  g_assert_cmpuint (g_list_length (items), ==, 1);
-  g_object_get (items->data, "label", &label, "menu", &sub, NULL);
-  g_assert_cmpstr (label, ==, "Convert to");
-  g_assert_nonnull (sub);
   {
     /* transfer full: the list and its items belong to the caller */
-    GList *sub_items = nautilus_menu_get_items (sub);
-
     for (GList *l = sub_items; l; l = l->next)
       {
         char *lab = NULL;
@@ -153,9 +220,6 @@ menu_labels (GList *infos)
       }
     free_items_deep (sub_items);
   }
-  g_free (label);
-  g_object_unref (sub);
-  nautilus_menu_item_list_free (items);
   return g_string_free (s, FALSE);
 }
 
@@ -210,19 +274,7 @@ has_label (const char *labels, const char *l)
 static GList *
 submenu_items (GList *infos)
 {
-  GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
-  NautilusMenu *sub = NULL;
-  GList *sub_items;
-
-  if (items == NULL)
-    return NULL;
-  g_assert_cmpuint (g_list_length (items), ==, 1);
-  g_object_get (items->data, "menu", &sub, NULL);
-  g_assert_nonnull (sub);
-  sub_items = nautilus_menu_get_items (sub);
-  g_object_unref (sub);
-  nautilus_menu_item_list_free (items);
-  return sub_items;
+  return top_submenu (infos, "Convert to");
 }
 
 static GList *
@@ -418,6 +470,206 @@ test_preset_menus (void)
   g_free (u1);
 }
 
+/* The names, labels and tooltips of the Compress submenu of a selection: High,
+ * Balanced, Small, as leaves, named FileConverter::Compress::<preset> */
+static void
+assert_compress_submenu (GList *infos)
+{
+  static const char *const keys[] = { "high", "balanced", "small" };
+  static const char *const labels[] = { "High", "Balanced", "Small" };
+  GList *items = top_items (infos);
+  NautilusMenuItem *top = find_top (items, "Compress");
+  NautilusMenu *sub = NULL;
+  GList *sub_items;
+  char *name = item_prop (top, "name"), *tip = item_prop (top, "tip");
+  guint i = 0;
+
+  g_assert_nonnull (top);
+  g_assert_cmpstr (name, ==, "FileConverter::Compress");
+  g_assert_nonnull (tip);
+  g_assert_nonnull (strstr (tip, "original")); /* says that the original stays */
+  g_object_get (top, "menu", &sub, NULL);
+  g_assert_nonnull (sub);
+  sub_items = nautilus_menu_get_items (sub);
+  g_assert_cmpuint (g_list_length (sub_items), ==, 3);
+  for (GList *l = sub_items; l; l = l->next, i++)
+    {
+      char *n = item_prop (l->data, "name"), *lab = item_prop (l->data, "label");
+      char *t = item_prop (l->data, "tip"), *want = g_strconcat ("FileConverter::Compress::", keys[i], NULL);
+
+      g_assert_cmpstr (n, ==, want);
+      g_assert_cmpstr (lab, ==, labels[i]);
+      g_assert_nonnull (t);
+      g_assert_true (g_str_has_prefix (t, labels[i]));
+      g_assert_true (item_is_leaf (l->data));
+      g_free (n); g_free (lab); g_free (t); g_free (want);
+    }
+  nautilus_menu_item_list_free (sub_items);
+  g_object_unref (sub);
+  g_free (name);
+  g_free (tip);
+  nautilus_menu_item_list_free (items);
+}
+
+/* Is "Compress" offered for this selection? The probes run in the background
+ * and the menu never waits: wait (up to 12 s, a probe's own timeout is 10 s)
+ * until it appears; when it should NOT be there, until the Convert menu of the
+ * same selection is (so that the probes of the category have finished). */
+static gboolean
+compress_offered_wait (GList *infos, gboolean expect)
+{
+  GList *items = NULL;
+  gboolean got = FALSE;
+
+  for (int i = 0; i < 600; i++)
+    {
+      items = top_items (infos);
+      got = find_top (items, "Compress") != NULL;
+      if (got || (!expect && find_top (items, "Convert to") != NULL))
+        break;
+      free_top (items);
+      items = NULL;
+      g_usleep (20000);
+    }
+  free_top (items);
+  return got;
+}
+
+static GList *
+sel1 (const char *name, const char *mime, gboolean dir)
+{
+  char *u = path_uri (name);
+  GList *l = g_list_append (NULL, fake_new (u, mime, dir));
+
+  g_free (u);
+  return l;
+}
+
+static GList *
+sel_add (GList *l, const char *name, const char *mime)
+{
+  char *u = path_uri (name);
+
+  l = g_list_append (l, fake_new (u, mime, FALSE));
+  g_free (u);
+  return l;
+}
+
+/* "Compress" next to "Convert to": offered only when every selected file is a
+ * JPG, WEBP, AVIF, MP4/M4V, WebM or GIF. */
+static void
+test_compress_menus (void)
+{
+  GList *l;
+  char *ffmpeg_path = g_find_program_in_path ("ffmpeg");
+  gboolean have_ffmpeg = ffmpeg_path != NULL;
+
+  touch ("c1.jpg"); touch ("c2.jpeg"); touch ("c3.png"); touch ("c4.webp");
+  touch ("c5.wav"); touch ("c6.docx"); touch ("c7.mkv"); touch ("c8.heic"); touch ("c9.bmp");
+  touch ("v1.mp4"); touch ("v2.webm"); touch ("v3.m4v"); touch ("g1.gif"); touch ("a1.avif");
+  g_mkdir_with_parents ("compress-dir", 0755);
+
+  /* a JPG: yes, with its three presets; "Convert to" is still first */
+  l = sel1 ("c1.jpg", "image/jpeg", FALSE);
+  g_assert_true (compress_offered_wait (l, TRUE));
+  assert_compress_submenu (l);
+  g_list_free_full (l, g_object_unref);
+
+  /* .jpeg and two JPGs: yes */
+  l = sel1 ("c2.jpeg", "image/jpeg", FALSE);
+  g_assert_true (compress_offered_wait (l, TRUE));
+  l = sel_add (l, "c1.jpg", "image/jpeg");
+  g_assert_true (compress_offered_wait (l, TRUE));
+  assert_compress_submenu (l);
+  g_list_free_full (l, g_object_unref);
+
+  /* a PNG has no presets: no Compress (but "Convert to" is there) */
+  l = sel1 ("c3.png", "image/png", FALSE);
+  g_assert_false (compress_offered_wait (l, FALSE));
+  g_list_free_full (l, g_object_unref);
+
+  /* JPG + PNG: not every file qualifies */
+  l = sel1 ("c1.jpg", "image/jpeg", FALSE);
+  l = sel_add (l, "c3.png", "image/png");
+  g_assert_false (compress_offered_wait (l, FALSE));
+  g_list_free_full (l, g_object_unref);
+
+  /* BMP, HEIC: no */
+  l = sel1 ("c9.bmp", "image/bmp", FALSE);
+  g_assert_false (compress_offered_wait (l, FALSE));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("c8.heic", "image/heic", FALSE);
+  g_assert_false (compress_offered_wait (l, FALSE));
+  g_list_free_full (l, g_object_unref);
+
+  /* a directory, alone or with a JPG: no menu at all */
+  l = sel1 ("compress-dir", "inode/directory", TRUE);
+  g_assert_null (top_submenu (l, "Compress"));
+  g_assert_null (top_submenu (l, "Convert to"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("c1.jpg", "image/jpeg", FALSE);
+  l = g_list_append (l, fake_new ("file:///tmp", "inode/directory", TRUE));
+  g_assert_null (top_submenu (l, "Compress"));
+  g_list_free_full (l, g_object_unref);
+
+  /* audio, a document: no */
+  l = sel1 ("c5.wav", "audio/x-wav", FALSE);
+  g_assert_null (top_submenu (l, "Compress"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("c6.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", FALSE);
+  g_assert_null (top_submenu (l, "Compress"));
+  g_list_free_full (l, g_object_unref);
+
+  /* mixed formats of one category are fine: each is compressed in its own format
+   * (WEBP needs an ImageMagick that writes it: when "Convert to" of a PNG offers
+   * WEBP) */
+  {
+    GList *p = sel1 ("c3.png", "image/png", FALSE);
+    char *labels = menu_labels_wait (p);
+
+    g_assert_nonnull (labels);
+    if (has_label (labels, "WEBP"))
+      {
+        l = sel1 ("c1.jpg", "image/jpeg", FALSE);
+        l = sel_add (l, "c4.webp", "image/webp");
+        g_assert_true (compress_offered_wait (l, TRUE));
+        assert_compress_submenu (l);
+        g_list_free_full (l, g_object_unref);
+      }
+    g_free (labels);
+    g_list_free_full (p, g_object_unref);
+  }
+
+  /* video and GIF need ffmpeg (and its encoders: when it is there they are) */
+  l = sel1 ("c7.mkv", "video/x-matroska", FALSE); /* MKV: no presets of its own */
+  g_assert_false (compress_offered_wait (l, FALSE) && have_ffmpeg);
+  g_list_free_full (l, g_object_unref);
+  if (have_ffmpeg)
+    {
+      GList *m;
+
+      for (const char *const *f = (const char *const[]) { "v1.mp4", "v2.webm", "v3.m4v", NULL }; *f; f++)
+        {
+          l = sel1 (*f, g_str_has_suffix (*f, "webm") ? "video/webm" : "video/mp4", FALSE);
+          /* offered only if the needed encoder (libx264/libopenh264, libvpx-vp9) exists */
+          if (compress_offered_wait (l, TRUE))
+            assert_compress_submenu (l);
+          g_list_free_full (l, g_object_unref);
+        }
+      /* MP4 + MKV: no */
+      m = sel1 ("v1.mp4", "video/mp4", FALSE);
+      m = sel_add (m, "c7.mkv", "video/x-matroska");
+      g_assert_false (compress_offered_wait (m, FALSE));
+      g_list_free_full (m, g_object_unref);
+      /* GIF (an image) and a JPG together */
+      l = sel1 ("g1.gif", "image/gif", FALSE);
+      if (compress_offered_wait (l, TRUE))
+        assert_compress_submenu (l);
+      g_list_free_full (l, g_object_unref);
+    }
+  g_free (ffmpeg_path);
+}
+
 static void
 test_entry_points (void)
 {
@@ -601,6 +853,7 @@ test_register_and_menu (void)
   g_free (u1); g_free (u2);
 
   test_preset_menus ();
+  test_compress_menus ();
 
   /* no background items */
   {

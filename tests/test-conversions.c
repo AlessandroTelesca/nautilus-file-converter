@@ -1322,6 +1322,670 @@ test_presets (void)
   g_free (dir);
 }
 
+/* ---- Compress and the keep-the-smaller rule ---- */
+
+typedef struct {
+  GMainLoop *loop;
+  GPtrArray *results; /* NfcResult copies: "ok|skipped|fail", path, output, error */
+  gboolean done;
+} CompressWait;
+
+static void
+compress_batch_done (GPtrArray *results, gpointer data)
+{
+  CompressWait *w = data;
+
+  for (guint i = 0; i < results->len; i++)
+    {
+      NfcResult *r = results->pdata[i];
+
+      g_ptr_array_add (w->results, g_strdup_printf ("%s|%s|%s|%s",
+                                                    r->ok ? "ok" : r->skipped ? "skipped" : "fail",
+                                                    r->path, r->output ? r->output : "",
+                                                    r->error ? r->error : ""));
+    }
+  w->done = TRUE;
+  g_main_loop_quit (w->loop);
+}
+
+/* run nfc_batch_run_compress and wait; the results as "state|path|output|error" */
+static GPtrArray *
+compress_batch_sync (NfcCategory cat, NfcPreset preset, char **paths, char **fmts, guint n)
+{
+  CompressWait w = { g_main_loop_new (NULL, FALSE), g_ptr_array_new_with_free_func (g_free), FALSE };
+
+  nfc_batch_run_compress (cat, preset, (const char *const *) paths, (const char *const *) fmts, n,
+                          compress_batch_done, &w);
+  if (!w.done)
+    g_main_loop_run (w.loop);
+  g_main_loop_unref (w.loop);
+  return w.results;
+}
+
+/* nfc_convert_file_opts_async with the Compress options (what the batch does per
+ * file). *skipped: the output was not smaller and was discarded. */
+static char *
+compress_sync (NfcCategory cat, const char *fmt, NfcPreset preset, const char *src,
+               gboolean *skipped, char **err)
+{
+  NfcCompressTarget t;
+  NfcConvertOptions o = { preset, " (compressed)", NFC_REFERENCE_SOURCE };
+  Wait w = { g_main_loop_new (NULL, FALSE), NULL, NULL };
+  char *out;
+
+  *skipped = FALSE;
+  if (err != NULL)
+    *err = NULL;
+  if (!nfc_compress_target (cat, fmt, &t))
+    {
+      g_main_loop_unref (w.loop);
+      if (err != NULL)
+        *err = g_strdup ("not compressible");
+      return NULL;
+    }
+  nfc_convert_file_opts_async (t.cat, fmt, t.key, t.ext, src, &o, on_done, &w);
+  g_main_loop_run (w.loop);
+  g_main_loop_unref (w.loop);
+  out = w.out;
+  *skipped = w.error != NULL && g_error_matches (w.error, NFC_CONVERT_ERROR,
+                                                 NFC_CONVERT_ERROR_NOT_SMALLER);
+  if (err != NULL)
+    *err = w.error ? g_strdup (w.error->message) : NULL;
+  g_clear_error (&w.error);
+  return out;
+}
+
+static char *
+checksum_of (const char *path)
+{
+  char *data;
+  gsize len;
+  char *sum = NULL;
+
+  if (g_file_get_contents (path, &data, &len, NULL))
+    {
+      sum = g_compute_checksum_for_data (G_CHECKSUM_SHA256, (const guchar *) data, len);
+      g_free (data);
+    }
+  return sum;
+}
+
+/* every entry of dir, space separated, minus the ones in `known` (NULL-ended) */
+static char *
+unexpected_entries (const char *dir, const char *const *known)
+{
+  GDir *d = g_dir_open (dir, 0, NULL);
+  const char *n;
+  GString *s = g_string_new (NULL);
+
+  while (d != NULL && (n = g_dir_read_name (d)) != NULL)
+    if (!g_strv_contains (known, n))
+      g_string_append_printf (s, "%s ", n);
+  if (d != NULL)
+    g_dir_close (d);
+  return g_string_free (s, FALSE);
+}
+
+/* Compress src_name (in dir) with High, Balanced and Small: every result is the
+ * same format, named "<stem> (compressed).<ext>", a real file of that type,
+ * smaller than the source; the source is untouched and nothing is left behind. */
+static void
+check_compress (const char *dir, const char *src_name)
+{
+  char *src = g_build_filename (dir, src_name, NULL), *stem = nfc_stem_of (src);
+  char *label = g_strdup ("compress"), *before = checksum_of (src), *left;
+  gint64 src_size = file_size (src), size[NFC_PRESET_N] = { 0 };
+  GString *detail = g_string_new (NULL);
+  gboolean pass = TRUE;
+  NfcFormat f;
+  NfcCompressTarget t;
+
+  if (!nfc_classify (src, NULL, &f) || !nfc_compress_target (f.cat, f.fmt, &t))
+    {
+      add_row (src_name, label, FALSE, "not compressible");
+      goto out;
+    }
+  if (!nfc_compress_available (f.cat, f.fmt))
+    {
+      /* e.g. no libvpx / libaom / libx264 in this ffmpeg: nothing to test */
+      add_row (src_name, label, TRUE, "not offered by this system: skipped");
+      goto out;
+    }
+  for (int p = NFC_PRESET_HIGH; p < NFC_PRESET_N && pass; p++)
+    {
+      gboolean skipped;
+      char *err = NULL;
+      char *o = compress_sync (f.cat, f.fmt, (NfcPreset) p, src, &skipped, &err);
+      char *want = g_strdup_printf ("%s (compressed).%s", stem, t.ext), *base = NULL, *bad;
+
+      if (o == NULL)
+        {
+          g_string_append_printf (detail, "%s: %s%s; ", nfc_preset_label ((NfcPreset) p),
+                                  skipped ? "SKIPPED, not smaller: " : "", err ? err : "failed");
+          pass = FALSE;
+        }
+      else
+        {
+          base = g_path_get_basename (o);
+          size[p] = file_size (o);
+          bad = check_type (t.ext, o);
+          if (g_strcmp0 (base, want) != 0)
+            {
+              g_string_append_printf (detail, "%s: named %s, expected %s; ",
+                                      nfc_preset_label ((NfcPreset) p), base, want);
+              pass = FALSE;
+            }
+          else if (bad != NULL || size[p] <= 0)
+            {
+              g_string_append_printf (detail, "%s: %s; ", nfc_preset_label ((NfcPreset) p),
+                                      bad ? bad : "empty");
+              pass = FALSE;
+            }
+          else if (size[p] >= src_size)
+            {
+              g_string_append_printf (detail, "%s: %" G_GINT64_FORMAT " bytes is not smaller than the source %"
+                                      G_GINT64_FORMAT "; ", nfc_preset_label ((NfcPreset) p), size[p],
+                                      src_size);
+              pass = FALSE;
+            }
+          else
+            g_string_append_printf (detail, "%s %" G_GINT64_FORMAT "%% ", nfc_preset_label ((NfcPreset) p),
+                                    size[p] * 100 / src_size);
+          g_free (bad);
+          g_unlink (o); /* the next preset publishes under the same name */
+        }
+      g_free (want);
+      g_free (base);
+      g_free (err);
+      g_free (o);
+    }
+  if (pass && (size[NFC_PRESET_BALANCED] > size[NFC_PRESET_HIGH] ||
+               size[NFC_PRESET_SMALL] > size[NFC_PRESET_BALANCED]))
+    {
+      g_string_append (detail, "(sizes do not decrease High > Balanced > Small) ");
+      pass = FALSE;
+    }
+  {
+    char *after = checksum_of (src);
+
+    if (g_strcmp0 (before, after) != 0)
+      {
+        g_string_append (detail, "(the original changed) ");
+        pass = FALSE;
+      }
+    g_free (after);
+  }
+  left = unexpected_entries (dir, (const char *const[]) { src_name, NULL });
+  if (left[0] != '\0')
+    {
+      g_string_append_printf (detail, "(left behind: %s)", left);
+      pass = FALSE;
+    }
+  g_free (left);
+  add_row (src_name, label, pass, detail->str);
+out:
+  g_string_free (detail, TRUE);
+  g_free (label);
+  g_free (before);
+  g_free (stem);
+  g_free (src);
+}
+
+/* The keep-the-smaller rule: an output that is not smaller than the reference is
+ * discarded, with nothing left behind */
+static void
+test_keep_smaller (const char *dir)
+{
+  const char *sub = "keep";
+  char *d = g_build_filename (dir, sub, NULL), *tiny, *gfx;
+  gboolean skipped;
+  char *err = NULL, *o, *left;
+  NfcConvertOptions opts;
+  Wait w;
+
+  g_mkdir_with_parents (d, 0755);
+  fixture ("compress/keep/tiny.jpg",
+           run (d, NULL, "magick", "-seed", "3", "-size", "200x150", "plasma:fractal",
+                "-quality", "40", "tiny.jpg", NULL));
+  fixture ("compress/keep/gfx.png",
+           run (d, NULL, "magick", "-seed", "7", "-size", "320x200", "plasma:fractal", "gfx.png", NULL));
+  tiny = g_build_filename (d, "tiny.jpg", NULL);
+  gfx = g_build_filename (d, "gfx.png", NULL);
+
+  /* a tiny q40 JPG compressed with High (q92) comes out larger: skipped, nothing left */
+  for (int p = NFC_PRESET_HIGH; p < NFC_PRESET_N; p++)
+    {
+      char *label = g_strdup_printf ("tiny.jpg compress %s", nfc_preset_label ((NfcPreset) p));
+
+      o = compress_sync (NFC_CAT_IMAGE, "jpg", (NfcPreset) p, tiny, &skipped, &err);
+      left = unexpected_entries (d, (const char *const[]) { "tiny.jpg", "gfx.png", NULL });
+      /* Small shrinks nothing here (200 px) and may or may not be smaller: only
+       * the invariant is checked there (skipped XOR a smaller file) */
+      if (p == NFC_PRESET_SMALL && o != NULL)
+        {
+          add_row ("keep-smaller", label, file_size (o) < file_size (tiny), "smaller: kept");
+          g_unlink (o);
+        }
+      else
+        add_row ("keep-smaller", label, o == NULL && skipped && left[0] == '\0' &&
+                 g_strcmp0 (err, "already as small as it gets") == 0,
+                 o ? o : (left[0] ? left : (err ? err : "")));
+      if (p == NFC_PRESET_SMALL && o != NULL)
+        g_free (left), left = g_strdup ("");
+      g_free (label);
+      g_free (left);
+      g_free (err);
+      g_free (o);
+    }
+
+  /* the general mechanism: an explicit reference size, no name suffix */
+  opts = (NfcConvertOptions) { NFC_PRESET_BEST, NULL, 1 };
+  w = (Wait) { g_main_loop_new (NULL, FALSE), NULL, NULL };
+  nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", gfx, &opts, on_done, &w);
+  g_main_loop_run (w.loop);
+  left = unexpected_entries (d, (const char *const[]) { "tiny.jpg", "gfx.png", NULL });
+  add_row ("keep-smaller", "reference 1 byte: discarded", w.out == NULL && left[0] == '\0' &&
+           g_error_matches (w.error, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER),
+           w.error ? w.error->message : (left[0] ? left : "kept"));
+  g_free (left);
+  g_clear_error (&w.error);
+  g_free (w.out);
+
+  opts.reference_size = G_GINT64_CONSTANT (1) << 40;
+  w.out = NULL;
+  nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", gfx, &opts, on_done, &w);
+  g_main_loop_run (w.loop);
+  {
+    char *base = w.out ? g_path_get_basename (w.out) : NULL;
+
+    add_row ("keep-smaller", "reference 1 TiB: kept, plain name",
+             g_strcmp0 (base, "gfx.jpg") == 0 && non_empty (w.out), w.error ? w.error->message : base);
+    g_free (base);
+  }
+  if (w.out)
+    g_unlink (w.out);
+  g_free (w.out);
+  g_clear_error (&w.error);
+
+  /* NFC_REFERENCE_SOURCE: smaller than the PNG source itself -> kept */
+  opts.reference_size = NFC_REFERENCE_SOURCE;
+  w.out = NULL;
+  nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", gfx, &opts, on_done, &w);
+  g_main_loop_run (w.loop);
+  add_row ("keep-smaller", "reference = source", w.out != NULL && file_size (w.out) < file_size (gfx),
+           w.error ? w.error->message : "kept a smaller file");
+  if (w.out)
+    g_unlink (w.out);
+  g_free (w.out);
+  g_clear_error (&w.error);
+  g_main_loop_unref (w.loop);
+
+  g_free (tiny);
+  g_free (gfx);
+  g_free (d);
+}
+
+/* a name that is taken: "(compressed) (1)", never overwrites anything */
+static void
+test_compress_naming (const char *dir)
+{
+  char *d = g_build_filename (dir, "naming", NULL), *src, *o1, *o2, *o3, *b1, *b2, *b3;
+  char *before1, *sums_ok;
+  gboolean skipped;
+
+  g_mkdir_with_parents (d, 0755);
+  fixture ("compress/naming/pic.jpg",
+           run (d, NULL, "magick", "-seed", "5", "-size", "800x500", "plasma:fractal", "-quality", "96",
+                "pic.jpg", NULL));
+  src = g_build_filename (d, "pic.jpg", NULL);
+  o1 = compress_sync (NFC_CAT_IMAGE, "jpg", NFC_PRESET_HIGH, src, &skipped, NULL);
+  before1 = o1 ? checksum_of (o1) : NULL;
+  o2 = compress_sync (NFC_CAT_IMAGE, "jpg", NFC_PRESET_SMALL, src, &skipped, NULL);
+  o3 = compress_sync (NFC_CAT_IMAGE, "jpg", NFC_PRESET_BALANCED, src, &skipped, NULL);
+  b1 = o1 ? g_path_get_basename (o1) : NULL;
+  b2 = o2 ? g_path_get_basename (o2) : NULL;
+  b3 = o3 ? g_path_get_basename (o3) : NULL;
+  {
+    char *after1 = o1 ? checksum_of (o1) : NULL;
+
+    sums_ok = g_strcmp0 (before1, after1) == 0 ? NULL : g_strdup ("the first output was overwritten");
+    g_free (after1);
+  }
+  add_row ("pic.jpg", "compress naming",
+           g_strcmp0 (b1, "pic (compressed).jpg") == 0 &&
+           g_strcmp0 (b2, "pic (compressed) (1).jpg") == 0 &&
+           g_strcmp0 (b3, "pic (compressed) (2).jpg") == 0 && sums_ok == NULL,
+           sums_ok ? sums_ok : (b3 ? b3 : "failed"));
+  g_free (sums_ok);
+  g_free (before1);
+  g_free (b1); g_free (b2); g_free (b3);
+  g_free (o1); g_free (o2); g_free (o3);
+  g_free (src);
+  g_free (d);
+}
+
+/* Several files at once, in several formats, through the batch + notifications */
+static void
+test_compress_batch (const char *dir)
+{
+  char *d = g_build_filename (dir, "batch", NULL);
+  char *paths[4], *fmts[4];
+  GPtrArray *res;
+  gboolean pass = TRUE;
+  GString *detail = g_string_new (NULL);
+  const char *want[] = { "m1 (compressed).jpg", "m2 (compressed).webp", "m3 (compressed).gif" };
+
+  g_mkdir_with_parents (d, 0755);
+  fixture ("compress/batch/m1.jpg",
+           run (d, NULL, "magick", "-seed", "5", "-size", "800x500", "plasma:fractal", "-quality", "96",
+                "m1.jpg", NULL));
+  fixture ("compress/batch/m2.webp",
+           run (d, NULL, "magick", "m1.jpg", "-quality", "98", "WEBP:m2.webp", NULL));
+  fixture ("compress/batch/m3.gif",
+           run (d, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                "testsrc2=d=2:s=800x600:r=20", "m3.gif", NULL));
+  paths[0] = g_build_filename (d, "m1.jpg", NULL);
+  paths[1] = g_build_filename (d, "m2.webp", NULL);
+  paths[2] = g_build_filename (d, "m3.gif", NULL);
+  paths[3] = NULL;
+  fmts[0] = (char *) "jpg"; fmts[1] = (char *) "webp"; fmts[2] = (char *) "gif"; fmts[3] = NULL;
+
+  /* mixed formats of the image category: each in its own format (a GIF is
+   * compressed with the GIF presets) */
+  nfc_tools.notify = NULL;
+  res = compress_batch_sync (NFC_CAT_IMAGE, NFC_PRESET_BALANCED, paths, fmts, 3);
+  g_assert_cmpuint (res->len, ==, 3);
+  for (guint i = 0; i < 3; i++)
+    {
+      char **v = g_strsplit (res->pdata[i], "|", 4);
+      char *base = g_path_get_basename (v[2]);
+      char *bad = v[2][0] ? check_type (strrchr (want[i], '.') + 1, v[2]) : g_strdup ("no output");
+
+      if (!g_str_equal (v[0], "ok") || g_strcmp0 (base, want[i]) != 0 || bad != NULL ||
+          file_size (v[2]) >= file_size (paths[i]))
+        {
+          g_string_append_printf (detail, "%s: %s %s %s; ", want[i], v[0], base, bad ? bad : "");
+          pass = FALSE;
+        }
+      else
+        g_string_append_printf (detail, "%s %" G_GINT64_FORMAT "%% ", want[i],
+                                file_size (v[2]) * 100 / file_size (paths[i]));
+      g_free (bad);
+      g_free (base);
+      g_strfreev (v);
+    }
+  add_row ("jpg + webp + gif", "compress batch (Balanced)", pass, detail->str);
+  g_ptr_array_unref (res);
+  g_string_free (detail, TRUE);
+  for (guint i = 0; i < 3; i++)
+    g_free (paths[i]);
+  g_free (d);
+}
+
+/* The notification texts of Compress */
+static void
+test_compress_notifications (const char *dir)
+{
+  char *ndir = g_dir_make_tmp ("nfc-notify-XXXXXX", NULL);
+  char *script = g_build_filename (ndir, "notify-send", NULL);
+  char *log = g_build_filename (ndir, "calls.log", NULL);
+  char *content = g_strdup_printf ("#!/bin/sh\necho \"$@\" >> '%s'\necho 4242\n", log);
+  char *saved = nfc_tools.notify;
+  struct {
+    const char *label;
+    NfcPreset preset;
+    const char *files[4];   /* "big", "tiny" or "bad" each */
+    const char *want[4];    /* all of these must be in the log */
+    const char *unwanted;
+  } c[] = {
+    { "one file", NFC_PRESET_HIGH, { "big", NULL },
+      { " -- Compressing… f0.jpg (High)", " -- Compression complete f0.jpg → f0 (compressed).jpg (High), −", "%", NULL },
+      "already as small" },
+    { "three files", NFC_PRESET_BALANCED, { "big", "big", "big", NULL },
+      { " -- Compressing… 3 files (Balanced)", " -- Compression complete Compressed 3 files (Balanced), −", "%", NULL },
+      "already as small" },
+    { "already as small as it gets", NFC_PRESET_HIGH, { "tiny", NULL },
+      { " -- Compressing… f0.jpg (High)", " -- Nothing to compress f0.jpg is already as small as it gets", NULL, NULL },
+      "Compression failed" },
+    { "one good, one skipped", NFC_PRESET_BALANCED, { "big", "tiny", NULL },
+      { " -- Compression complete f0.jpg → f0 (compressed).jpg (Balanced), −",
+        "\nf1.jpg is already as small as it gets", NULL, NULL },
+      "Compression failed" },
+    { "one good, one broken", NFC_PRESET_BALANCED, { "big", "bad", NULL },
+      { " -- Compression failed f0.jpg → f0 (compressed).jpg (Balanced), −", "\nFailed: f1.jpg — ", NULL, NULL },
+      "already as small" },
+  };
+
+  g_file_set_contents (script, content, -1, NULL);
+  g_chmod (script, 0755);
+  nfc_tools.notify = script;
+  for (guint k = 0; k < G_N_ELEMENTS (c); k++)
+    {
+      char *sub = g_strdup_printf ("%s/nt%u", dir, k);
+      char *paths[5] = { NULL }, *fmts[5] = { NULL }, *logged = NULL;
+      guint n = 0;
+      gboolean pass = FALSE;
+      GString *miss = g_string_new (NULL);
+      char *big = g_build_filename (dir, "keep", "gfx.png", NULL);
+
+      g_mkdir_with_parents (sub, 0755);
+      for (; c[k].files[n] != NULL; n++)
+        {
+          char *name = g_strdup_printf ("f%u.jpg", n);
+
+          paths[n] = g_build_filename (sub, name, NULL);
+          fmts[n] = (char *) "jpg";
+          if (g_str_equal (c[k].files[n], "big"))
+            run (sub, NULL, "magick", "-seed", "9", "-size", "640x400", "plasma:fractal", "-quality", "96", name, NULL);
+          else if (g_str_equal (c[k].files[n], "tiny"))
+            run (sub, NULL, "magick", "-seed", "3", "-size", "200x150", "plasma:fractal", "-quality", "40", name, NULL);
+          else
+            g_file_set_contents (paths[n], "this is not a jpeg", -1, NULL);
+          g_free (name);
+        }
+      g_remove (log);
+      {
+        GPtrArray *res = compress_batch_sync (NFC_CAT_IMAGE, c[k].preset, paths, fmts, n);
+
+        g_ptr_array_unref (res);
+      }
+      for (int i = 0; i < 500 && !pass; i++)
+        {
+          g_main_context_iteration (NULL, FALSE);
+          g_usleep (20000);
+          g_clear_pointer (&logged, g_free);
+          if (g_file_get_contents (log, &logged, NULL, NULL))
+            pass = strstr (logged, "Compression complete") != NULL ||
+                   strstr (logged, "Compression failed") != NULL ||
+                   strstr (logged, "Nothing to compress") != NULL;
+        }
+      if (!pass)
+        g_string_append (miss, "no final notification; ");
+      for (guint i = 0; pass && i < 4 && c[k].want[i] != NULL; i++)
+        if (strstr (logged, c[k].want[i]) == NULL)
+          {
+            g_string_append_printf (miss, "missing '%s'; ", c[k].want[i]);
+            pass = FALSE;
+          }
+      if (pass && c[k].unwanted != NULL && strstr (logged, c[k].unwanted) != NULL)
+        {
+          g_string_append_printf (miss, "unexpected '%s'; ", c[k].unwanted);
+          pass = FALSE;
+        }
+      add_row ("(notifications)", c[k].label, pass,
+               pass ? "Compress notification texts" : (miss->len ? miss->str : "?"));
+      if (!pass && logged != NULL)
+        g_printerr ("--- notify log of '%s':\n%s\n", c[k].label, logged);
+      g_string_free (miss, TRUE);
+      g_free (logged);
+      g_free (big);
+      for (guint i = 0; i < n; i++)
+        g_free (paths[i]);
+      g_free (sub);
+    }
+  nfc_tools.notify = saved;
+  g_free (ndir);
+  g_free (script);
+  g_free (log);
+  g_free (content);
+}
+
+/* WEBP graphics presets: lossy encode vs lossless, the smaller wins */
+static void
+test_webp_graphics_presets (const char *dir)
+{
+  char *d = g_build_filename (dir, "webpgfx", NULL), *flat, *plasma;
+  gint64 best_flat = 0, best_plasma = 0, flat_size[NFC_PRESET_N] = { 0 }, plasma_size[NFC_PRESET_N] = { 0 };
+  gboolean pass = TRUE;
+  GString *detail = g_string_new (NULL);
+  char *left;
+
+  g_mkdir_with_parents (d, 0755);
+  /* flat text on a plain background: lossless is smaller than any lossy q */
+  fixture ("compress/webpgfx/flat.png",
+           run (d, NULL, "magick", "-size", "800x500", "xc:#1e1e1e", "-fill", "#d0d0d0", "-pointsize", "16",
+                "-annotate", "+10+30", "user@host:~$ ls -la /usr/share/doc | head -n 20\n"
+                "drwxr-xr-x 2 root root 4096 Nov 18 12:00 alpha\n"
+                "drwxr-xr-x 2 root root 4096 Nov 18 12:00 beta\n", "flat.png", NULL));
+  /* smooth gradients and noise: a lossy encode is far smaller */
+  fixture ("compress/webpgfx/plasma.png",
+           run (d, NULL, "magick", "-seed", "7", "-size", "640x400", "plasma:fractal",
+                "-fill", "white", "-pointsize", "28", "-annotate", "+20+50", "Hello presets 12345",
+                "plasma.png", NULL));
+  flat = g_build_filename (d, "flat.png", NULL);
+  plasma = g_build_filename (d, "plasma.png", NULL);
+  for (int p = 0; p < NFC_PRESET_N; p++)
+    {
+      for (int k = 0; k < 2; k++)
+        {
+          const char *src = k ? plasma : flat;
+          char *err = NULL;
+          char *o = convert_preset_sync (NFC_CAT_IMAGE, "png", "webp", (NfcPreset) p, "webp", src, &err);
+          gint64 sz = file_size (o);
+          char *bad = o ? check_type ("webp", o) : g_strdup (err ? err : "failed");
+
+          if (bad != NULL || sz <= 0)
+            {
+              g_string_append_printf (detail, "%s %s: %s; ", k ? "plasma" : "flat",
+                                      nfc_preset_label ((NfcPreset) p), bad ? bad : "empty");
+              pass = FALSE;
+            }
+          (k ? plasma_size : flat_size)[p] = sz;
+          if (p == 0)
+            (k ? &best_plasma : &best_flat)[0] = sz;
+          if (o != NULL)
+            g_unlink (o);
+          g_free (bad);
+          g_free (err);
+          g_free (o);
+        }
+    }
+  for (int p = 1; pass && p < NFC_PRESET_N; p++)
+    {
+      /* flat: lossless wins every time: exactly Best's size, never larger */
+      if (flat_size[p] != best_flat)
+        {
+          g_string_append_printf (detail, "flat %s is %" G_GINT64_FORMAT ", Best (lossless) %" G_GINT64_FORMAT "; ",
+                                  nfc_preset_label ((NfcPreset) p), flat_size[p], best_flat);
+          pass = FALSE;
+        }
+      /* plasma: lossy wins by far, and shrinks with the preset */
+      if (plasma_size[p] * 2 > best_plasma || plasma_size[p] > plasma_size[p - 1])
+        {
+          g_string_append_printf (detail, "plasma %s is %" G_GINT64_FORMAT " (Best %" G_GINT64_FORMAT ", previous %"
+                                  G_GINT64_FORMAT "); ", nfc_preset_label ((NfcPreset) p),
+                                  plasma_size[p], best_plasma, plasma_size[p - 1]);
+          pass = FALSE;
+        }
+    }
+  left = unexpected_entries (d, (const char *const[]) { "flat.png", "plasma.png", NULL });
+  if (left[0] != '\0')
+    {
+      g_string_append_printf (detail, "(left behind: %s)", left);
+      pass = FALSE;
+    }
+  if (pass)
+    g_string_append_printf (detail, "flat %" G_GINT64_FORMAT "/%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT
+                            " (Best %" G_GINT64_FORMAT "), plasma %" G_GINT64_FORMAT "/%" G_GINT64_FORMAT
+                            "/%" G_GINT64_FORMAT " (Best %" G_GINT64_FORMAT ")",
+                            flat_size[1], flat_size[2], flat_size[3], best_flat,
+                            plasma_size[1], plasma_size[2], plasma_size[3], best_plasma);
+  add_row ("flat.png, plasma.png", "webp graphics: smaller of lossy and lossless", pass, detail->str);
+  g_free (left);
+  g_string_free (detail, TRUE);
+  g_free (flat);
+  g_free (plasma);
+  g_free (d);
+}
+
+static void
+test_compress (void)
+{
+  char *dir = P ("compress");
+  char *saved_notify = nfc_tools.notify;
+
+  g_mkdir_with_parents (dir, 0755);
+  nfc_tools.notify = NULL; /* no real notifications from the test */
+  {
+    /* one directory per source file: the "nothing left behind" check lists it */
+    static const char *const names[] = { "photo.jpg", "photo.jpeg", "photo.webp", "photo.avif",
+                                         "clip.mp4", "clip.m4v", "clip.webm", "anim.gif" };
+    char *sub[G_N_ELEMENTS (names)];
+    char *src = NULL;
+
+    for (guint i = 0; i < G_N_ELEMENTS (names); i++)
+      {
+        sub[i] = g_strdup_printf ("%s/c%u", dir, i);
+        g_mkdir_with_parents (sub[i], 0755);
+      }
+    /* a high-quality photograph-like JPG (q97), WEBP and AVIF made from it */
+    fixture ("photo.jpg", run (sub[0], NULL, "magick", "-seed", "11", "-size", "1280x800", "plasma:fractal",
+                               "-attenuate", "0.3", "+noise", "Gaussian", "-quality", "97", "photo.jpg", NULL));
+    src = g_build_filename (sub[1], "photo.jpeg", NULL);
+    {
+      char *from = g_build_filename (sub[0], "photo.jpg", NULL);
+      gchar *data;
+      gsize len;
+
+      if (g_file_get_contents (from, &data, &len, NULL))
+        {
+          g_file_set_contents (src, data, len, NULL);
+          g_free (data);
+        }
+      g_free (from);
+    }
+    g_free (src);
+    fixture ("photo.webp", run (sub[2], NULL, "magick", "../c0/photo.jpg", "-quality", "98", "WEBP:photo.webp", NULL));
+    fixture ("photo.avif", run (sub[3], NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i",
+                                "../c0/photo.jpg", "-frames:v", "1", "-c:v", "libaom-av1", "-crf", "10",
+                                "-cpu-used", "8", "-still-picture", "1", "-f", "avif", "photo.avif", NULL));
+    /* video: an MPEG-4 part 2 encode at q2 is large for what it holds */
+    fixture ("clip.mp4", run (sub[4], NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                              "-i", "testsrc2=d=2:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=2", "-shortest",
+                              "-c:v", "mpeg4", "-q:v", "2", "-pix_fmt", "yuv420p", "clip.mp4", NULL));
+    fixture ("clip.m4v", run (sub[5], NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i",
+                              "../c4/clip.mp4", "-c", "copy", "-f", "mp4", "clip.m4v", NULL));
+    fixture ("clip.webm", run (sub[6], NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                               "-i", "testsrc2=d=2:s=1280x720:r=25", "-c:v", "libvpx-vp9", "-crf", "12",
+                               "-b:v", "0", "-deadline", "realtime", "-cpu-used", "8", "clip.webm", NULL));
+    fixture ("anim.gif", run (sub[7], NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                              "-i", "testsrc2=d=2:s=1000x750:r=25", "anim.gif", NULL));
+    for (guint i = 0; i < G_N_ELEMENTS (names); i++)
+      {
+        check_compress (sub[i], names[i]);
+        g_free (sub[i]);
+      }
+  }
+  test_keep_smaller (dir);
+  test_compress_naming (dir);
+  test_compress_batch (dir);
+  test_webp_graphics_presets (dir);
+  nfc_tools.notify = saved_notify;
+  test_compress_notifications (dir);
+  nfc_tools.notify = saved_notify;
+  g_free (dir);
+}
+
 int
 main (void)
 {
@@ -1479,6 +2143,7 @@ main (void)
   check_error ("noaudio.mp4", "m4a", "no audio track");
   test_quality ();
   test_presets ();
+  test_compress ();
   test_large_image ();
   test_pdf_page_size ();
   check_many ("test.mov", k_mov);
@@ -1565,7 +2230,7 @@ main (void)
     lines = g_strsplit (log != NULL ? log : "", "\n", -1);
     for (char **l = lines; *l; l++)
       if (strstr (*l, "size probe failed") != NULL && strstr (*l, "bad.png") == NULL &&
-          strstr (*l, "corrupt.png") == NULL)
+          strstr (*l, "corrupt.png") == NULL && strstr (*l, "/nt4/") == NULL)
         {
           g_printerr ("%s\n", *l);
           bad++;

@@ -23,11 +23,54 @@ void  nfc_convert_file_preset_async (NfcCategory cat, const char *fmt, const cha
                                      NfcPreset preset, const char *ext, const char *src,
                                      GAsyncReadyCallback callback, gpointer user_data);
 
+/* ---- conversion options, keep-the-smaller ----
+ *
+ * The general form of a conversion: everything nfc_convert_file_preset_async
+ * does plus an output name suffix and a reference size. Resize, Upscale and
+ * Compress all go through it. */
+
+#define NFC_CONVERT_ERROR (nfc_convert_error_quark ())
+GQuark nfc_convert_error_quark (void);
+
+typedef enum {
+  /* the output was not smaller than NfcConvertOptions.reference_size: it has
+   * been deleted, nothing was left behind. Not a failure of the conversion. */
+  NFC_CONVERT_ERROR_NOT_SMALLER = 1
+} NfcConvertError;
+
+#define NFC_REFERENCE_NONE   ((gint64) -1) /* keep the output whatever its size */
+#define NFC_REFERENCE_SOURCE ((gint64) -2) /* keep it only if smaller than the source file */
+
+typedef struct {
+  NfcPreset   preset;
+  /* Appended to the stem of the published name: "name" + " (compressed)" gives
+   * "name (compressed).jpg" (and "name (compressed) (1).jpg" if that exists).
+   * NULL or "": the plain stem. */
+  const char *name_suffix;
+  /* NFC_REFERENCE_NONE, NFC_REFERENCE_SOURCE, or a size in bytes (>= 0): after
+   * the conversion, an output that is NOT strictly smaller (nfc_is_smaller) is
+   * deleted, the work directory and temporary files are removed and the task
+   * fails with NFC_CONVERT_ERROR_NOT_SMALLER. */
+  gint64      reference_size;
+} NfcConvertOptions;
+
+/* nfc_convert_file_preset_async with options (opts may be NULL: BEST, no
+ * suffix, no reference). */
+void  nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
+                                   const char *ext, const char *src,
+                                   const NfcConvertOptions *opts,
+                                   GAsyncReadyCallback callback, gpointer user_data);
+
 typedef struct {
   char    *path;
   gboolean ok;
   char    *output; /* final path when ok */
   char    *error;  /* message when !ok */
+  gboolean skipped;  /* !ok, but not a failure: the output was not smaller than the
+                      * reference and was discarded (NFC_CONVERT_ERROR_NOT_SMALLER);
+                      * error then reads "already as small as it gets" */
+  gint64   src_size, out_size; /* bytes of the source and, when ok, of the output
+                                * (compress batches only, else 0) */
 } NfcResult;
 
 /* Called once when the whole batch is finished; results is a GPtrArray of
@@ -48,6 +91,18 @@ void nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset,
                            const char *label, const char *ext, const char *const *paths,
                            const char *const *fmts, guint n,
                            NfcBatchDone done, gpointer user_data);
+
+/* Compress paths[i] (source format fmts[i], category cat of the selection):
+ * each file becomes a smaller copy in its own format with the preset (HIGH,
+ * BALANCED or SMALL; see nfc_compress_target), named "<name> (compressed).<ext>",
+ * kept only if smaller than the original (NFC_REFERENCE_SOURCE). The results
+ * carry `skipped` for files that were already as small as they get. Shows
+ * "Compressing...", then "Compressed 3 files (Balanced), -62%" /
+ * "a.jpg → a (compressed).jpg (Balanced), -62%", plus a line for each file that
+ * was not smaller ("a.jpg is already as small as it gets"). */
+void nfc_batch_run_compress (NfcCategory cat, NfcPreset preset,
+                             const char *const *paths, const char *const *fmts, guint n,
+                             NfcBatchDone done, gpointer user_data);
 
 /* Module shutdown: kill the process groups of all in-flight conversions,
  * remove their work directories and hidden temp files (best effort), and

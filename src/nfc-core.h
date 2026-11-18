@@ -53,6 +53,46 @@ gboolean    nfc_target_has_presets (NfcCategory cat, const char *key);
  * downscaling. Static string, never NULL. */
 const char *nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset);
 
+/* ---- keep only what is smaller ----
+ *
+ * "Reference size + keep only if smaller": an output is worth keeping only if
+ * it is strictly smaller than some reference (the source file for Compress, and
+ * later for Resize/Upscale; the other candidate when two encodes compete).
+ * nfc_is_smaller is the single rule; the runner applies it
+ *   - to a whole job: NfcConvertOptions.reference_size (nfc-convert.h): an
+ *     output that is not smaller than the reference is deleted and the job ends
+ *     with NFC_CONVERT_ERROR_NOT_SMALLER, and
+ *   - inside an attempt, between candidate files: the internal step
+ *     NFC_STEP_KEEP_SMALLEST (see below). */
+gboolean nfc_is_smaller (gint64 size, gint64 reference);
+
+/* An internal "step" of an attempt that is not a program: argv is
+ * { NFC_STEP_KEEP_SMALLEST, out, other1, other2, ..., NULL }. The runner keeps
+ * the smallest of out and the others (that exist and are not empty) at `out`
+ * (a tie keeps out) and deletes all the others. All files must be on the same
+ * file system (the winner is renamed onto `out`). It also deletes them when the
+ * job ends early, whatever the reason. */
+#define NFC_STEP_KEEP_SMALLEST "nfc:keep-smallest"
+
+/* ---- Compress: a smaller copy in the same format ----
+ *
+ * Offered for the formats that have presets: JPG, WEBP, AVIF (images), MP4/M4V
+ * (H.264), WebM (VP9) and GIF (animated, converted with the GIF presets). The
+ * copy is the same format with the preset's settings, named "<name> (compressed).<ext>",
+ * and is only kept when it is smaller than the original. */
+typedef struct {
+  NfcCategory cat;     /* category to convert in: a GIF image is compressed as video */
+  const char *key;     /* target key ("jpg", "mp4", "gif") */
+  const char *ext;     /* output extension (a .jpeg or .m4v source gets .jpg / .mp4) */
+} NfcCompressTarget;
+
+/* The compress target of a source of category cat and canonical format fmt;
+ * FALSE if that format cannot be compressed (PNG, HEIC, MKV, audio, ...). Static
+ * table: says nothing about whether the tools are installed. */
+gboolean nfc_compress_target (NfcCategory cat, const char *fmt, NfcCompressTarget *out);
+/* One-line tooltip of a Compress preset (HIGH, BALANCED or SMALL); "" otherwise. */
+const char *nfc_compress_tooltip (NfcPreset preset);
+
 /* Result of classifying a file. fmt is a static canonical key ("jpg", "heic"). */
 typedef struct {
   NfcCategory cat;
@@ -118,6 +158,9 @@ const char *nfc_category_name (NfcCategory cat);
 /* Targets offered for a source of category/fmt (own format removed). Array of
  * const NfcTarget *, free with g_ptr_array_unref(). */
 GPtrArray  *nfc_targets_for (NfcCategory cat, const char *fmt);
+/* Can a source of category/fmt be compressed right now: nfc_compress_target has
+ * an entry and its tools (encoder, decoder) are installed and probed. */
+gboolean    nfc_compress_available (NfcCategory cat, const char *fmt);
 
 /* ---- selection analysis (menu logic) ---- */
 
@@ -132,6 +175,7 @@ typedef struct {
   GPtrArray  *paths;   /* char *, owned */
   GPtrArray  *fmts;    /* const char *, static */
   GPtrArray  *targets; /* const NfcTarget *, static */
+  gboolean    can_compress; /* "Compress" is offered: see nfc_compress_target */
 } NfcSelection;
 
 /* TRUE (and a filled sel) if a menu should be shown for this selection.
@@ -142,7 +186,12 @@ typedef struct {
  * audio and video targets appear as soon as their own probe is done, normally
  * within a fraction of a second of Nautilus starting). If nothing is known to
  * be available yet the result is FALSE, i.e. no menu at all rather than an
- * empty or half-built one. A probe that timed out counts as "unavailable". */
+ * empty or half-built one. A probe that timed out counts as "unavailable".
+ *
+ * Compress is separate from the convert targets: sel->can_compress is TRUE when
+ * every selected file can be compressed (nfc_compress_available); each in its
+ * own format. The result is TRUE when there is a convert target or can_compress
+ * (sel->targets may then be empty). */
 gboolean nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel);
 void     nfc_selection_clear (NfcSelection *sel);
 

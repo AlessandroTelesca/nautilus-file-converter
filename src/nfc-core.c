@@ -627,6 +627,14 @@ nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset)
     "Balanced — good for sharing, typically 25-45% of the size of Best",
     "Small — smallest acceptable file, typically 10-30% of Best; images over 2560 px are scaled down to 2560 px",
   };
+  /* WEBP of graphics is the smaller of a lossy and the lossless file: flat
+   * screenshots stay lossless, so no typical size is promised */
+  static const char *const webp_tips[NFC_PRESET_N] = {
+    "Best — the highest quality; the file can be large",
+    "High — very close to Best, a much smaller file (flat screenshots stay lossless when that is smaller)",
+    "Balanced — good for sharing, smaller still (flat screenshots stay lossless when that is smaller)",
+    "Small — the smallest acceptable file; images over 2560 px are scaled down to 2560 px",
+  };
   static const char *const video_tips[NFC_PRESET_N] = {
     "Best — the highest quality; the file can be large",
     "High — visually identical, typically 55-70% of the size of Best",
@@ -643,8 +651,67 @@ nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset)
   if ((guint) preset >= NFC_PRESET_N || !nfc_target_has_presets (cat, key))
     return "";
   if (cat == NFC_CAT_IMAGE)
-    return image_tips[preset];
+    return g_str_equal (key, "webp") ? webp_tips[preset] : image_tips[preset];
   return g_str_equal (key, "gif") ? gif_tips[preset] : video_tips[preset];
+}
+
+/* ---- keep only what is smaller / Compress ---- */
+
+gboolean
+nfc_is_smaller (gint64 size, gint64 reference)
+{
+  return size >= 0 && reference >= 0 && size < reference;
+}
+
+gboolean
+nfc_compress_target (NfcCategory cat, const char *fmt, NfcCompressTarget *out)
+{
+  static const struct {
+    NfcCategory src_cat;
+    const char *fmt;
+    NfcCategory cat;
+    const char *key, *ext;
+  } map[] = {
+    { NFC_CAT_IMAGE, "jpg",  NFC_CAT_IMAGE, "jpg",  "jpg" },
+    { NFC_CAT_IMAGE, "webp", NFC_CAT_IMAGE, "webp", "webp" },
+    { NFC_CAT_IMAGE, "avif", NFC_CAT_IMAGE, "avif", "avif" },
+    /* the GIF presets belong to the video target "gif" (ffmpeg, palette) */
+    { NFC_CAT_IMAGE, "gif",  NFC_CAT_VIDEO, "gif",  "gif" },
+    { NFC_CAT_VIDEO, "mp4",  NFC_CAT_VIDEO, "mp4",  "mp4" },
+    { NFC_CAT_VIDEO, "m4v",  NFC_CAT_VIDEO, "mp4",  "mp4" },
+    { NFC_CAT_VIDEO, "webm", NFC_CAT_VIDEO, "webm", "webm" },
+  };
+
+  if (fmt == NULL)
+    return FALSE;
+  for (guint i = 0; i < G_N_ELEMENTS (map); i++)
+    if (map[i].src_cat == cat && g_str_equal (map[i].fmt, fmt))
+      {
+        if (out != NULL)
+          {
+            out->cat = map[i].cat;
+            out->key = map[i].key;
+            out->ext = map[i].ext;
+          }
+        return TRUE;
+      }
+  return FALSE;
+}
+
+const char *
+nfc_compress_tooltip (NfcPreset preset)
+{
+  switch (preset)
+    {
+    case NFC_PRESET_HIGH:
+      return "High — visually identical, a moderately smaller copy";
+    case NFC_PRESET_BALANCED:
+      return "Balanced — good for sharing, a clearly smaller copy";
+    case NFC_PRESET_SMALL:
+      return "Small — the smallest acceptable copy; images over 2560 px and video above 1080p are scaled down";
+    default:
+      return "";
+    }
 }
 
 #define T(k, l, e) { k, l, e }
@@ -879,6 +946,22 @@ nfc_targets_for (NfcCategory cat, const char *fmt)
   return out;
 }
 
+gboolean
+nfc_compress_available (NfcCategory cat, const char *fmt)
+{
+  NfcCompressTarget t;
+
+  if (!nfc_compress_target (cat, fmt, &t))
+    return FALSE;
+  /* an AVIF source is decoded by the helper (GdkPixbuf) */
+  if (cat == NFC_CAT_IMAGE && is_pixbuf_src (fmt) && pixbuf_can_read (fmt) != AV_YES)
+    return FALSE;
+  /* a GIF source is read by ffmpeg, the others by the tool of their category */
+  if (!nfc_category_available (cat) || !nfc_category_available (t.cat))
+    return FALSE;
+  return target_avail (t.cat, t.key) == AV_YES;
+}
+
 /* -------------------------------------------------------------------------
  * Selection analysis
  * ---------------------------------------------------------------------- */
@@ -891,6 +974,7 @@ nfc_selection_clear (NfcSelection *sel)
   g_clear_pointer (&sel->paths, g_ptr_array_unref);
   g_clear_pointer (&sel->fmts, g_ptr_array_unref);
   g_clear_pointer (&sel->targets, g_ptr_array_unref);
+  sel->can_compress = FALSE;
 }
 
 static gboolean
@@ -981,7 +1065,12 @@ nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel)
       if (all)
         g_ptr_array_add (sel->targets, (gpointer) t);
     }
-  ok = sel->targets->len > 0;
+  /* Compress: every selected file in a format that has presets (each is
+   * compressed in its own format) */
+  sel->can_compress = TRUE;
+  for (guint i = 0; i < sel->fmts->len && sel->can_compress; i++)
+    sel->can_compress = nfc_compress_available (cat, sel->fmts->pdata[i]);
+  ok = sel->targets->len > 0 || sel->can_compress;
 
 out:
   g_clear_pointer (&first, g_ptr_array_unref);
@@ -1315,6 +1404,8 @@ static const char *const jpg_sampling_photo[NFC_PRESET_N] = { "4:4:4", "4:2:0", 
 
 /* WEBP lossy quality of photos, per preset */
 static const char *const webp_quality_photo[NFC_PRESET_N] = { "90", "85", "78", "65" };
+/* ... and of graphics (Best is lossless: the entry is not used) */
+static const char *const webp_quality_graphics[NFC_PRESET_N] = { "100", "95", "88", "75" };
 
 /* The ffmpeg step that makes the AVIF from the flattened PNG.
  *
@@ -1642,6 +1733,8 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
       char *im_in, *decoded = NULL;
       char **dec_step = NULL;
       const char *imname, *coder;
+      char **lossless_step = NULL;
+      char *alt_webp = NULL;
 
       if (nfc_tools.magick == NULL ||
           (im_format_name (key) == NULL && !g_str_equal (key, "avif")))
@@ -1744,35 +1837,54 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
       else if (g_str_equal (key, "webp"))
         {
           /* WEBP stores at most 16383 pixels per side: shrink only beyond that.
-           * Graphics (lossless sources): lossless WEBP, which was smaller than
-           * the source PNG for every screenshot tried and has no chroma
-           * subsampling or ringing. Photos: lossy q90, method 6, sharp YUV
-           * (the chroma conversion that keeps colour edges). 94 made a phone JPEG
+           * Best, graphics (lossless sources): lossless WEBP, which was smaller
+           * than the source PNG for every screenshot tried and has no chroma
+           * subsampling or ringing. Photos: lossy q90, method 6 (sharp YUV
+           * is requested too, see webp_lossy_args). 94 made a phone JPEG
            * larger than its source (a lossy source re-encoded at a higher quality
            * keeps its artefacts at a higher bitrate): at q90 the output is not
            * larger, SSIM >= 0.98 against the source on most photos.
            *
-           * Other presets, photos: a lower lossy quality. Graphics: still
-           * lossless, but with fewer bits of information per pixel, so the file
-           * is never larger than Best's: 6 or 5 bits per channel (High,
-           * Balanced) or an adaptive 128-colour palette (Small). A lossy WEBP
-           * is larger than the lossless one for flat text/UI screenshots, and
-           * near-lossless (webp:near-lossless) has no effect in ImageMagick.
-           * Small also shrinks images beyond 2560 px. */
+           * Other presets, photos: a lower lossy quality. Graphics: a lossy
+           * encode (q95/88/75, method 6, sharp YUV, alpha at q100) AND, for
+           * images below NFC_SMALL_IMAGE_PIXELS, the lossless encode of Best,
+           * and the smaller file wins (NFC_STEP_KEEP_SMALLEST): lossy WEBP is
+           * larger than lossless for flat text/UI screenshots (a terminal: 32 KB
+           * lossless, 59 KB lossy q60), smaller for screenshots with gradients
+           * and photos. The lossless encode comes first and is not essential:
+           * if it fails (memory), the second attempt is the lossy encode alone.
+           * Small also shrinks images beyond 2560 px (both candidates). */
           av_add (a, "-auto-orient", "-resize",
                   preset == NFC_PRESET_SMALL ? SMALL_MAX_SIDE : "16383x16383>", NULL);
           if (photo_source (fmt))
             av_add (a, "-quality", webp_quality_photo[preset], "-define", "webp:method=6",
                     "-define", "webp:sharp-yuv=true", NULL);
+          else if (preset == NFC_PRESET_BEST)
+            av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
           else
             {
-              if (preset == NFC_PRESET_HIGH)
-                av_add (a, "-depth", "6", NULL);
-              else if (preset == NFC_PRESET_BALANCED)
-                av_add (a, "-depth", "5", NULL);
-              else if (preset == NFC_PRESET_SMALL)
-                av_add (a, "+dither", "-colors", "128", NULL);
-              av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
+              guint64 px = info != NULL ? info->width * info->height : G_MAXUINT64;
+
+              if (g_str_equal (fmt, "svg") && px != G_MAXUINT64)
+                px = px * 64 / 9;
+              if (px < NFC_SMALL_IMAGE_PIXELS)
+                {
+                  /* the lossless candidate: same input and resize, own output */
+                  GPtrArray *l = av_new ();
+                  char *o;
+
+                  alt_webp = g_strconcat (out, ".alt", NULL);
+                  o = im_path_arg ("WEBP", alt_webp, NULL);
+
+                  for (char **p = (char **) a->pdata; *p != NULL; p++)
+                    g_ptr_array_add (l, g_strdup (*p));
+                  av_add (l, "-define", "webp:lossless=true", "-define", "webp:method=4", o, NULL);
+                  lossless_step = av_done (l);
+                  g_free (o);
+                }
+              av_add (a, "-quality", webp_quality_graphics[preset], "-define", "webp:method=6",
+                      "-define", "webp:use-sharp-yuv=true", "-define", "webp:alpha-quality=100",
+                      NULL);
             }
         }
       else if (g_str_equal (key, "ico"))
@@ -1818,11 +1930,28 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
         av_add (a, o, NULL);
         g_free (o);
       }
-      add_attempt (attempts, dec_step, av_done (a), NULL);
+      if (lossless_step != NULL)
+        {
+          char **lossy = av_done (a);
+          char **keep = g_new0 (char *, 4);
+
+          /* attempt 1: both encodes, the smaller one stays at `out`; attempt 2
+           * (only if attempt 1 failed, e.g. the lossless one ran out of memory):
+           * the lossy encode alone */
+          keep[0] = g_strdup (NFC_STEP_KEEP_SMALLEST);
+          keep[1] = g_strdup (out);
+          keep[2] = g_strdup (alt_webp);
+          add_attempt (attempts, dec_step, lossless_step, lossy, keep, NULL);
+          add_attempt (attempts, g_strdupv (dec_step), g_strdupv (lossy), NULL);
+        }
+      else
+        add_attempt (attempts, dec_step, av_done (a), NULL);
+      g_free (alt_webp);
       g_free (im_in);
       g_free (decoded);
       g_free (src);
       return attempts;
+
     }
 
   if (cat == NFC_CAT_AUDIO || cat == NFC_CAT_VIDEO)
