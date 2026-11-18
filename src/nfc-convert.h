@@ -52,7 +52,22 @@ typedef struct {
    * deleted, the work directory and temporary files are removed and the task
    * fails with NFC_CONVERT_ERROR_NOT_SMALLER. */
   gint64      reference_size;
+  /* Resize: the preset to scale to (NULL: no resize). The job probes the
+   * source's pixel size first and, when the preset would not make it smaller,
+   * ends with NFC_CONVERT_ERROR_NOT_SMALLER ("already smaller than 1080p")
+   * without running the converter. cat/fmt/key/ext are those of
+   * nfc_resize_target; preset is ignored (Best). Add new fields below this one:
+   * callers initialise the leading ones positionally. */
+  const NfcResizePreset *resize;
 } NfcConvertOptions;
+
+/* The pixel size of the source as the job's own size probe found it (the first
+ * frame of an image, the first video stream), for the callback of a
+ * nfc_convert_file_*_async call, whatever its outcome; FALSE (and 0, 0) when it
+ * was not probed (documents, audio, a tool that was missing, a probe that failed).
+ * Images and GIFs are always probed, videos for MP4/MKV, resizes and the Small
+ * preset. */
+gboolean nfc_convert_result_dims (GAsyncResult *result, guint64 *width, guint64 *height);
 
 /* nfc_convert_file_preset_async with options (opts may be NULL: BEST, no
  * suffix, no reference). */
@@ -71,6 +86,7 @@ typedef struct {
                       * error then reads "already as small as it gets" */
   gint64   src_size, out_size; /* bytes of the source and, when ok, of the output
                                 * (compress batches only, else 0) */
+  guint64  src_w, src_h;       /* pixel size of the source when the job probed it, else 0 */
 } NfcResult;
 
 /* Called once when the whole batch is finished; results is a GPtrArray of
@@ -103,6 +119,18 @@ void nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset,
 void nfc_batch_run_compress (NfcCategory cat, NfcPreset preset,
                              const char *const *paths, const char *const *fmts, guint n,
                              NfcBatchDone done, gpointer user_data);
+
+/* Resize paths[i] (source format fmts[i], category cat of the selection) to the
+ * preset (nfc_resize_preset_from_key (cat, preset_key)): each file becomes a copy
+ * in its own format (nfc_resize_target), named "<name> (1080p).<ext>" and kept
+ * only if the preset makes it smaller; files it would not are `skipped`. Shows
+ * "Resizing...", then "photo.jpg → photo (1080p).jpg, 3840×2160 → 1920×1080" /
+ * "Resized 3 files to 1080p", plus a line for each file that was already smaller
+ * ("photo.jpg is already smaller than 1080p"). An unknown preset key finishes the
+ * batch at once with every file failed. */
+void nfc_batch_run_resize (NfcCategory cat, const char *preset_key,
+                           const char *const *paths, const char *const *fmts, guint n,
+                           NfcBatchDone done, gpointer user_data);
 
 /* Module shutdown: kill the process groups of all in-flight conversions,
  * remove their work directories and hidden temp files (best effort), and

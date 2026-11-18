@@ -17,10 +17,13 @@
  *    timeout does not start the fallback attempt.
  *  - shutdown: in-flight jobs are killed and cleaned up.
  *  - log: mode 0600, rotation at 1 MiB.
+ *  - header-read-safety: the bounded header read of Resize never blocks on a FIFO,
+ *    reads at most 64 KiB of a huge file.
  */
 #include <glib.h>
 #include <glib/gstdio.h>
 #include <signal.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -28,6 +31,7 @@
 
 #include "nfc-convert.h"
 #include "nfc-core.h"
+#include "nfc-header.h"
 
 #define TEST_TIMEOUT 2        /* NFC_TEST_TIMEOUT_SECS for steps */
 #define TEST_PROBE_TIMEOUT 3  /* NFC_TEST_PROBE_TIMEOUT_SECS */
@@ -213,6 +217,122 @@ read_log (void)
     data = g_strdup ("");
   g_free (p);
   return data;
+}
+
+/* The one place where the main thread reads file content: the header of an image
+ * (nfc-header.h). It must be bounded, must not follow a FIFO into a hang, and must
+ * not be fooled by a huge or odd file. */
+static void
+test_header_read_safety (void)
+{
+  guint8 png[24] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R',
+                     0, 0, 0x0f, 0, 0, 0, 0x08, 0x70 }; /* 3840 x 2160 */
+  char *p, *fifo, *loop, *sparse, *dir;
+  guint32 w = 0, h = 0;
+  gint64 t0;
+  FILE *fp;
+  GString *junk;
+
+  /* a regular file: fine */
+  p = B (datadir, "hdr.png");
+  g_assert_true (g_file_set_contents (p, (const char *) png, sizeof png, NULL));
+  g_assert_true (nfc_header_read_file (p, "png", &w, &h));
+  g_assert_cmpuint (w, ==, 3840);
+  g_assert_cmpuint (h, ==, 2160);
+
+  /* a FIFO nobody writes to: refused at once, not waited for */
+  fifo = B (datadir, "fifo.png");
+  g_assert_cmpint (mkfifo (fifo, 0600), ==, 0);
+  t0 = g_get_monotonic_time ();
+  g_assert_false (nfc_header_read_file (fifo, "png", &w, &h));
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, 100000);
+  g_unlink (fifo);
+
+  /* devices, directories, dangling and looping symlinks, missing files, empty files */
+  g_assert_false (nfc_header_read_file ("/dev/zero", "png", &w, &h));
+  g_assert_false (nfc_header_read_file ("/dev/null", "png", &w, &h));
+  dir = B (datadir, "adir.png");
+  g_assert_cmpint (g_mkdir (dir, 0755), ==, 0);
+  g_assert_false (nfc_header_read_file (dir, "png", &w, &h));
+  loop = B (datadir, "loop.png");
+  g_assert_cmpint (symlink ("loop.png", loop), ==, 0);
+  g_assert_false (nfc_header_read_file (loop, "png", &w, &h));
+  g_assert_false (nfc_header_read_file ("/nonexistent/dir/a.png", "png", &w, &h));
+  touch (datadir, "empty.png");
+  {
+    char *e = B (datadir, "empty.png");
+
+    g_assert_cmpint (truncate (e, 0), ==, 0);
+    g_assert_false (nfc_header_read_file (e, "png", &w, &h));
+    g_free (e);
+  }
+  g_assert_false (nfc_header_read_file (NULL, "png", &w, &h));
+  g_assert_false (nfc_header_read_file (p, NULL, &w, &h));
+  g_assert_false (nfc_header_read_file (p, "tiff", &w, &h)); /* no parser: the file is not even opened */
+
+  /* a 100 GiB sparse file with a valid header: only the first 64 KiB are read */
+  sparse = B (datadir, "sparse.png");
+  fp = fopen (sparse, "wb");
+  g_assert_nonnull (fp);
+  g_assert_cmpuint (fwrite (png, 1, sizeof png, fp), ==, sizeof png);
+  g_assert_cmpint (fflush (fp), ==, 0);
+  g_assert_cmpint (ftruncate (fileno (fp), (off_t) 100 * 1024 * 1024 * 1024), ==, 0);
+  fclose (fp);
+  t0 = g_get_monotonic_time ();
+  g_assert_true (nfc_header_read_file (sparse, "png", &w, &h));
+  g_assert_cmpint (g_get_monotonic_time () - t0, <, 100000);
+  g_assert_cmpuint (w, ==, 3840);
+
+  /* a JPEG whose frame header lies beyond 64 KiB: unknown, not an error, not slow */
+  junk = g_string_new ("\xff\xd8\xff\xe1\xff\xff");
+  g_string_set_size (junk, 2 + 2 + 65535 + 100);
+  memset (junk->str + 6, 0, junk->len - 6);
+  {
+    char *jp = B (datadir, "bigexif.jpg");
+
+    g_assert_true (g_file_set_contents (jp, junk->str, junk->len, NULL));
+    g_assert_false (nfc_header_read_file (jp, "jpg", &w, &h));
+    g_free (jp);
+  }
+  g_string_free (junk, TRUE);
+
+  /* selections: up to NFC_SELECTION_DIMS_MAX files get their sizes, bigger ones none;
+   * both answer well within the menu's 100 ms budget */
+  {
+    NfcSelItem items[NFC_SELECTION_DIMS_MAX + 8];
+    char *uris[NFC_SELECTION_DIMS_MAX + 8];
+
+    for (guint n = NFC_SELECTION_DIMS_MAX; n <= NFC_SELECTION_DIMS_MAX + 1; n++)
+      {
+        NfcSelection sel;
+        gint64 us;
+        gboolean ok;
+
+        for (guint i = 0; i < n; i++)
+          {
+            uris[i] = g_filename_to_uri (p, NULL, NULL);
+            items[i] = (NfcSelItem) { uris[i], "image/png", FALSE };
+          }
+        t0 = g_get_monotonic_time ();
+        ok = nfc_analyze_selection (items, n, &sel);
+        us = g_get_monotonic_time () - t0;
+        g_assert_true (ok);
+        g_assert_cmpint (us, <, 100000);
+        if (n <= NFC_SELECTION_DIMS_MAX)
+          {
+            g_assert_nonnull (sel.dims);
+            g_assert_cmpuint (sel.dims->len, ==, n);
+            g_assert_cmpuint (g_array_index (sel.dims, NfcDims, n - 1).width, ==, 3840);
+            g_assert_cmpuint (g_array_index (sel.dims, NfcDims, 0).height, ==, 2160);
+          }
+        else
+          g_assert_null (sel.dims);
+        nfc_selection_clear (&sel);
+        for (guint i = 0; i < n; i++)
+          g_free (uris[i]);
+      }
+  }
+  g_free (p); g_free (fifo); g_free (loop); g_free (sparse); g_free (dir);
 }
 
 /* QC finding 1: a hung `ffmpeg -encoders` used to freeze the right-click menu
@@ -1198,6 +1318,7 @@ main (int argc, char **argv)
   g_test_add_func ("/robust/output-flood", test_output_flood);
   g_test_add_func ("/robust/admission-batch", test_admission_batch);
   g_test_add_func ("/robust/cancel-on-shutdown", test_cancel_on_shutdown);
+  g_test_add_func ("/robust/header-read-safety", test_header_read_safety);
   rc = g_test_run ();
 
   {

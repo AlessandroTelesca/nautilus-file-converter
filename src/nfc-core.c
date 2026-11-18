@@ -15,6 +15,7 @@
 #endif
 
 #include "config.h"
+#include "nfc-header.h"
 #include "nfc-util.h"
 
 NfcTools nfc_tools = { NULL, NULL, NULL, NULL, NULL, NULL };
@@ -616,6 +617,45 @@ nfc_target_has_presets (NfcCategory cat, const char *key)
   return FALSE;
 }
 
+const char *
+nfc_preset_menu_label (NfcCategory cat, const char *key, NfcPreset preset)
+{
+  if (preset != NFC_PRESET_SMALL)
+    return nfc_preset_label (preset);
+  if (key == NULL)
+    return "Small (max 2560 px / 1080p)";
+  if (!nfc_target_has_presets (cat, key))
+    return "Small";
+  if (cat == NFC_CAT_IMAGE)
+    return "Small (max 2560 px)";
+  return g_str_equal (key, "gif") ? "Small (480 px)" : "Small (max 1080p)";
+}
+
+gboolean
+nfc_preset_output_size (NfcCategory cat, const char *key, NfcPreset preset,
+                        guint64 w, guint64 h, guint64 *ow, guint64 *oh)
+{
+  static const NfcResizePreset small_image = { "small", "", "", 2560, 0, FALSE };
+  static const NfcResizePreset small_video = { "small", "", "", 1080, 0, TRUE };
+
+  if (preset != NFC_PRESET_SMALL || key == NULL || !nfc_target_has_presets (cat, key))
+    return FALSE;
+  if (cat == NFC_CAT_IMAGE)
+    return nfc_resize_output_size (&small_image, w, h, ow, oh);
+  if (g_str_equal (key, "gif"))
+    {
+      /* scale='min(480,iw)':-1 */
+      if (w <= 480 || h == 0)
+        return FALSE;
+      if (ow != NULL)
+        *ow = 480;
+      if (oh != NULL)
+        *oh = MAX ((MIN (h, (guint64) 1 << 31) * 480 + w / 2) / w, (guint64) 1);
+      return TRUE;
+    }
+  return nfc_resize_output_size (&small_video, w, h, ow, oh);
+}
+
 /* The tooltips say what a preset does, with the sizes measured against Best
  * (see README: they depend on the content). */
 const char *
@@ -712,6 +752,170 @@ nfc_compress_tooltip (NfcPreset preset)
     default:
       return "";
     }
+}
+
+/* ---- Resize ---- */
+
+static const NfcResizePreset image_resize[] = {
+  { "4k",    "4K (3840 px)",    "4K",    3840,  0, FALSE },
+  { "1440p", "1440p (2560 px)", "1440p", 2560,  0, FALSE },
+  { "1080p", "1080p (1920 px)", "1080p", 1920,  0, FALSE },
+  { "720p",  "720p (1280 px)",  "720p",  1280,  0, FALSE },
+  { "480p",  "480p (854 px)",   "480p",  854,   0, FALSE },
+  { "50pct", "50%",             "50%",   0,    50, FALSE },
+  { "25pct", "25%",             "25%",   0,    25, FALSE },
+};
+
+static const NfcResizePreset video_resize[] = {
+  { "1080p", "1080p", "1080p", 1080, 0, TRUE },
+  { "720p",  "720p",  "720p",  720,  0, TRUE },
+  { "480p",  "480p",  "480p",  480,  0, TRUE },
+};
+
+const NfcResizePreset *
+nfc_resize_presets (NfcCategory cat, guint *n)
+{
+  if (cat == NFC_CAT_IMAGE)
+    {
+      if (n != NULL)
+        *n = G_N_ELEMENTS (image_resize);
+      return image_resize;
+    }
+  if (cat == NFC_CAT_VIDEO)
+    {
+      if (n != NULL)
+        *n = G_N_ELEMENTS (video_resize);
+      return video_resize;
+    }
+  if (n != NULL)
+    *n = 0;
+  return NULL;
+}
+
+const NfcResizePreset *
+nfc_resize_preset_from_key (NfcCategory cat, const char *key)
+{
+  guint n;
+  const NfcResizePreset *p = nfc_resize_presets (cat, &n);
+
+  if (key == NULL)
+    return NULL;
+  for (guint i = 0; i < n; i++)
+    if (g_str_equal (p[i].key, key))
+      return &p[i];
+  return NULL;
+}
+
+/* nearest integer of v * num / den (what ImageMagick's geometry does: floor(x + 0.5)) */
+static guint64
+scaled (guint64 v, guint64 num, guint64 den)
+{
+  return (v * num + den / 2) / den;
+}
+
+gboolean
+nfc_resize_output_size (const NfcResizePreset *p, guint64 w, guint64 h, guint64 *ow, guint64 *oh)
+{
+  guint64 nw, nh;
+
+  if (p == NULL || w == 0 || h == 0)
+    return FALSE;
+  /* bounded, so that the products below cannot overflow */
+  w = MIN (w, (guint64) 1 << 31);
+  h = MIN (h, (guint64) 1 << 31);
+  if (p->percent > 0)
+    {
+      nw = scaled (w, p->percent, 100);
+      nh = scaled (h, p->percent, 100);
+      if (p->percent >= 100 || MIN (nw, nh) < NFC_RESIZE_MIN_SIDE)
+        return FALSE;
+    }
+  else if (p->side == 0)
+    return FALSE;
+  else if (!p->short_side)
+    {
+      guint64 longer = MAX (w, h);
+
+      if (longer <= p->side)
+        return FALSE;
+      nw = w >= h ? p->side : MAX (scaled (w, p->side, longer), (guint64) 1);
+      nh = w >= h ? MAX (scaled (h, p->side, longer), (guint64) 1) : p->side;
+    }
+  else
+    {
+      guint64 shorter = MIN (w, h);
+
+      if (shorter <= p->side)
+        return FALSE;
+      /* the long side is made even (ffmpeg's -2), the short one is the preset */
+      nw = w <= h ? p->side : MAX (2 * scaled (scaled (w, p->side, shorter), 1, 2), (guint64) 2);
+      nh = w <= h ? MAX (2 * scaled (scaled (h, p->side, shorter), 1, 2), (guint64) 2) : p->side;
+    }
+  if (ow != NULL)
+    *ow = nw;
+  if (oh != NULL)
+    *oh = nh;
+  return TRUE;
+}
+
+char *
+nfc_resize_tooltip (const NfcResizePreset *p, guint64 w, guint64 h)
+{
+  guint64 ow, oh;
+
+  if (p == NULL)
+    return g_strdup ("");
+  if (nfc_resize_output_size (p, w, h, &ow, &oh))
+    return g_strdup_printf ("Make a copy scaled down to %" G_GUINT64_FORMAT " × %" G_GUINT64_FORMAT
+                            " px (aspect ratio kept)", ow, oh);
+  if (p->percent > 0)
+    return g_strdup_printf ("Make a copy scaled down to %u%% of the width and height", p->percent);
+  if (p->short_side)
+    return g_strdup_printf ("Make a copy scaled down so that its shorter side is %u px "
+                            "(aspect ratio kept); the video is re-encoded", p->side);
+  return g_strdup_printf ("Make a copy scaled down so that its longer side is %u px "
+                          "(aspect ratio kept)", p->side);
+}
+
+gboolean
+nfc_resize_target (NfcCategory cat, const char *fmt, NfcResizeTarget *out)
+{
+  static const struct {
+    NfcCategory src_cat;
+    const char *fmt;
+    NfcCategory cat;
+    const char *key, *ext;
+  } map[] = {
+    { NFC_CAT_IMAGE, "png",  NFC_CAT_IMAGE, "png",  "png" },
+    { NFC_CAT_IMAGE, "jpg",  NFC_CAT_IMAGE, "jpg",  "jpg" },
+    { NFC_CAT_IMAGE, "webp", NFC_CAT_IMAGE, "webp", "webp" },
+    { NFC_CAT_IMAGE, "avif", NFC_CAT_IMAGE, "avif", "avif" },
+    { NFC_CAT_IMAGE, "bmp",  NFC_CAT_IMAGE, "bmp",  "bmp" },
+    { NFC_CAT_IMAGE, "tiff", NFC_CAT_IMAGE, "tiff", "tiff" },
+    /* an animation: ffmpeg's scale + palette chain, like the GIF presets */
+    { NFC_CAT_IMAGE, "gif",  NFC_CAT_VIDEO, "gif",  "gif" },
+    { NFC_CAT_VIDEO, "mp4",  NFC_CAT_VIDEO, "mp4",  "mp4" },
+    { NFC_CAT_VIDEO, "m4v",  NFC_CAT_VIDEO, "mp4",  "mp4" }, /* ffmpeg's .m4v muxer is raw H.264 */
+    { NFC_CAT_VIDEO, "mkv",  NFC_CAT_VIDEO, "mkv",  "mkv" },
+    { NFC_CAT_VIDEO, "webm", NFC_CAT_VIDEO, "webm", "webm" },
+    { NFC_CAT_VIDEO, "mov",  NFC_CAT_VIDEO, "mov",  "mov" },
+    { NFC_CAT_VIDEO, "avi",  NFC_CAT_VIDEO, "avi",  "avi" },
+  };
+
+  if (fmt == NULL)
+    return FALSE;
+  for (guint i = 0; i < G_N_ELEMENTS (map); i++)
+    if (map[i].src_cat == cat && g_str_equal (map[i].fmt, fmt))
+      {
+        if (out != NULL)
+          {
+            out->cat = map[i].cat;
+            out->key = map[i].key;
+            out->ext = map[i].ext;
+          }
+        return TRUE;
+      }
+  return FALSE;
 }
 
 #define T(k, l, e) { k, l, e }
@@ -962,6 +1166,25 @@ nfc_compress_available (NfcCategory cat, const char *fmt)
   return target_avail (t.cat, t.key) == AV_YES;
 }
 
+gboolean
+nfc_resize_available (NfcCategory cat, const char *fmt)
+{
+  NfcResizeTarget t;
+  const char *need;
+
+  if (!nfc_resize_target (cat, fmt, &t))
+    return FALSE;
+  /* an AVIF source is decoded by the helper (GdkPixbuf) */
+  if (cat == NFC_CAT_IMAGE && is_pixbuf_src (fmt) && pixbuf_can_read (fmt) != AV_YES)
+    return FALSE;
+  /* a GIF source is read by ffmpeg, the others by the tool of their category */
+  if (!nfc_category_available (cat) || !nfc_category_available (t.cat))
+    return FALSE;
+  /* mov and avi are written like mp4: an H.264 encoder */
+  need = (g_str_equal (t.key, "mov") || g_str_equal (t.key, "avi")) ? "mp4" : t.key;
+  return target_avail (t.cat, need) == AV_YES;
+}
+
 /* -------------------------------------------------------------------------
  * Selection analysis
  * ---------------------------------------------------------------------- */
@@ -974,6 +1197,8 @@ nfc_selection_clear (NfcSelection *sel)
   g_clear_pointer (&sel->paths, g_ptr_array_unref);
   g_clear_pointer (&sel->fmts, g_ptr_array_unref);
   g_clear_pointer (&sel->targets, g_ptr_array_unref);
+  g_clear_pointer (&sel->dims, g_array_unref);
+  g_clear_pointer (&sel->resize, g_ptr_array_unref);
   sel->can_compress = FALSE;
 }
 
@@ -984,6 +1209,57 @@ target_in (GPtrArray *arr, const NfcTarget *t)
     if (g_str_equal (((const NfcTarget *) arr->pdata[i])->key, t->key))
       return TRUE;
   return FALSE;
+}
+
+/* The Resize presets to offer for a selection: those that make at least one file
+ * smaller. A file of unknown size counts as "smaller" for every preset (the fixed
+ * list is shown, files that are not smaller are skipped when the job runs). */
+static GPtrArray *
+resize_presets_for (NfcCategory cat, const GArray *dims)
+{
+  GPtrArray *out = g_ptr_array_new ();
+  guint n;
+  const NfcResizePreset *all = nfc_resize_presets (cat, &n);
+
+  for (guint k = 0; k < n; k++)
+    {
+      gboolean any = dims == NULL || dims->len == 0;
+
+      for (guint i = 0; dims != NULL && i < dims->len && !any; i++)
+        {
+          const NfcDims *d = &g_array_index (dims, NfcDims, i);
+
+          any = d->width == 0 || d->height == 0 ||
+                nfc_resize_output_size (&all[k], d->width, d->height, NULL, NULL);
+        }
+      if (any)
+        g_ptr_array_add (out, (gpointer) &all[k]);
+    }
+  return out;
+}
+
+/* The size of each selected image from its header; (0, 0) where it cannot be told */
+static GArray *
+read_selection_dims (NfcCategory cat, GPtrArray *paths, GPtrArray *fmts)
+{
+  GArray *dims;
+
+  if (cat != NFC_CAT_IMAGE || paths->len > NFC_SELECTION_DIMS_MAX)
+    return NULL;
+  dims = g_array_sized_new (FALSE, TRUE, sizeof (NfcDims), paths->len);
+  for (guint i = 0; i < paths->len; i++)
+    {
+      NfcDims d = { 0, 0 };
+      guint32 w, h;
+
+      if (nfc_header_read_file (paths->pdata[i], fmts->pdata[i], &w, &h))
+        {
+          d.width = w;
+          d.height = h;
+        }
+      g_array_append_val (dims, d);
+    }
+  return dims;
 }
 
 gboolean
@@ -1070,7 +1346,19 @@ nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel)
   sel->can_compress = TRUE;
   for (guint i = 0; i < sel->fmts->len && sel->can_compress; i++)
     sel->can_compress = nfc_compress_available (cat, sel->fmts->pdata[i]);
-  ok = sel->targets->len > 0 || sel->can_compress;
+  /* Resize: every selected file in a resizable format, and a preset that makes
+   * one of them smaller (sizes from the headers, see nfc-header.h) */
+  {
+    gboolean all = TRUE;
+
+    for (guint i = 0; i < sel->fmts->len && all; i++)
+      all = nfc_resize_available (cat, sel->fmts->pdata[i]);
+    sel->dims = read_selection_dims (cat, sel->paths, sel->fmts);
+    if (all)
+      sel->resize = resize_presets_for (cat, sel->dims);
+  }
+  ok = sel->targets->len > 0 || sel->can_compress ||
+       (sel->resize != NULL && sel->resize->len > 0);
 
 out:
   g_clear_pointer (&first, g_ptr_array_unref);
@@ -1199,44 +1487,104 @@ video_filter (NfcPreset preset)
   return preset == NFC_PRESET_SMALL ? EVEN "," SCALE_1080 : EVEN;
 }
 
-/* The MP4 / MKV re-encode attempts for the H.264 encoders ffmpeg has: libx264
- * (crf by preset: 18 for Best; slow) first, then libopenh264 (bitrate, see
- * above) as the next attempt. With neither known (the probe has not run) the
- * libx264 attempt alone, as before. */
+/* What differs between the H.264 re-encodes of a plain conversion and of a
+ * resize (see add_h264_attempts_ex). */
+typedef struct {
+  const char *vf;      /* video filter chain; NULL: video_filter (preset) */
+  gboolean    audio_copy; /* try "-c:a copy" first; AAC 192k is the next attempt */
+  gboolean    faststart;  /* -movflags +faststart (mp4, mov) */
+  gboolean    no_bframes; /* libx264 -bf 0 (AVI cannot carry B-frames reliably) */
+} H264Opts;
+
+/* The re-encode attempts for the H.264 encoders ffmpeg has: libx264 (crf by
+ * preset: 18 for Best; slow) first, then libopenh264 (bitrate, see above) as the
+ * next attempt. With neither known (the probe has not run) the libx264 attempt
+ * alone, as before. With audio_copy each encoder runs twice: with the audio
+ * stream copied (the muxer refuses a codec the container cannot hold while
+ * writing the header, i.e. at once), then with AAC. */
+static void
+add_h264_attempts_ex (GPtrArray *attempts, const char *src, const char *out,
+                      const NfcImageInfo *info, NfcPreset preset, const H264Opts *o)
+{
+  gboolean x264 = nfc_have_encoder ("libx264");
+  gboolean oh264 = nfc_have_encoder ("libopenh264");
+  const char *vf = o->vf != NULL ? o->vf : video_filter (preset);
+  GPtrArray *a;
+
+  for (int enc = 0; enc < 2; enc++)
+    {
+      char *bps = NULL;
+
+      if (enc == 0 && !(x264 || !oh264))
+        continue;
+      if (enc == 1 && !oh264)
+        continue;
+      if (enc == 1)
+        {
+          guint64 rate = nfc_h264_bitrate (info) * oh264_percent[preset] / 100;
+
+          bps = g_strdup_printf ("%" G_GUINT64_FORMAT, MAX (rate, (guint64) H264_MIN_BPS));
+        }
+      for (int copy = o->audio_copy ? 1 : 0; copy >= 0; copy--)
+        {
+          a = ff_base (src);
+          av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn", "-vf", vf, NULL);
+          if (enc == 0)
+            {
+              av_add (a, "-c:v", "libx264", "-crf", x264_crf[preset],
+                      "-preset", preset == NFC_PRESET_SMALL ? "medium" : "slow", NULL);
+              if (o->no_bframes)
+                av_add (a, "-bf", "0", NULL);
+            }
+          else
+            av_add (a, "-c:v", "libopenh264", "-rc_mode", "bitrate", "-b:v", bps, NULL);
+          av_add (a, "-pix_fmt", "yuv420p", NULL);
+          if (copy)
+            av_add (a, "-c:a", "copy", NULL);
+          else
+            av_add (a, "-c:a", "aac", "-b:a", "192k", NULL);
+          if (o->faststart)
+            av_add (a, "-movflags", "+faststart", NULL);
+          av_add (a, out, NULL);
+          add_attempt (attempts, av_done (a), NULL);
+        }
+      g_free (bps);
+    }
+}
+
+/* The MP4 / MKV re-encode attempts of a conversion (see add_h264_attempts_ex) */
 static void
 add_h264_attempts (GPtrArray *attempts, const char *src, const char *out, gboolean mp4,
                    const NfcImageInfo *info, NfcPreset preset)
 {
-  gboolean x264 = nfc_have_encoder ("libx264");
-  gboolean oh264 = nfc_have_encoder ("libopenh264");
-  GPtrArray *a;
+  H264Opts o = { NULL, FALSE, mp4, FALSE };
 
-  if (x264 || !oh264)
+  add_h264_attempts_ex (attempts, src, out, info, preset, &o);
+}
+
+/* "-auto-orient", then for a resize the geometry that makes the picture smaller:
+ * Lanczos (the sharpest of the stock filters for shrinking), the long side
+ * bounded to the preset ("1920x1920>": never enlarges, so a missing size is
+ * harmless) or a percentage. Takes the picture's alpha channel along. */
+static void
+im_orient (GPtrArray *a, const NfcResizePreset *rs)
+{
+  av_add (a, "-auto-orient", NULL);
+  if (rs == NULL)
+    return;
+  if (rs->percent > 0)
     {
-      a = ff_base (src);
-      av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-              "-vf", video_filter (preset), "-c:v", "libx264", "-crf", x264_crf[preset],
-              "-preset", preset == NFC_PRESET_SMALL ? "medium" : "slow",
-              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
-      if (mp4)
-        av_add (a, "-movflags", "+faststart", NULL);
-      av_add (a, out, NULL);
-      add_attempt (attempts, av_done (a), NULL);
+      char *g = g_strdup_printf ("%u%%", rs->percent);
+
+      av_add (a, "-filter", "Lanczos", "-resize", g, NULL);
+      g_free (g);
     }
-  if (oh264)
+  else
     {
-      guint64 rate = nfc_h264_bitrate (info) * oh264_percent[preset] / 100;
-      char *bps = g_strdup_printf ("%" G_GUINT64_FORMAT, MAX (rate, (guint64) H264_MIN_BPS));
+      char *g = g_strdup_printf ("%ux%u>", rs->side, rs->side);
 
-      a = ff_base (src);
-      av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
-              "-vf", video_filter (preset), "-c:v", "libopenh264", "-rc_mode", "bitrate", "-b:v", bps,
-              "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", NULL);
-      if (mp4)
-        av_add (a, "-movflags", "+faststart", NULL);
-      av_add (a, out, NULL);
-      add_attempt (attempts, av_done (a), NULL);
-      g_free (bps);
+      av_add (a, "-filter", "Lanczos", "-resize", g, NULL);
+      g_free (g);
     }
 }
 
@@ -1709,11 +2057,127 @@ nfc_build_attempts_info (NfcCategory cat, const char *fmt, const char *key,
                                     info, needs_decode);
 }
 
+/* ffmpeg scale filter of a resize preset. Video: the SHORT side becomes `side`
+ * (portrait or landscape), the other follows with an even value (-2); GIF and
+ * the like: the long side (or a percentage), any value (-1). Never enlarges
+ * (min), so a source whose size is unknown cannot get bigger. Lanczos. */
+static char *
+resize_scale_filter (const NfcResizePreset *rs, gboolean video)
+{
+  if (rs->percent > 0)
+    return g_strdup_printf ("scale=w='trunc(iw*%u/100+0.5)':h='trunc(ih*%u/100+0.5)':flags=lanczos",
+                            rs->percent, rs->percent);
+  if (rs->short_side)
+    return g_strdup_printf ("scale=w='if(gt(iw,ih),-2,min(iw,%u))':h='if(gt(iw,ih),min(ih,%u),-2)'"
+                            ":flags=lanczos", rs->side, rs->side);
+  return g_strdup_printf ("scale=w='if(gt(iw,ih),min(iw,%u),%s)':h='if(gt(iw,ih),%s,min(ih,%u))'"
+                          ":flags=lanczos", rs->side, video ? "-2" : "-1", video ? "-2" : "-1",
+                          rs->side);
+}
+
+/* The attempts that resize a video (or animated GIF) to the preset. MP4, MOV, MKV
+ * and AVI: libx264 crf 18 slow (the Best preset), libopenh264 when that is all
+ * ffmpeg has; the audio stream is copied when the container takes it, else AAC
+ * 192k. AVI gets no B-frames (it cannot carry them reliably). WebM: VP9 crf 28
+ * (Best), audio copied, else Opus 128k. GIF: the palette chain of the GIF presets
+ * at the new size, frame rate untouched. FALSE for any other key. */
+static gboolean
+add_resize_video_attempts (GPtrArray *attempts, const char *key, const char *src,
+                           const char *out, const NfcResizePreset *rs, const NfcImageInfo *info)
+{
+  GPtrArray *a;
+  guint64 ow, oh;
+  NfcImageInfo oinfo = { 0, 0, FALSE, 0, 0 };
+
+  if (g_str_equal (key, "gif"))
+    {
+      char *scale = resize_scale_filter (rs, FALSE);
+      char *vf = g_strdup_printf ("%s,split[s0][s1];[s0]palettegen=stats_mode=diff[p];"
+                                  "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                                  scale);
+
+      a = ff_base (src);
+      av_add (a, "-map", "0:v:0", "-an", "-sn", "-dn", "-vf", vf, "-loop", "0", out, NULL);
+      add_attempt (attempts, av_done (a), NULL);
+      g_free (vf);
+      g_free (scale);
+      return TRUE;
+    }
+  if (g_str_equal (key, "webm"))
+    {
+      char *scale = resize_scale_filter (rs, TRUE);
+      char *vf = g_strconcat (scale, "," EVEN, NULL);
+
+      for (int copy = 1; copy >= 0; copy--)
+        {
+          a = ff_base (src);
+          av_add (a, "-map", "0:v:0", "-map", "0:a:0?", "-sn", "-dn",
+                  "-c:v", "libvpx-vp9", "-crf", "28", "-b:v", "0", "-row-mt", "1",
+                  "-deadline", "good", "-cpu-used", "2", "-pix_fmt", "yuv420p", "-vf", vf, NULL);
+          if (copy)
+            av_add (a, "-c:a", "copy", NULL);
+          else
+            av_add (a, "-c:a", "libopus", "-b:a", "128k", NULL);
+          av_add (a, out, NULL);
+          add_attempt (attempts, av_done (a), NULL);
+        }
+      g_free (vf);
+      g_free (scale);
+      return TRUE;
+    }
+  if (g_str_equal (key, "mp4") || g_str_equal (key, "mov") || g_str_equal (key, "mkv") ||
+      g_str_equal (key, "avi"))
+    {
+      char *scale = resize_scale_filter (rs, TRUE);
+      char *vf = g_strconcat (scale, "," EVEN, NULL);
+      H264Opts o = { vf, TRUE, g_str_equal (key, "mp4") || g_str_equal (key, "mov"),
+                     g_str_equal (key, "avi") };
+
+      /* the libopenh264 bitrate follows the size of the OUTPUT */
+      if (info != NULL && nfc_resize_output_size (rs, info->width, info->height, &ow, &oh))
+        {
+          oinfo.width = ow;
+          oinfo.height = oh;
+        }
+      add_h264_attempts_ex (attempts, src, out, oinfo.width > 0 ? &oinfo : NULL,
+                            NFC_PRESET_BEST, &o);
+      g_free (vf);
+      g_free (scale);
+      return TRUE;
+    }
+  return FALSE;
+}
+
+static GPtrArray *build_attempts (NfcCategory cat, const char *fmt, const char *key,
+                                  NfcPreset preset, const NfcResizePreset *rs,
+                                  const char *src_in, const char *out, const char *workdir,
+                                  const NfcImageInfo *info, gboolean *needs_decode);
+
 GPtrArray *
 nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
                            NfcPreset preset, const char *src_in, const char *out,
                            const char *workdir, const NfcImageInfo *info,
                            gboolean *needs_decode)
+{
+  return build_attempts (cat, fmt, key, preset, NULL, src_in, out, workdir, info, needs_decode);
+}
+
+GPtrArray *
+nfc_build_attempts_resize (NfcCategory cat, const char *fmt, const char *key,
+                           const NfcResizePreset *rs, const char *src_in, const char *out,
+                           const char *workdir, const NfcImageInfo *info,
+                           gboolean *needs_decode)
+{
+  if (rs == NULL)
+    return NULL;
+  return build_attempts (cat, fmt, key, NFC_PRESET_BEST, rs, src_in, out, workdir, info,
+                         needs_decode);
+}
+
+static GPtrArray *
+build_attempts (NfcCategory cat, const char *fmt, const char *key, NfcPreset preset,
+                const NfcResizePreset *rs, const char *src_in, const char *out,
+                const char *workdir, const NfcImageInfo *info, gboolean *needs_decode)
 {
   GPtrArray *attempts, *a;
   char *src;
@@ -1722,8 +2186,8 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
     *needs_decode = FALSE;
   if (src_in == NULL || fmt == NULL || key == NULL || out == NULL || workdir == NULL)
     return NULL;
-  /* targets without presets always convert as Best */
-  if ((guint) preset >= NFC_PRESET_N || !nfc_target_has_presets (cat, key))
+  /* targets without presets always convert as Best; a resize is always Best */
+  if (rs != NULL || (guint) preset >= NFC_PRESET_N || !nfc_target_has_presets (cat, key))
     preset = NFC_PRESET_BEST;
   src = g_canonicalize_filename (src_in, NULL);
   attempts = attempts_new ();
@@ -1779,7 +2243,8 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
           im_limits (a);
           if (g_str_equal (fmt, "svg"))
             av_add (a, "-background", "none", "-density", "192", NULL);
-          av_add (a, im_in, "-auto-orient", NULL);
+          av_add (a, im_in, NULL);
+          im_orient (a, rs);
           if (preset == NFC_PRESET_SMALL)
             av_add (a, "-resize", SMALL_MAX_SIDE, NULL);
           im_flatten (a);
@@ -1820,7 +2285,7 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
            * photos are fine at q95. The other presets lower the quality (tables
            * above), write progressive files and subsample the chroma where that
            * costs little; Small also shrinks images beyond 2560 px. */
-          av_add (a, "-auto-orient", NULL);
+          im_orient (a, rs);
           if (preset == NFC_PRESET_SMALL)
             av_add (a, "-resize", SMALL_MAX_SIDE, NULL);
           im_flatten (a);
@@ -1839,8 +2304,7 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
           /* WEBP stores at most 16383 pixels per side: shrink only beyond that.
            * Best, graphics (lossless sources): lossless WEBP, which was smaller
            * than the source PNG for every screenshot tried and has no chroma
-           * subsampling or ringing. Photos: lossy q90, method 6 (sharp YUV
-           * is requested too, see webp_lossy_args). 94 made a phone JPEG
+           * subsampling or ringing. Photos: lossy q90, method 6 (sharp YUV). 94 made a phone JPEG
            * larger than its source (a lossy source re-encoded at a higher quality
            * keeps its artefacts at a higher bitrate): at q90 the output is not
            * larger, SSIM >= 0.98 against the source on most photos.
@@ -1854,11 +2318,11 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
            * and photos. The lossless encode comes first and is not essential:
            * if it fails (memory), the second attempt is the lossy encode alone.
            * Small also shrinks images beyond 2560 px (both candidates). */
-          av_add (a, "-auto-orient", "-resize",
-                  preset == NFC_PRESET_SMALL ? SMALL_MAX_SIDE : "16383x16383>", NULL);
+          im_orient (a, rs);
+          av_add (a, "-resize", preset == NFC_PRESET_SMALL ? SMALL_MAX_SIDE : "16383x16383>", NULL);
           if (photo_source (fmt))
             av_add (a, "-quality", webp_quality_photo[preset], "-define", "webp:method=6",
-                    "-define", "webp:sharp-yuv=true", NULL);
+                    "-define", "webp:use-sharp-yuv=true", NULL);
           else if (preset == NFC_PRESET_BEST)
             av_add (a, "-define", "webp:lossless=true", "-define", "webp:method=4", NULL);
           else
@@ -1921,7 +2385,7 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
             }
         }
       else /* png, bmp, tiff */
-        av_add (a, "-auto-orient", NULL);
+        im_orient (a, rs);
       {
         /* explicit format prefix: ImageMagick silently writes PNG data under
          * an .avif/.heic name, and never trusts the extension we want */
@@ -1958,6 +2422,14 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
     {
       if (nfc_tools.ffmpeg == NULL)
         goto fail;
+
+      if (rs != NULL)
+        {
+          if (cat != NFC_CAT_VIDEO || !add_resize_video_attempts (attempts, key, src, out, rs, info))
+            goto fail;
+          g_free (src);
+          return attempts;
+        }
 
       if (g_str_equal (key, "mp3") || g_str_equal (key, "flac") ||
           g_str_equal (key, "wav") || g_str_equal (key, "ogg") ||
@@ -2012,7 +2484,9 @@ nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const char *key,
           static const struct { guint width, fps; const char *colors; } gif_p[NFC_PRESET_N] = {
             { 960, 15, "" }, { 720, 15, "" }, { 640, 12, "" }, { 480, 10, ":max_colors=128" },
           };
-          char *vf = g_strdup_printf ("fps=%u,scale='min(%u,iw)':-1:flags=lanczos,"
+          /* min(source_fps, preset fps): a 10 fps source keeps its 10 fps instead
+           * of getting every frame doubled (a bigger file with nothing gained) */
+          char *vf = g_strdup_printf ("fps=fps='min(source_fps,%u)',scale='min(%u,iw)':-1:flags=lanczos,"
                                       "split[s0][s1];[s0]palettegen=stats_mode=diff%s[p];"
                                       "[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
                                       gif_p[preset].fps, gif_p[preset].width, gif_p[preset].colors);

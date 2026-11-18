@@ -86,6 +86,7 @@ typedef struct {
   char *pub_stem;         /* stem of the published name when it is not the source's */
   gint64 ref_size;        /* keep the output only if smaller than this (-1: always keep) */
   NfcPreset preset;
+  const NfcResizePreset *resize; /* Resize job: static preset, NULL otherwise */
   char *workdir, *produced, *hidden;
   gint64 src_size;
   GPtrArray *attempts;
@@ -181,12 +182,40 @@ job_free (Job *j)
   g_free (j);
 }
 
+/* Whatever the outcome, the callback can ask for the source's size
+ * (nfc_convert_result_dims): kept on the task before it returns */
+static void
+task_keep_dims (Job *j)
+{
+  NfcDims *d;
+
+  if (j->task == NULL || !j->have_info)
+    return;
+  d = g_new (NfcDims, 1);
+  d->width = j->info.width;
+  d->height = j->info.height;
+  g_object_set_data_full (G_OBJECT (j->task), "nfc-src-dims", d, g_free);
+}
+
+gboolean
+nfc_convert_result_dims (GAsyncResult *result, guint64 *width, guint64 *height)
+{
+  const NfcDims *d = result != NULL ? g_object_get_data (G_OBJECT (result), "nfc-src-dims") : NULL;
+
+  if (width != NULL)
+    *width = d != NULL ? d->width : 0;
+  if (height != NULL)
+    *height = d != NULL ? d->height : 0;
+  return d != NULL;
+}
+
 static void
 job_fail (Job *j, const char *msg)
 {
   GTask *task = j->task;
 
   job_cleanup_files (j);
+  task_keep_dims (j);
   g_task_return_new_error (task, G_IO_ERROR, G_IO_ERROR_FAILED, "%s",
                            msg != NULL && *msg ? msg : "conversion failed");
   j->task = NULL;
@@ -211,8 +240,31 @@ job_skip (Job *j, gint64 out_size)
            " bytes: not smaller, discarded", j->src, j->key, nfc_preset_label (j->preset),
            out_size, j->ref_size);
   job_cleanup_files (j);
+  task_keep_dims (j);
   g_task_return_new_error (task, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER,
                            "already as small as it gets");
+  j->task = NULL;
+  job_free (j);
+  g_object_unref (task);
+}
+
+/* A Resize job whose source the preset would not make smaller: ends before any
+ * converter runs, with the same error (and no output, no temporary file) */
+static void
+job_skip_resize (Job *j)
+{
+  GTask *task = j->task;
+  char *msg;
+
+  nfc_log ("SKIP %s -> %s (%s): source %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT
+           " is already smaller than the preset", j->src, j->key, j->resize->name,
+           j->info.width, j->info.height);
+  job_cleanup_files (j);
+  task_keep_dims (j);
+  msg = j->resize->percent > 0 ? g_strdup_printf ("too small to resize to %s", j->resize->name)
+                               : g_strdup_printf ("already smaller than %s", j->resize->name);
+  g_task_return_new_error (task, NFC_CONVERT_ERROR, NFC_CONVERT_ERROR_NOT_SMALLER, "%s", msg);
+  g_free (msg);
   j->task = NULL;
   job_free (j);
   g_object_unref (task);
@@ -320,6 +372,7 @@ finalize_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data)
     GTask *task = j->task;
 
     nfc_rm_rf (j->workdir);
+    task_keep_dims (j);
     g_task_return_pointer (task, final, g_free);
     j->task = NULL;
     job_free (j);
@@ -830,6 +883,13 @@ admission_submit (Job *j)
 static void
 probe_finished (Job *j)
 {
+  /* Resize: the preset must make the picture smaller, else there is nothing to do */
+  if (j->resize != NULL && j->have_info &&
+      !nfc_resize_output_size (j->resize, j->info.width, j->info.height, NULL, NULL))
+    {
+      job_skip_resize (j);
+      return;
+    }
   if (j->cat == NFC_CAT_VIDEO)
     job_start (j);
   else
@@ -971,9 +1031,14 @@ job_start (Job *j)
       j->produced = g_strdup (j->hidden);
     }
   /* HEIC/AVIF input: the attempt starts with an nfc-decode step (own process) */
-  j->attempts = nfc_build_attempts_preset (j->cat, j->fmt, j->key, j->preset, j->src,
-                                          j->produced, j->workdir,
-                                          j->have_info ? &j->info : NULL, NULL);
+  if (j->resize != NULL)
+    j->attempts = nfc_build_attempts_resize (j->cat, j->fmt, j->key, j->resize, j->src,
+                                             j->produced, j->workdir,
+                                             j->have_info ? &j->info : NULL, NULL);
+  else
+    j->attempts = nfc_build_attempts_preset (j->cat, j->fmt, j->key, j->preset, j->src,
+                                             j->produced, j->workdir,
+                                             j->have_info ? &j->info : NULL, NULL);
   if (j->attempts == NULL)
     {
       job_fail (j, "no converter available for this format");
@@ -995,7 +1060,7 @@ nfc_convert_file_preset_async (NfcCategory cat, const char *fmt, const char *key
                                NfcPreset preset, const char *ext, const char *src_in,
                                GAsyncReadyCallback callback, gpointer user_data)
 {
-  NfcConvertOptions opts = { preset, NULL, NFC_REFERENCE_NONE };
+  NfcConvertOptions opts = { preset, NULL, NFC_REFERENCE_NONE, NULL };
 
   nfc_convert_file_opts_async (cat, fmt, key, ext, src_in, &opts, callback, user_data);
 }
@@ -1023,6 +1088,7 @@ nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
   j->ref_size = NFC_REFERENCE_NONE;
   if (opts != NULL)
     {
+      j->resize = opts->resize;
       if (opts->name_suffix != NULL && *opts->name_suffix != '\0')
         {
           /* a file name is at most 255 bytes: the suffix, the extension and a
@@ -1055,8 +1121,12 @@ nfc_convert_file_opts_async (NfcCategory cat, const char *fmt, const char *key,
 
   if (cat == NFC_CAT_IMAGE)
     probe_start (j); /* then the admission decides when job_start runs */
-  else if (cat == NFC_CAT_VIDEO && (g_str_equal (key, "mp4") || g_str_equal (key, "mkv")))
-    probe_start (j); /* the picture size sets the libopenh264 bitrate; then job_start */
+  else if (cat == NFC_CAT_VIDEO &&
+           (g_str_equal (key, "mp4") || g_str_equal (key, "mkv") || j->resize != NULL ||
+            (preset == NFC_PRESET_SMALL && (g_str_equal (key, "webm") || g_str_equal (key, "gif")))))
+    probe_start (j); /* the picture size sets the libopenh264 bitrate, tells a resize
+                      * whether there is anything to do and the toast what the Small
+                      * preset scaled to; then job_start */
   else
     job_start (j);
 }
@@ -1249,6 +1319,7 @@ typedef struct {
   char *suffix;           /* " (Balanced)" when a preset other than Best applies, else "" */
   NfcPreset preset;
   gboolean compress;      /* nfc_batch_run_compress: key/ext/cat are per file */
+  const NfcResizePreset *resize; /* nfc_batch_run_resize: key/ext/cat are per file */
   guint n, next, running, finished, max_workers;
   char **paths, **fmts;
   GPtrArray *results;
@@ -1299,6 +1370,144 @@ saved_text (gint64 src, gint64 out)
   return g_strdup_printf (", −%d%%", MAX (pct, 1));
 }
 
+/* " (Small)", or, when the Small preset scaled this file down, " (Small, 2560×1707)":
+ * the suffix of the success toast of file i (g_free). The size is the one the preset
+ * makes of the source size the job probed. */
+static char *
+result_suffix (Batch *b, guint i)
+{
+  const NfcResult *r = b->results->pdata[i];
+  NfcCategory cat = b->cat;
+  const char *key = b->key;
+  NfcCompressTarget ct;
+  guint64 ow, oh;
+
+  if (b->compress)
+    {
+      if (!nfc_compress_target (b->cat, b->fmts[i], &ct))
+        return g_strdup (b->suffix);
+      cat = ct.cat;
+      key = ct.key;
+    }
+  if (b->preset == NFC_PRESET_SMALL && r->src_w > 0 &&
+      nfc_preset_output_size (cat, key, b->preset, r->src_w, r->src_h, &ow, &oh))
+    return g_strdup_printf (" (%s, %" G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT ")",
+                            nfc_preset_label (b->preset), ow, oh);
+  return g_strdup (b->suffix);
+}
+
+/* "Failed: name — reason" for the first three failed files of a batch, and a
+ * pointer to the log for the rest */
+static void
+append_failures (Batch *b, GString *body)
+{
+  guint shown = 0, bad = 0;
+
+  for (guint i = 0; i < b->n; i++)
+    {
+      NfcResult *r = b->results->pdata[i];
+      char *base;
+
+      if (r->ok || r->skipped)
+        continue;
+      bad++;
+      if (shown >= 3)
+        continue;
+      base = g_path_get_basename (r->path);
+      if (body->len)
+        g_string_append_c (body, '\n');
+      g_string_append_printf (body, "Failed: %s — %s", base, r->error);
+      g_free (base);
+      shown++;
+    }
+  if (bad > 3)
+    g_string_append_printf (body, "\n…and %u more (see ~/.cache/nautilus-file-converter.log)",
+                            bad - 3);
+}
+
+/* The notification of a resize batch: what was made (with the sizes for one
+ * file), what was already smaller than the preset, what failed. Returns the
+ * title; body is filled; *icon is static. */
+static const char *
+resize_message (Batch *b, GString *body, const char **icon)
+{
+  const NfcResizePreset *p = b->resize;
+  guint good = 0, skipped = 0, bad = 0;
+  const char *small_verb = p->percent > 0 ? "too small to resize to" : "already smaller than";
+
+  for (guint i = 0; i < b->n; i++)
+    {
+      NfcResult *r = b->results->pdata[i];
+
+      if (r->ok)
+        good++;
+      else if (r->skipped)
+        skipped++;
+      else
+        bad++;
+    }
+  if (good == 1)
+    for (guint i = 0; i < b->n; i++)
+      {
+        NfcResult *r = b->results->pdata[i];
+        guint64 ow, oh;
+
+        if (!r->ok)
+          continue;
+        {
+          char *from = g_path_get_basename (r->path);
+          char *to = g_path_get_basename (r->output);
+
+          g_string_append_printf (body, "%s → %s", from, to);
+          g_free (from);
+          g_free (to);
+        }
+        if (r->src_w > 0 && nfc_resize_output_size (p, r->src_w, r->src_h, &ow, &oh))
+          g_string_append_printf (body, ", %" G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT " → %"
+                                  G_GUINT64_FORMAT "×%" G_GUINT64_FORMAT,
+                                  r->src_w, r->src_h, ow, oh);
+      }
+  else if (good > 1 && good == b->n)
+    g_string_append_printf (body, "Resized %u files to %s", good, p->name);
+  else if (good > 1)
+    g_string_append_printf (body, "Resized %u of %u files to %s", good, b->n, p->name);
+
+  if (skipped == 1)
+    for (guint i = 0; i < b->n; i++)
+      {
+        NfcResult *r = b->results->pdata[i];
+
+        if (r->skipped)
+          {
+            char *base = g_path_get_basename (r->path);
+
+            if (body->len)
+              g_string_append_c (body, '\n');
+            g_string_append_printf (body, "%s is %s %s", base, small_verb, p->name);
+            g_free (base);
+          }
+      }
+  else if (skipped > 1)
+    {
+      if (body->len)
+        g_string_append_c (body, '\n');
+      g_string_append_printf (body, "%u files are %s %s", skipped, small_verb, p->name);
+    }
+  append_failures (b, body);
+  if (bad > 0)
+    {
+      *icon = "dialog-error-symbolic";
+      return "Resize failed";
+    }
+  if (good > 0)
+    {
+      *icon = "object-select-symbolic";
+      return "Resize complete";
+    }
+  *icon = "dialog-information-symbolic";
+  return "Nothing to resize";
+}
+
 /* The notification of a compress batch: what was made, what was already as small
  * as it gets, what failed. Returns the title; body is filled; *icon is static. */
 static const char *
@@ -1334,10 +1543,12 @@ compress_message (Batch *b, GString *body, const char **icon)
             {
               char *from = g_path_get_basename (r->path);
               char *to = g_path_get_basename (r->output);
+              char *suffix = result_suffix (b, i);
 
-              g_string_append_printf (body, "%s → %s%s%s", from, to, b->suffix, saved);
+              g_string_append_printf (body, "%s → %s%s%s", from, to, suffix, saved);
               g_free (from);
               g_free (to);
+              g_free (suffix);
             }
         }
     }
@@ -1409,7 +1620,14 @@ batch_finish (Batch *b)
     if (((NfcResult *) b->results->pdata[i])->ok)
       good++;
 
-  if (b->compress)
+  if (b->resize != NULL)
+    {
+      const char *icon;
+      const char *title = resize_message (b, body, &icon);
+
+      notifier_send (b->notifier, title, body->str, icon, "normal");
+    }
+  else if (b->compress)
     {
       const char *icon;
       const char *title = compress_message (b, body, &icon);
@@ -1423,10 +1641,12 @@ batch_finish (Batch *b)
           NfcResult *r = b->results->pdata[0];
           char *from = g_path_get_basename (r->path);
           char *to = g_path_get_basename (r->output);
+          char *suffix = result_suffix (b, 0);
 
-          g_string_printf (body, "%s → %s%s", from, to, b->suffix);
+          g_string_printf (body, "%s → %s%s", from, to, suffix);
           g_free (from);
           g_free (to);
+          g_free (suffix);
         }
       else
         g_string_printf (body, "Converted %u files to %s", good, b->short_label);
@@ -1523,8 +1743,11 @@ static void
 batch_item_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data)
 {
   GError *error = NULL;
+  BatchItem *it = data;
+  NfcResult *r = it->batch->results->pdata[it->index];
   char *output = nfc_convert_file_finish (res, &error);
 
+  nfc_convert_result_dims (res, &r->src_w, &r->src_h);
   batch_item_complete (data, output, error);
   g_clear_error (&error);
 }
@@ -1534,8 +1757,11 @@ batch_item_done (GObject *source G_GNUC_UNUSED, GAsyncResult *res, gpointer data
 static gboolean
 batch_item_unsupported (gpointer data)
 {
+  BatchItem *it = data;
   GError *error = g_error_new_literal (G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
-                                       "this format cannot be compressed");
+                                       it->batch->resize != NULL
+                                         ? "this format cannot be resized"
+                                         : "this format cannot be compressed");
 
   batch_item_complete (data, NULL, error);
   g_error_free (error);
@@ -1552,10 +1778,24 @@ batch_pump (Batch *b)
       it->batch = b;
       it->index = b->next++;
       b->running++;
+      if (b->resize != NULL)
+        {
+          NfcResizeTarget rt;
+          char *suffix = g_strdup_printf (" (%s)", b->resize->name);
+          NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, b->resize };
+
+          if (!nfc_resize_target (b->cat, b->fmts[it->index], &rt))
+            g_idle_add (batch_item_unsupported, it);
+          else
+            nfc_convert_file_opts_async (rt.cat, b->fmts[it->index], rt.key, rt.ext,
+                                         b->paths[it->index], &o, batch_item_done, it);
+          g_free (suffix); /* copied by the job */
+          continue;
+        }
       if (b->compress)
         {
           NfcCompressTarget ct;
-          NfcConvertOptions o = { b->preset, " (compressed)", NFC_REFERENCE_SOURCE };
+          NfcConvertOptions o = { b->preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL };
 
           if (!nfc_compress_target (b->cat, b->fmts[it->index], &ct))
             {
@@ -1580,7 +1820,8 @@ nfc_batch_run (NfcCategory cat, const char *key, const char *label, const char *
 }
 
 static void
-batch_start (gboolean compress, NfcCategory cat, const char *key, NfcPreset preset,
+batch_start (gboolean compress, const NfcResizePreset *resize, NfcCategory cat,
+             const char *key, NfcPreset preset,
              const char *label, const char *ext, const char *const *paths,
              const char *const *fmts, guint n, NfcBatchDone done, gpointer user_data)
 {
@@ -1607,6 +1848,7 @@ batch_start (gboolean compress, NfcCategory cat, const char *key, NfcPreset pres
   if ((sp = strstr (b->short_label, " (")) != NULL)
     *sp = '\0';
   b->compress = compress;
+  b->resize = resize;
   b->preset = ((guint) preset < NFC_PRESET_N && (compress || nfc_target_has_presets (cat, key)))
                 ? preset : NFC_PRESET_BEST;
   b->suffix = b->preset == NFC_PRESET_BEST ? g_strdup ("")
@@ -1643,11 +1885,13 @@ batch_start (gboolean compress, NfcCategory cat, const char *key, NfcPreset pres
   else
     what = g_strdup_printf ("%u files", n);
   {
-    char *body = compress ? g_strdup_printf ("%s%s", what, b->suffix)
-                          : g_strdup_printf ("%s to %s", what, b->short_label);
+    char *body = resize != NULL ? (n == 1 ? g_strdup_printf ("%s (%s)", what, resize->name)
+                                          : g_strdup_printf ("%s to %s", what, resize->name))
+                 : compress ? g_strdup_printf ("%s%s", what, b->suffix)
+                            : g_strdup_printf ("%s to %s", what, b->short_label);
 
-    notifier_send (b->notifier, compress ? "Compressing…" : "Converting…", body,
-                   "view-refresh-symbolic", "normal");
+    notifier_send (b->notifier, resize != NULL ? "Resizing…" : compress ? "Compressing…" : "Converting…",
+                   body, "view-refresh-symbolic", "normal");
     g_free (body);
   }
   g_free (what);
@@ -1659,7 +1903,7 @@ nfc_batch_run_preset (NfcCategory cat, const char *key, NfcPreset preset, const 
                       const char *ext, const char *const *paths, const char *const *fmts,
                       guint n, NfcBatchDone done, gpointer user_data)
 {
-  batch_start (FALSE, cat, key, preset, label, ext, paths, fmts, n, done, user_data);
+  batch_start (FALSE, NULL, cat, key, preset, label, ext, paths, fmts, n, done, user_data);
 }
 
 void
@@ -1667,5 +1911,32 @@ nfc_batch_run_compress (NfcCategory cat, NfcPreset preset, const char *const *pa
                         const char *const *fmts, guint n, NfcBatchDone done,
                         gpointer user_data)
 {
-  batch_start (TRUE, cat, "", preset, "Compress", "", paths, fmts, n, done, user_data);
+  batch_start (TRUE, NULL, cat, "", preset, "Compress", "", paths, fmts, n, done, user_data);
+}
+
+void
+nfc_batch_run_resize (NfcCategory cat, const char *preset_key, const char *const *paths,
+                      const char *const *fmts, guint n, NfcBatchDone done, gpointer user_data)
+{
+  const NfcResizePreset *p = nfc_resize_preset_from_key (cat, preset_key);
+
+  if (p == NULL)
+    {
+      /* nothing to run: every file failed */
+      GPtrArray *results = g_ptr_array_new_with_free_func ((GDestroyNotify) result_free);
+
+      for (guint i = 0; i < n && paths != NULL; i++)
+        {
+          NfcResult *r = g_new0 (NfcResult, 1);
+
+          r->path = g_strdup (paths[i]);
+          r->error = g_strdup ("unknown resize preset");
+          g_ptr_array_add (results, r);
+        }
+      if (done != NULL)
+        done (results, user_data);
+      g_ptr_array_unref (results);
+      return;
+    }
+  batch_start (FALSE, p, cat, "", NFC_PRESET_BEST, "Resize", "", paths, fmts, n, done, user_data);
 }

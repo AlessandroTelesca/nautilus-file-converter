@@ -1369,7 +1369,7 @@ compress_sync (NfcCategory cat, const char *fmt, NfcPreset preset, const char *s
                gboolean *skipped, char **err)
 {
   NfcCompressTarget t;
-  NfcConvertOptions o = { preset, " (compressed)", NFC_REFERENCE_SOURCE };
+  NfcConvertOptions o = { preset, " (compressed)", NFC_REFERENCE_SOURCE, NULL };
   Wait w = { g_main_loop_new (NULL, FALSE), NULL, NULL };
   char *out;
 
@@ -1579,7 +1579,7 @@ test_keep_smaller (const char *dir)
     }
 
   /* the general mechanism: an explicit reference size, no name suffix */
-  opts = (NfcConvertOptions) { NFC_PRESET_BEST, NULL, 1 };
+  opts = (NfcConvertOptions) { NFC_PRESET_BEST, NULL, 1, NULL };
   w = (Wait) { g_main_loop_new (NULL, FALSE), NULL, NULL };
   nfc_convert_file_opts_async (NFC_CAT_IMAGE, "png", "jpg", "jpg", gfx, &opts, on_done, &w);
   g_main_loop_run (w.loop);
@@ -1986,6 +1986,649 @@ test_compress (void)
   g_free (dir);
 }
 
+/* ---- Resize ---- */
+
+typedef struct {
+  GMainLoop *loop;
+  char *out;
+  GError *error;
+  guint64 w, h;
+} ResizeWait;
+
+static void
+resize_on_done (GObject *o, GAsyncResult *res, gpointer data)
+{
+  ResizeWait *w = data;
+
+  (void) o;
+  nfc_convert_result_dims (res, &w->w, &w->h);
+  w->out = nfc_convert_file_finish (res, &w->error);
+  g_main_loop_quit (w->loop);
+}
+
+/* what the batch does for one file: the target of the resize, the name suffix, the
+ * preset. *skipped: the preset would not make the source smaller (nothing made).
+ * src_w, src_h: the size the job probed. */
+static char *
+resize_sync (NfcCategory cat, const char *fmt, const char *rs_key, const char *src,
+             gboolean *skipped, char **err, guint64 *src_w, guint64 *src_h)
+{
+  NfcResizeTarget t;
+  const NfcResizePreset *rs = nfc_resize_preset_from_key (cat, rs_key);
+  char *suffix = rs != NULL ? g_strdup_printf (" (%s)", rs->name) : NULL;
+  NfcConvertOptions o = { NFC_PRESET_BEST, suffix, NFC_REFERENCE_NONE, rs };
+  ResizeWait w = { g_main_loop_new (NULL, FALSE), NULL, NULL, 0, 0 };
+  char *out;
+
+  *skipped = FALSE;
+  if (err != NULL)
+    *err = NULL;
+  if (rs == NULL || !nfc_resize_target (cat, fmt, &t))
+    {
+      g_main_loop_unref (w.loop);
+      g_free (suffix);
+      if (err != NULL)
+        *err = g_strdup ("not resizable");
+      return NULL;
+    }
+  nfc_convert_file_opts_async (t.cat, fmt, t.key, t.ext, src, &o, resize_on_done, &w);
+  g_main_loop_run (w.loop);
+  g_main_loop_unref (w.loop);
+  g_free (suffix);
+  out = w.out;
+  *skipped = w.error != NULL && g_error_matches (w.error, NFC_CONVERT_ERROR,
+                                                 NFC_CONVERT_ERROR_NOT_SMALLER);
+  if (err != NULL)
+    *err = w.error ? g_strdup (w.error->message) : NULL;
+  if (src_w != NULL)
+    *src_w = w.w;
+  if (src_h != NULL)
+    *src_h = w.h;
+  g_clear_error (&w.error);
+  return out;
+}
+
+/* "WxH" of the first frame of an image or the first video stream of path (g_free) */
+static char *
+size_of (const char *path)
+{
+  char *out = NULL, *r;
+
+  if (!run (NULL, &out, "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+            "stream=width,height", "-of", "csv=p=0:s=x", path, NULL) || out == NULL)
+    {
+      g_free (out);
+      return g_strdup ("(ffprobe failed)");
+    }
+  r = g_strdup (g_strstrip (out));
+  g_free (out);
+  return r;
+}
+
+/* one ffprobe field of the first stream of a kind ("v:0" / "a:0"), e.g. codec_name */
+static char *
+stream_field (const char *path, const char *stream, const char *field)
+{
+  char *out = NULL, *entries = g_strdup_printf ("stream=%s", field), *r;
+
+  if (!run (NULL, &out, "ffprobe", "-v", "error", "-select_streams", stream, "-show_entries",
+            entries, "-of", "csv=p=0", path, NULL) || out == NULL)
+    r = g_strdup ("");
+  else
+    r = g_strdup (g_strstrip (out));
+  g_free (out);
+  g_free (entries);
+  return r;
+}
+
+/* frames of an image or animated GIF (all of them, no decoding) */
+static char *
+frames_of (const char *path)
+{
+  char *out = NULL, *r;
+
+  if (!run (NULL, &out, "magick", "identify", "-ping", "-format", "%n\n", path, NULL) || out == NULL)
+    {
+      g_free (out);
+      return g_strdup ("?");
+    }
+  r = g_strdup (strtok (out, "\n"));
+  g_free (out);
+  return r;
+}
+
+/* Resize `src_name` (in `dir`, alone there) with preset rs_key: the output is named
+ * `want_name`, is a real file of the same type, has exactly `want_dims` ("WxH"), the
+ * source is untouched and nothing else is left behind. extra: more to check on the
+ * output (may be NULL), returns an error text or NULL. */
+static void
+check_resize (const char *dir, const char *src_name, const char *rs_key, const char *want_name,
+              const char *want_dims, char *(*extra) (const char *src, const char *out))
+{
+  char *src = g_build_filename (dir, src_name, NULL), *before = checksum_of (src), *label;
+  char *err = NULL, *out, *detail = NULL, *left;
+  gboolean skipped;
+  guint64 sw = 0, sh = 0;
+  NfcFormat f;
+  NfcResizeTarget t;
+  gboolean pass = FALSE;
+
+  label = g_strdup_printf ("resize %s", rs_key);
+  if (!nfc_classify (src, NULL, &f) || !nfc_resize_target (f.cat, f.fmt, &t))
+    {
+      add_row (src_name, label, FALSE, "not resizable");
+      goto out;
+    }
+  if (!nfc_resize_available (f.cat, f.fmt))
+    {
+      add_row (src_name, label, TRUE, "not offered by this system: skipped");
+      goto out;
+    }
+  out = resize_sync (f.cat, f.fmt, rs_key, src, &skipped, &err, &sw, &sh);
+  if (out == NULL)
+    detail = g_strdup_printf ("%s%s", skipped ? "SKIPPED: " : "", err ? err : "failed");
+  else
+    {
+      char *base = g_path_get_basename (out), *bad = NULL, *d = size_of (out), *x = NULL;
+      char *after = checksum_of (src);
+
+      if (!g_str_equal (base, want_name))
+        bad = g_strdup_printf ("named %s, expected %s", base, want_name);
+      else if (!g_str_equal (d, want_dims))
+        bad = g_strdup_printf ("is %s, expected %s", d, want_dims);
+      else if (!non_empty (out))
+        bad = g_strdup ("empty");
+      else if (g_str_equal (t.ext, "mov") || g_str_equal (t.ext, "avi"))
+        {
+          char *fmt_name = NULL;
+
+          run (NULL, &fmt_name, "ffprobe", "-v", "error", "-show_entries", "format=format_name",
+               "-of", "csv=p=0", out, NULL);
+          if (fmt_name == NULL || strstr (fmt_name, g_str_equal (t.ext, "mov") ? "mov" : "avi") == NULL)
+            bad = g_strdup_printf ("container is %s", fmt_name ? g_strstrip (fmt_name) : "?");
+          g_free (fmt_name);
+        }
+      else
+        bad = check_type (t.ext, out);
+      if (bad == NULL && g_strcmp0 (before, after) != 0)
+        bad = g_strdup ("the original changed");
+      if (bad == NULL && extra != NULL)
+        bad = extra (src, out);
+      if (bad == NULL && (sw == 0 || sh == 0))
+        bad = g_strdup ("the job reported no source size");
+      if (bad == NULL)
+        {
+          char *sd = g_strdup_printf ("%" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT, sw, sh);
+
+          x = g_strdup_printf ("%s -> %s %s, %" G_GINT64_FORMAT " -> %" G_GINT64_FORMAT " bytes", sd, d, base,
+                               file_size (src), file_size (out));
+          g_free (sd);
+        }
+      pass = bad == NULL;
+      detail = bad != NULL ? bad : x;
+      if (bad != NULL)
+        g_free (x);
+      g_free (base);
+      g_free (d);
+      g_free (after);
+    }
+  left = unexpected_entries (dir, (const char *const[]) { src_name, want_name, NULL });
+  if (left[0] != '\0')
+    {
+      char *d2 = g_strdup_printf ("%s (left behind: %s)", detail ? detail : "", left);
+
+      g_free (detail);
+      detail = d2;
+      pass = FALSE;
+    }
+  g_free (left);
+  add_row (src_name, label, pass, detail);
+  g_free (detail);
+  g_free (out);
+out:
+  g_free (err);
+  g_free (label);
+  g_free (before);
+  g_free (src);
+}
+
+/* a transparent pixel must survive: the output is not opaque */
+static char *
+extra_alpha_kept (const char *src, const char *out)
+{
+  char *op = NULL, *r = NULL;
+
+  (void) src;
+  if (!run (NULL, &op, "magick", "identify", "-format", "%[opaque]", out, NULL) || op == NULL ||
+      !g_str_equal (g_strstrip (op), "False"))
+    r = g_strdup_printf ("the alpha channel was lost (opaque=%s)", op ? op : "?");
+  g_free (op);
+  return r;
+}
+
+/* an animated GIF keeps its frame count and frame rate */
+static char *
+extra_gif_same_frames (const char *src, const char *out)
+{
+  char *fs = frames_of (src), *fo = frames_of (out);
+  char *rs = stream_field (src, "v:0", "avg_frame_rate"), *ro = stream_field (out, "v:0", "avg_frame_rate");
+  char *r = NULL;
+
+  if (!g_str_equal (fs, fo))
+    r = g_strdup_printf ("%s frames became %s", fs, fo);
+  else if (!g_str_equal (rs, ro))
+    r = g_strdup_printf ("frame rate %s became %s", rs, ro);
+  g_free (fs); g_free (fo); g_free (rs); g_free (ro);
+  return r;
+}
+
+/* a video keeps its audio untouched (stream copy: same codec, sample rate) and gets
+ * H.264 / VP9 as before */
+static char *
+extra_audio_copied (const char *src, const char *out)
+{
+  char *a = stream_field (src, "a:0", "codec_name"), *b = stream_field (out, "a:0", "codec_name");
+  char *ra = stream_field (src, "a:0", "sample_rate"), *rb = stream_field (out, "a:0", "sample_rate");
+  char *r = NULL;
+
+  if (a[0] == '\0')
+    r = g_strdup ("the fixture has no audio");
+  else if (!g_str_equal (a, b) || !g_str_equal (ra, rb))
+    r = g_strdup_printf ("audio %s/%s became %s/%s", a, ra, b, rb);
+  g_free (a); g_free (b); g_free (ra); g_free (rb);
+  return r;
+}
+
+static char *
+extra_h264_copy (const char *src, const char *out)
+{
+  char *c = stream_field (out, "v:0", "codec_name"), *r = extra_audio_copied (src, out);
+
+  if (r == NULL && !g_str_equal (c, "h264"))
+    r = g_strdup_printf ("video codec is %s", c);
+  g_free (c);
+  return r;
+}
+
+static char *
+extra_vp9_copy (const char *src, const char *out)
+{
+  char *c = stream_field (out, "v:0", "codec_name"), *r = extra_audio_copied (src, out);
+
+  if (r == NULL && !g_str_equal (c, "vp9"))
+    r = g_strdup_printf ("video codec is %s", c);
+  g_free (c);
+  return r;
+}
+
+static char *
+extra_not_enlarged (const char *src, const char *out)
+{
+  return file_size (out) < file_size (src) * 3 ? NULL : g_strdup ("the output is much larger");
+}
+
+/* a source the preset would not make smaller: nothing is made, nothing is left */
+static void
+check_resize_skipped (const char *dir, const char *src_name, const char *rs_key, const char *want_msg)
+{
+  char *src = g_build_filename (dir, src_name, NULL), *err = NULL, *out, *left, *detail;
+  gboolean skipped;
+  guint64 sw = 0, sh = 0;
+  NfcFormat f;
+  gboolean pass;
+  char *label = g_strdup_printf ("resize %s (already smaller)", rs_key);
+
+  g_assert_true (nfc_classify (src, NULL, &f));
+  out = resize_sync (f.cat, f.fmt, rs_key, src, &skipped, &err, &sw, &sh);
+  left = unexpected_entries (dir, (const char *const[]) { src_name, "small.png", "exact.png", "hd.mp4",
+                                                          "tiny.png", NULL });
+  pass = out == NULL && skipped && g_strcmp0 (err, want_msg) == 0 && left[0] == '\0' && sw > 0;
+  detail = g_strdup_printf ("%s%s%s", skipped ? "skipped: " : "NOT skipped: ", err ? err : "(no error)",
+                            left[0] ? left : "");
+  add_row (src_name, label, pass, detail);
+  g_free (detail); g_free (label); g_free (left); g_free (out); g_free (err); g_free (src);
+}
+
+/* the frame rate of a GIF made from a 10 fps and from a 30 fps source with the GIF
+ * presets: min(source, preset) */
+static void
+check_gif_fps (const char *dir)
+{
+  /* frames of the 3 s / 2 s sources: a GIF stores delays in hundredths of a second, so
+   * 15 fps is not exactly representable and the frame COUNT is what is checked */
+  static const struct { const char *src, *preset_label; NfcPreset preset; int want; } c[] = {
+    { "ten.gif", "Best (15 max)", NFC_PRESET_BEST, 30 },       /* 10 fps source: no doubled frames */
+    { "ten.gif", "Small (10 max)", NFC_PRESET_SMALL, 30 },
+    { "ten.gif", "Balanced (12 max)", NFC_PRESET_BALANCED, 30 },
+    { "thirty.mp4", "Best (15 max)", NFC_PRESET_BEST, 30 },    /* 30 fps source: capped at 15 */
+    { "thirty.mp4", "Balanced (12 max)", NFC_PRESET_BALANCED, 24 },
+    { "thirty.mp4", "Small (10 max)", NFC_PRESET_SMALL, 20 },
+    { "twelve.mp4", "Best (15 max)", NFC_PRESET_BEST, 24 },    /* 12 fps source under the cap */
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+    {
+      char *src = g_build_filename (dir, c[i].src, NULL), *err = NULL, *out, *rate = NULL, *label;
+      int got = 0;
+      NfcFormat f;
+      gboolean pass = FALSE;
+      char *detail;
+
+      g_assert_true (nfc_classify (src, NULL, &f));
+      out = convert_preset_sync (NFC_CAT_VIDEO, f.fmt, "gif", c[i].preset, "gif", src, &err);
+      if (out != NULL)
+        {
+          rate = frames_of (out);
+          got = atoi (rate);
+          pass = ABS (got - c[i].want) <= 1;
+          g_unlink (out);
+        }
+      detail = g_strdup_printf ("%s: %s frames (expected %d)", err ? err : "ok", rate ? rate : "-", c[i].want);
+      label = g_strdup_printf ("gif frames, %s", c[i].preset_label);
+      add_row (c[i].src, label, pass, detail);
+      g_free (label); g_free (detail); g_free (rate); g_free (out); g_free (err); g_free (src);
+    }
+}
+
+/* the notifications of Resize and the size in the Small toast */
+static void
+test_resize_notifications (const char *dir)
+{
+  char *ndir = g_dir_make_tmp ("nfc-notify-XXXXXX", NULL);
+  char *script = g_build_filename (ndir, "notify-send", NULL);
+  char *log = g_build_filename (ndir, "calls.log", NULL);
+  char *content = g_strdup_printf ("#!/bin/sh\necho \"$@\" >> '%s'\necho 4242\n", log);
+  char *saved = nfc_tools.notify;
+  struct {
+    const char *label, *preset;
+    const char *files[4];   /* "4k", "small" (320x200) or "bad" each */
+    const char *want[4];
+    const char *unwanted;
+  } c[] = {
+    { "one file", "1080p", { "4k", NULL },
+      { " -- Resizing… f0.png (1080p)",
+        " -- Resize complete f0.png → f0 (1080p).png, 3840×2160 → 1920×1080", NULL, NULL },
+      "already smaller" },
+    { "two files", "720p", { "4k", "4k", NULL },
+      { " -- Resizing… 2 files to 720p", " -- Resize complete Resized 2 files to 720p", NULL, NULL },
+      "already smaller" },
+    { "50%", "50pct", { "4k", NULL },
+      { " -- Resizing… f0.png (50%)",
+        " -- Resize complete f0.png → f0 (50%).png, 3840×2160 → 1920×1080", NULL, NULL },
+      "already smaller" },
+    { "already smaller", "1080p", { "small", NULL },
+      { " -- Resizing… f0.png (1080p)", " -- Nothing to resize f0.png is already smaller than 1080p", NULL, NULL },
+      "Resize failed" },
+    { "two already smaller", "1080p", { "small", "small", NULL },
+      { " -- Nothing to resize 2 files are already smaller than 1080p", NULL, NULL, NULL },
+      "Resize failed" },
+    { "one good, one skipped", "1080p", { "4k", "small", NULL },
+      { " -- Resize complete f0.png → f0 (1080p).png, 3840×2160 → 1920×1080",
+        "\nf1.png is already smaller than 1080p", NULL, NULL },
+      "Resize failed" },
+    { "one good, one broken", "1080p", { "4k", "bad", NULL },
+      { " -- Resize failed f0.png → f0 (1080p).png, 3840×2160 → 1920×1080", "\nFailed: f1.png — ", NULL, NULL },
+      "already smaller" },
+    { "too small for a percentage", "25pct", { "tiny", NULL },
+      { " -- Nothing to resize f0.png is too small to resize to 25%", NULL, NULL, NULL }, "Resize failed" },
+  };
+
+  g_file_set_contents (script, content, -1, NULL);
+  g_chmod (script, 0755);
+  nfc_tools.notify = script;
+  for (guint k = 0; k < G_N_ELEMENTS (c); k++)
+    {
+      char *sub = g_strdup_printf ("%s/rn%u", dir, k);
+      char *paths[5] = { NULL }, *fmts[5] = { NULL }, *logged = NULL;
+      guint n = 0;
+      gboolean pass = FALSE;
+      GString *miss = g_string_new (NULL);
+
+      g_mkdir_with_parents (sub, 0755);
+      for (; c[k].files[n] != NULL; n++)
+        {
+          char *name = g_strdup_printf ("f%u.png", n);
+
+          paths[n] = g_build_filename (sub, name, NULL);
+          fmts[n] = (char *) "png";
+          if (g_str_equal (c[k].files[n], "4k"))
+            run (sub, NULL, "magick", "-size", "3840x2160", "gradient:red-blue", name, NULL);
+          else if (g_str_equal (c[k].files[n], "small"))
+            run (sub, NULL, "magick", "-size", "320x200", "gradient:red-blue", name, NULL);
+          else if (g_str_equal (c[k].files[n], "tiny"))
+            run (sub, NULL, "magick", "-size", "30x30", "gradient:red-blue", name, NULL);
+          else
+            g_file_set_contents (paths[n], "this is not a png", -1, NULL);
+          g_free (name);
+        }
+      g_remove (log);
+      nfc_batch_run_resize (NFC_CAT_IMAGE, c[k].preset, (const char *const *) paths,
+                            (const char *const *) fmts, n, NULL, NULL);
+      for (int i = 0; i < 1000 && !pass; i++)
+        {
+          g_main_context_iteration (NULL, FALSE);
+          g_usleep (20000);
+          g_clear_pointer (&logged, g_free);
+          if (g_file_get_contents (log, &logged, NULL, NULL))
+            pass = strstr (logged, "Resize complete") != NULL ||
+                   strstr (logged, "Resize failed") != NULL ||
+                   strstr (logged, "Nothing to resize") != NULL;
+        }
+      if (!pass)
+        g_string_append (miss, "no final notification; ");
+      for (guint i = 0; pass && i < 4 && c[k].want[i] != NULL; i++)
+        if (strstr (logged, c[k].want[i]) == NULL)
+          {
+            g_string_append_printf (miss, "missing '%s'; ", c[k].want[i]);
+            pass = FALSE;
+          }
+      if (pass && c[k].unwanted != NULL && strstr (logged, c[k].unwanted) != NULL)
+        {
+          g_string_append_printf (miss, "unexpected '%s'; ", c[k].unwanted);
+          pass = FALSE;
+        }
+      add_row ("(notifications)", c[k].label, pass, pass ? "Resize notification texts" : (miss->len ? miss->str : "?"));
+      if (!pass && logged != NULL)
+        g_printerr ("--- notify log of '%s':\n%s\n", c[k].label, logged);
+      g_string_free (miss, TRUE);
+      g_free (logged);
+      for (guint i = 0; i < n; i++)
+        g_free (paths[i]);
+      g_free (sub);
+    }
+
+  /* the Small preset names the size it scaled to, only when it did scale */
+  {
+    static const struct { const char *label; const char *size; gboolean compress; const char *want; } s[] = {
+      { "Small, convert: scaled", "3840x2560", FALSE, " -- Conversion complete f0.png → f0.jpg (Small, 2560×1707)" },
+      { "Small, convert: not scaled", "1000x700", FALSE, " -- Conversion complete f0.png → f0.jpg (Small)\n" },
+      { "Small, compress: scaled", "3840x2560", TRUE, " (Small, 2560×1707)" },
+    };
+
+    for (guint k = 0; k < G_N_ELEMENTS (s); k++)
+      {
+        char *sub = g_strdup_printf ("%s/sm%u", dir, k), *logged = NULL, *path;
+        char *paths[2], *fmts[2];
+        gboolean pass = FALSE;
+        const char *src_name = s[k].compress ? "f0.jpg" : "f0.png";
+
+        g_mkdir_with_parents (sub, 0755);
+        if (s[k].compress)
+          run (sub, NULL, "magick", "-seed", "9", "-size", s[k].size, "plasma:fractal", "-quality", "97",
+               src_name, NULL);
+        else
+          run (sub, NULL, "magick", "-size", s[k].size, "gradient:red-blue", src_name, NULL);
+        path = g_build_filename (sub, src_name, NULL);
+        paths[0] = path; paths[1] = NULL;
+        fmts[0] = (char *) (s[k].compress ? "jpg" : "png"); fmts[1] = NULL;
+        g_remove (log);
+        if (s[k].compress)
+          nfc_batch_run_compress (NFC_CAT_IMAGE, NFC_PRESET_SMALL, (const char *const *) paths,
+                                  (const char *const *) fmts, 1, NULL, NULL);
+        else
+          nfc_batch_run_preset (NFC_CAT_IMAGE, "jpg", NFC_PRESET_SMALL, "JPG", "jpg",
+                                (const char *const *) paths, (const char *const *) fmts, 1, NULL, NULL);
+        for (int i = 0; i < 1000 && !pass; i++)
+          {
+            g_main_context_iteration (NULL, FALSE);
+            g_usleep (20000);
+            g_clear_pointer (&logged, g_free);
+            if (g_file_get_contents (log, &logged, NULL, NULL))
+              pass = strstr (logged, "complete") != NULL || strstr (logged, "failed") != NULL;
+          }
+        pass = pass && strstr (logged, s[k].want) != NULL;
+        add_row ("(notifications)", s[k].label, pass, pass ? "the size is named when Small scaled" : (logged ? logged : "no calls"));
+        g_free (logged);
+        g_free (path);
+        g_free (sub);
+      }
+  }
+  nfc_tools.notify = saved;
+  g_free (ndir);
+  g_free (script);
+  g_free (log);
+  g_free (content);
+}
+
+static void
+test_resize (void)
+{
+  char *dir = P ("resize");
+  char *saved_notify = nfc_tools.notify;
+  struct {
+    const char *sub, *name, *rs, *want_name, *want_dims, *category;
+    char *(*extra) (const char *, const char *);
+  } c[] = {
+    /* images */
+    { "r0", "pic.png", "1080p", "pic (1080p).png", "1920x1080", "image", NULL },
+    { "r1", "photo.jpg", "50pct", "photo (50%).jpg", "800x600", "image", extra_not_enlarged },
+    { "r2", "sticker.webp", "720p", "sticker (720p).webp", "1280x720", "image", extra_alpha_kept },
+    { "r3", "anim.gif", "480p", "anim (480p).gif", "854x641", "image", extra_gif_same_frames },
+    { "r4", "tall.jpg", "480p", "tall (480p).jpg", "641x854", "image", NULL },
+    { "r5", "pic.bmp", "50pct", "pic (50%).bmp", "500x400", "image", NULL },
+    { "r6", "pic.tiff", "25pct", "pic (25%).tiff", "250x200", "image", NULL },
+    { "r7", "pic.avif", "50pct", "pic (50%).avif", "400x300", "image", NULL },
+    { "r8", "alpha.png", "25pct", "alpha (25%).png", "200x150", "image", extra_alpha_kept },
+    /* video: the SHORT side, audio stream copied */
+    { "v0", "clip.mp4", "720p", "clip (720p).mp4", "1280x720", "video", extra_h264_copy },
+    { "v1", "clip.webm", "480p", "clip (480p).webm", "854x480", "video", extra_vp9_copy },
+    { "v2", "clip.mkv", "720p", "clip (720p).mkv", "1280x720", "video", extra_h264_copy },
+    { "v3", "clip.mov", "480p", "clip (480p).mov", "854x480", "video", extra_h264_copy },
+    { "v4", "clip.avi", "480p", "clip (480p).avi", "854x480", "video", NULL },
+    { "v5", "clip.m4v", "480p", "clip (480p).mp4", "854x480", "video", extra_h264_copy },
+    { "v6", "phone.mp4", "480p", "phone (480p).mp4", "480x854", "video", NULL },
+    { "v7", "silent.mp4", "480p", "silent (480p).mp4", "854x480", "video", NULL },
+  };
+
+  g_mkdir_with_parents (dir, 0755);
+  nfc_tools.notify = NULL; /* no real notifications from the test */
+  for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+    {
+      char *sub = g_build_filename (dir, c[i].sub, NULL);
+
+      g_mkdir_with_parents (sub, 0755);
+      g_free (sub);
+    }
+#define SUB(i) g_build_filename (dir, c[i].sub, NULL)
+#define MK(i, what, ...) do { char *d_ = SUB (i); fixture (what, run (d_, NULL, __VA_ARGS__, NULL)); g_free (d_); } while (0)
+  MK (0, "r0/pic.png", "magick", "-size", "3840x2160", "gradient:red-blue", "-fill", "white", "-pointsize", "80",
+      "-annotate", "+100+200", "Resize me", "pic.png");
+  MK (1, "r1/photo.jpg", "magick", "-seed", "11", "-size", "1600x1200", "plasma:fractal", "-quality", "97", "photo.jpg");
+  MK (2, "r2/sticker.webp", "magick", "-size", "1600x900", "xc:none", "-fill", "red", "-draw", "circle 800,450 800,100",
+      "WEBP:sticker.webp");
+  MK (3, "r3/anim.gif", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=3:s=1000x750:r=10", "anim.gif");
+  MK (4, "r4/tall.jpg", "magick", "-seed", "2", "-size", "900x1200", "plasma:fractal", "-quality", "95", "tall.jpg");
+  MK (5, "r5/pic.bmp", "magick", "-size", "1000x800", "gradient:red-blue", "BMP:pic.bmp");
+  MK (6, "r6/pic.tiff", "magick", "-size", "1000x800", "gradient:red-blue", "TIFF:pic.tiff");
+  MK (7, "r7/pic.avif", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=800x600:r=1", "-frames:v", "1", "-c:v", "libaom-av1", "-cpu-used", "8", "-still-picture", "1",
+      "-f", "avif", "pic.avif");
+  MK (8, "r8/alpha.png", "magick", "-size", "800x600", "xc:none", "-fill", "blue", "-draw", "circle 400,300 400,50",
+      "alpha.png");
+  MK (9, "v0/clip.mp4", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=2:s=1920x1080:r=25", "-f", "lavfi", "-i", "sine=d=2", "-shortest", "-c:v", "libx264", "-preset",
+      "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "clip.mp4");
+  MK (10, "v1/clip.webm", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=1", "-shortest", "-c:v", "libvpx-vp9", "-b:v", "1M",
+      "-deadline", "realtime", "-cpu-used", "8", "-c:a", "libopus", "clip.webm");
+  MK (11, "v2/clip.mkv", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=2:s=1920x1080:r=25", "-f", "lavfi", "-i", "sine=d=2", "-shortest", "-c:v", "libx264", "-preset",
+      "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "clip.mkv");
+  MK (12, "v3/clip.mov", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=1", "-shortest", "-c:v", "libx264", "-preset",
+      "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "clip.mov");
+  MK (13, "v4/clip.avi", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=1", "-shortest", "-c:v", "mpeg4", "-q:v", "3",
+      "-c:a", "libmp3lame", "clip.avi");
+  MK (14, "v5/clip.m4v", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1280x720:r=25", "-f", "lavfi", "-i", "sine=d=1", "-shortest", "-c:v", "libx264", "-preset",
+      "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-f", "mp4", "clip.m4v");
+  MK (15, "v6/phone.mp4", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1080x1920:r=25", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "phone.mp4");
+  MK (16, "v7/silent.mp4", "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+      "testsrc2=d=1:s=1280x720:r=25", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "silent.mp4");
+  for (guint i = 0; i < G_N_ELEMENTS (c); i++)
+    {
+      char *sub = SUB (i);
+
+      check_resize (sub, c[i].name, c[i].rs, c[i].want_name, c[i].want_dims, c[i].extra);
+      g_free (sub);
+    }
+#undef MK
+#undef SUB
+
+  /* naming: a second resize does not overwrite the first */
+  {
+    char *sub = g_build_filename (dir, "r0", NULL), *src = g_build_filename (sub, "pic.png", NULL);
+    gboolean skipped;
+    char *o = resize_sync (NFC_CAT_IMAGE, "png", "480p", src, &skipped, NULL, NULL, NULL);
+    char *o2 = resize_sync (NFC_CAT_IMAGE, "png", "480p", src, &skipped, NULL, NULL, NULL);
+    char *b1 = o ? g_path_get_basename (o) : NULL, *b2 = o2 ? g_path_get_basename (o2) : NULL;
+
+    add_row ("pic.png", "resize naming", g_strcmp0 (b1, "pic (480p).png") == 0 &&
+             g_strcmp0 (b2, "pic (480p) (1).png") == 0, b2 ? b2 : "failed");
+    g_free (b1); g_free (b2); g_free (o); g_free (o2); g_free (src); g_free (sub);
+  }
+
+  /* an image or a video the preset would not shrink: nothing made, a plain message */
+  {
+    char *sub = g_build_filename (dir, "s0", NULL);
+
+    g_mkdir_with_parents (sub, 0755);
+    fixture ("s0/small.png", run (sub, NULL, "magick", "-size", "800x600", "gradient:red-blue", "small.png", NULL));
+    fixture ("s0/exact.png", run (sub, NULL, "magick", "-size", "1920x1080", "gradient:red-blue", "exact.png", NULL));
+    fixture ("s0/hd.mp4", run (sub, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                               "testsrc2=d=1:s=1280x720:r=25", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt",
+                               "yuv420p", "hd.mp4", NULL));
+    fixture ("s0/tiny.png", run (sub, NULL, "magick", "-size", "30x30", "gradient:red-blue", "tiny.png", NULL));
+    check_resize_skipped (sub, "small.png", "1080p", "already smaller than 1080p");
+    check_resize_skipped (sub, "exact.png", "1080p", "already smaller than 1080p"); /* equal is not smaller */
+    check_resize_skipped (sub, "hd.mp4", "720p", "already smaller than 720p");     /* 720p -> 720p */
+    check_resize_skipped (sub, "tiny.png", "50pct", "too small to resize to 50%");
+    g_free (sub);
+  }
+
+  /* the GIF frame rate is min(source, preset) */
+  {
+    char *sub = g_build_filename (dir, "fps", NULL);
+
+    g_mkdir_with_parents (sub, 0755);
+    fixture ("fps/ten.gif", run (sub, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                                 "testsrc2=d=3:s=400x300:r=10", "ten.gif", NULL));
+    fixture ("fps/thirty.mp4", run (sub, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                    "-i", "testsrc2=d=2:s=400x300:r=30", "-pix_fmt", "yuv420p", "thirty.mp4", NULL));
+    fixture ("fps/twelve.mp4", run (sub, NULL, "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                                    "-i", "testsrc2=d=2:s=400x300:r=12", "-pix_fmt", "yuv420p", "twelve.mp4", NULL));
+    check_gif_fps (sub);
+    g_free (sub);
+  }
+  nfc_tools.notify = saved_notify;
+  test_resize_notifications (dir);
+  nfc_tools.notify = saved_notify;
+  g_free (dir);
+}
+
 int
 main (void)
 {
@@ -2144,6 +2787,7 @@ main (void)
   test_quality ();
   test_presets ();
   test_compress ();
+  test_resize ();
   test_large_image ();
   test_pdf_page_size ();
   check_many ("test.mov", k_mov);
@@ -2230,7 +2874,7 @@ main (void)
     lines = g_strsplit (log != NULL ? log : "", "\n", -1);
     for (char **l = lines; *l; l++)
       if (strstr (*l, "size probe failed") != NULL && strstr (*l, "bad.png") == NULL &&
-          strstr (*l, "corrupt.png") == NULL && strstr (*l, "/nt4/") == NULL)
+          strstr (*l, "corrupt.png") == NULL && strstr (*l, "/nt4/") == NULL && strstr (*l, "/rn6/") == NULL)
         {
           g_printerr ("%s\n", *l);
           bad++;

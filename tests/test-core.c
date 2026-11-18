@@ -8,6 +8,7 @@
 #include <utime.h>
 
 #include "nfc-core.h"
+#include "nfc-header.h"
 
 static gboolean
 argv_has (char **argv, const char *s)
@@ -233,7 +234,7 @@ test_argv (void)
   argv = a0->pdata[a0->len - 1];
   g_assert_false (argv_has (argv, "webp:lossless=true"));
   g_assert_cmpstr (argv_after (argv, "-quality"), ==, "90");
-  g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
+  g_assert_true (argv_has (argv, "webp:use-sharp-yuv=true"));
   g_ptr_array_unref (at);
   /* AVIF: graphics 4:4:4 crf 9 with a fallback attempt (8-bit 4:2:0), photos
    * 4:2:0 crf 12; both tagged BT.709 full range, even-size scale gone */
@@ -275,7 +276,7 @@ test_argv (void)
   g_ptr_array_unref (at);
   at = nfc_build_attempts (NFC_CAT_VIDEO, "mp4", "gif", "/s/a.mp4", "/o/x.gif", "/w", &dec);
   argv = ((GPtrArray *) at->pdata[0])->pdata[0];
-  g_assert_nonnull (strstr (argv_after (argv, "-vf"), "fps=15,scale='min(960,iw)'"));
+  g_assert_nonnull (strstr (argv_after (argv, "-vf"), "fps=fps='min(source_fps,15)',scale='min(960,iw)'"));
   g_assert_nonnull (strstr (argv_after (argv, "-vf"), "palettegen=stats_mode=diff"));
   g_assert_nonnull (strstr (argv_after (argv, "-vf"), "diff_mode=rectangle"));
   g_ptr_array_unref (at);
@@ -1058,7 +1059,7 @@ static const struct {
     "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -resize 16383x16383> -define webp:lossless=true -define webp:method=4 WEBP:/o/x.webp"
   },
   { "webp-jpg", NFC_CAT_IMAGE, "jpg", "webp", 0, FALSE,
-    "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -resize 16383x16383> -quality 90 -define webp:method=6 -define webp:sharp-yuv=true WEBP:/o/x.webp"
+    "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -resize 16383x16383> -quality 90 -define webp:method=6 -define webp:use-sharp-yuv=true WEBP:/o/x.webp"
   },
   { "avif-png", NFC_CAT_IMAGE, "png", "avif", 0, FALSE,
     "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -background white -alpha remove -alpha off PNG:/w/flat.png && /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /w/flat.png -frames:v 1 -vf scale=out_color_matrix=bt709:out_range=pc:flags=accurate_rnd+full_chroma_int,format=yuv444p -c:v libaom-av1 -crf 9 -b:v 0 -cpu-used 6 -row-mt 1 -still-picture 1 -colorspace bt709 -color_primaries bt709 -color_range pc -f avif /o/x.avif"
@@ -1077,7 +1078,7 @@ static const struct {
     "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -c:v libvpx-vp9 -crf 28 -b:v 0 -row-mt 1 -deadline good -cpu-used 2 -pix_fmt yuv420p -vf crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:a libopus -b:a 128k /o/x.webm"
   },
   { "gif", NFC_CAT_VIDEO, "mp4", "gif", 0, FALSE,
-    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -an -sn -dn -vf fps=15,scale='min(960,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle -loop 0 /o/x.gif"
+    "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -an -sn -dn -vf fps=fps='min(source_fps,15)',scale='min(960,iw)':-1:flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle -loop 0 /o/x.gif"
   },
   { "mkv-x264", NFC_CAT_VIDEO, "mp4", "mkv", 0, TRUE,
     "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -c copy /o/x.mkv"
@@ -1362,13 +1363,13 @@ test_preset_webp (void)
       char **argv = last_step (at, 0);
 
       /* photos: lossy, lower quality per preset, method 6; one encode only.
-       * (webp:sharp-yuv is not an ImageMagick option and does nothing: Best's
-       * argv keeps it; the graphics presets use webp:use-sharp-yuv) */
+       * (sharp YUV is webp:use-sharp-yuv: the former webp:sharp-yuv was not an
+       * ImageMagick option and did nothing) */
       g_assert_cmpuint (at->len, ==, 1);
       g_assert_cmpuint (((GPtrArray *) at->pdata[0])->len, ==, 1);
       g_assert_cmpstr (argv_after (argv, "-quality"), ==, q_photo[p]);
       g_assert_true (argv_has (argv, "webp:method=6"));
-      g_assert_true (argv_has (argv, "webp:sharp-yuv=true"));
+      g_assert_true (argv_has (argv, "webp:use-sharp-yuv=true"));
       g_assert_false (argv_has (argv, "webp:lossless=true"));
       g_assert_cmpstr (argv_after (argv, "-resize"), ==, p == SMALL ? "2560x2560>" : "16383x16383>");
       g_ptr_array_unref (at);
@@ -1616,8 +1617,8 @@ test_preset_video (void)
   static const char *const vp9_crf[] = { "28", "36", "44", "52" };
   static const char *const oh264_bps[] = { "6220800", "3732480", "2488320", "1555200" };
   static const struct { const char *fps, *width, *colors; } gif[] = {
-    { "fps=15,", "min(960,iw)", NULL }, { "fps=15,", "min(720,iw)", NULL },
-    { "fps=12,", "min(640,iw)", NULL }, { "fps=10,", "min(480,iw)", "max_colors=128" },
+    { "fps=fps='min(source_fps,15)',", "min(960,iw)", NULL }, { "fps=fps='min(source_fps,15)',", "min(720,iw)", NULL },
+    { "fps=fps='min(source_fps,12)',", "min(640,iw)", NULL }, { "fps=fps='min(source_fps,10)',", "min(480,iw)", "max_colors=128" },
   };
 
   use_fake_tools ();
@@ -1765,6 +1766,738 @@ test_preset_distinct_and_ignored (void)
   nfc_test_set_encoders ("");
 }
 
+/* ------------------------------------------------------------------------
+ * Image headers (nfc-header.h)
+ * --------------------------------------------------------------------- */
+
+static void
+put_be16 (guint8 *p, guint v) { p[0] = v >> 8; p[1] = v & 0xff; }
+static void
+put_be32 (guint8 *p, guint32 v) { put_be16 (p, v >> 16); put_be16 (p + 2, v & 0xffff); }
+static void
+put_le16 (guint8 *p, guint v) { p[0] = v & 0xff; p[1] = v >> 8; }
+static void
+put_le32 (guint8 *p, guint32 v) { put_le16 (p, v & 0xffff); put_le16 (p + 2, v >> 16); }
+
+/* parse a copy of data[0..len) held in an allocation of EXACTLY len bytes, so
+ * that ASan sees any read beyond it */
+static gboolean
+parse_exact (const char *fmt, const guint8 *data, gsize len, guint32 *w, guint32 *h)
+{
+  guint8 *copy = g_malloc (len > 0 ? len : 1); /* exact: no slack byte to hide an over-read */
+  gboolean ok;
+
+  if (len > 0)
+    memcpy (copy, data, len);
+  ok = nfc_header_parse (fmt, copy, len, w, h);
+  g_free (copy);
+  return ok;
+}
+
+/* a JPEG made by hand: SOI, the given APP segments (n_app of seg bytes of
+ * payload each), then an SOF0 of w x h and an SOS */
+static GByteArray *
+make_jpeg (guint n_app, guint seg, guint w, guint h)
+{
+  GByteArray *a = g_byte_array_new ();
+  guint8 b[16];
+
+  b[0] = 0xff; b[1] = 0xd8;
+  g_byte_array_append (a, b, 2);
+  for (guint i = 0; i < n_app; i++)
+    {
+      guint8 *payload = g_malloc0 (seg);
+
+      b[0] = 0xff; b[1] = 0xe1; put_be16 (b + 2, seg + 2);
+      g_byte_array_append (a, b, 4);
+      g_byte_array_append (a, payload, seg);
+      g_free (payload);
+    }
+  b[0] = 0xff; b[1] = 0xc0; put_be16 (b + 2, 17); b[4] = 8;
+  put_be16 (b + 5, h); put_be16 (b + 7, w); b[9] = 3;
+  g_byte_array_append (a, b, 10);
+  {
+    guint8 comps[9] = { 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1 };
+
+    g_byte_array_append (a, comps, 9);
+  }
+  b[0] = 0xff; b[1] = 0xda; put_be16 (b + 2, 12);
+  g_byte_array_append (a, b, 4);
+  return a;
+}
+
+static void
+test_header_handmade (void)
+{
+  guint32 w = 0, h = 0;
+  guint8 png[33] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n', 0, 0, 0, 13, 'I', 'H', 'D', 'R' };
+  guint8 gif[13] = { 'G', 'I', 'F', '8', '9', 'a' };
+  guint8 bmp[54] = { 'B', 'M' };
+  guint8 vp8[30] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', ' ' };
+  guint8 vp8l[30] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', 'L' };
+  guint8 vp8x[30] = { 'R', 'I', 'F', 'F', 0, 0, 0, 0, 'W', 'E', 'B', 'P', 'V', 'P', '8', 'X' };
+  GByteArray *j;
+
+  /* PNG */
+  put_be32 (png + 16, 3840); put_be32 (png + 20, 2160);
+  g_assert_true (parse_exact ("png", png, sizeof png, &w, &h));
+  g_assert_cmpuint (w, ==, 3840); g_assert_cmpuint (h, ==, 2160);
+  put_be32 (png + 16, 0);
+  g_assert_false (parse_exact ("png", png, sizeof png, &w, &h)); /* zero width */
+  put_be32 (png + 16, 0x80000000u);
+  g_assert_false (parse_exact ("png", png, sizeof png, &w, &h)); /* beyond 2^31 - 1 */
+  put_be32 (png + 16, 1); put_be32 (png + 20, 1);
+  g_assert_true (parse_exact ("png", png, sizeof png, &w, &h));
+  png[15] = 'X'; /* not IHDR */
+  g_assert_false (parse_exact ("png", png, sizeof png, &w, &h));
+  png[15] = 'R'; png[11] = 12; /* a length that is not 13 */
+  g_assert_false (parse_exact ("png", png, sizeof png, &w, &h));
+
+  /* GIF: logical screen, little endian */
+  put_le16 (gif + 6, 600); put_le16 (gif + 8, 799);
+  g_assert_true (parse_exact ("gif", gif, sizeof gif, &w, &h));
+  g_assert_cmpuint (w, ==, 600); g_assert_cmpuint (h, ==, 799);
+  gif[4] = '7';
+  g_assert_true (parse_exact ("gif", gif, sizeof gif, &w, &h)); /* GIF87a */
+  gif[3] = '9';
+  g_assert_false (parse_exact ("gif", gif, sizeof gif, &w, &h));
+
+  /* BMP: BITMAPINFOHEADER (40), top-down (negative height), OS/2 (12) */
+  put_le32 (bmp + 14, 40); put_le32 (bmp + 18, 635); put_le32 (bmp + 22, 600);
+  g_assert_true (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+  g_assert_cmpuint (w, ==, 635); g_assert_cmpuint (h, ==, 600);
+  put_le32 (bmp + 22, (guint32) -480);
+  g_assert_true (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+  g_assert_cmpuint (h, ==, 480);
+  put_le32 (bmp + 22, 0x80000000u); /* INT_MIN: must not overflow the negation */
+  g_assert_true (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+  g_assert_cmpuint (h, ==, 0x80000000u);
+  put_le32 (bmp + 18, (guint32) -5);
+  g_assert_false (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+  put_le32 (bmp + 14, 12); put_le16 (bmp + 18, 320); put_le16 (bmp + 20, 200);
+  g_assert_true (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+  g_assert_cmpuint (w, ==, 320); g_assert_cmpuint (h, ==, 200);
+  put_le32 (bmp + 14, 7); /* an impossible header size */
+  g_assert_false (parse_exact ("bmp", bmp, sizeof bmp, &w, &h));
+
+  /* WebP: lossy VP8 (14-bit sizes after the start code), lossless VP8L
+   * (14 bits minus one each), extended VP8X (24 bits minus one each) */
+  vp8[23] = 0x9d; vp8[24] = 0x01; vp8[25] = 0x2a;
+  put_le16 (vp8 + 26, 1920 | 0x4000); put_le16 (vp8 + 28, 1080); /* the scale bits are ignored */
+  g_assert_true (parse_exact ("webp", vp8, sizeof vp8, &w, &h));
+  g_assert_cmpuint (w, ==, 1920); g_assert_cmpuint (h, ==, 1080);
+  vp8[24] = 0;
+  g_assert_false (parse_exact ("webp", vp8, sizeof vp8, &w, &h));
+  vp8l[20] = 0x2f;
+  put_le32 (vp8l + 21, (512 - 1) | ((300 - 1) << 14));
+  g_assert_true (parse_exact ("webp", vp8l, sizeof vp8l, &w, &h));
+  g_assert_cmpuint (w, ==, 512); g_assert_cmpuint (h, ==, 300);
+  vp8l[20] = 0x2e;
+  g_assert_false (parse_exact ("webp", vp8l, sizeof vp8l, &w, &h));
+  vp8x[24] = (16383 - 1) & 0xff; vp8x[25] = (16383 - 1) >> 8; vp8x[26] = 0;
+  vp8x[27] = 100 - 1; vp8x[28] = 0; vp8x[29] = 0;
+  g_assert_true (parse_exact ("webp", vp8x, sizeof vp8x, &w, &h));
+  g_assert_cmpuint (w, ==, 16383); g_assert_cmpuint (h, ==, 100);
+
+  /* JPEG: the size marker after APPn segments is found by their lengths */
+  j = make_jpeg (0, 0, 4191, 6286);
+  g_assert_true (parse_exact ("jpg", j->data, j->len, &w, &h));
+  g_assert_cmpuint (w, ==, 4191); g_assert_cmpuint (h, ==, 6286);
+  g_byte_array_free (j, TRUE);
+  j = make_jpeg (1, 60000, 3024, 4032); /* one big EXIF/ICC: still inside 64 KiB */
+  g_assert_true (parse_exact ("jpg", j->data, MIN (j->len, NFC_HEADER_MAX_BYTES), &w, &h));
+  g_assert_cmpuint (w, ==, 3024); g_assert_cmpuint (h, ==, 4032);
+  g_byte_array_free (j, TRUE);
+  j = make_jpeg (2, 40000, 3024, 4032); /* the size marker lies beyond 64 KiB: unknown */
+  g_assert_cmpuint (j->len, >, NFC_HEADER_MAX_BYTES);
+  g_assert_false (parse_exact ("jpg", j->data, NFC_HEADER_MAX_BYTES, &w, &h));
+  g_assert_true (parse_exact ("jpg", j->data, j->len, &w, &h)); /* the parser itself is fine */
+  g_byte_array_free (j, TRUE);
+  j = make_jpeg (0, 0, 10, 10);
+  j->data[2 + 0] = 0xff; j->data[3] = 0xda; /* SOS before any frame header */
+  g_assert_false (parse_exact ("jpg", j->data, j->len, &w, &h));
+  g_byte_array_free (j, TRUE);
+  j = make_jpeg (0, 0, 10, 0); /* height 0 (DNL): unknown */
+  g_assert_false (parse_exact ("jpg", j->data, j->len, &w, &h));
+  g_byte_array_free (j, TRUE);
+
+  /* a mismatch between the extension and the content, unknown and NULL input */
+  j = make_jpeg (0, 0, 10, 10);
+  g_assert_false (parse_exact ("png", j->data, j->len, &w, &h));
+  g_assert_false (parse_exact ("tiff", j->data, j->len, &w, &h));
+  g_assert_false (parse_exact (NULL, j->data, j->len, &w, &h));
+  g_assert_false (nfc_header_parse ("jpg", NULL, 0, &w, &h));
+  g_assert_true (nfc_header_parse ("jpg", j->data, j->len, NULL, NULL)); /* out params optional */
+  g_assert_true (nfc_header_format_known ("webp"));
+  g_assert_false (nfc_header_format_known ("tiff"));
+  g_assert_false (nfc_header_format_known (NULL));
+  g_byte_array_free (j, TRUE);
+}
+
+/* Real files made by ImageMagick, parsed from disk by nfc_header_read_file, with
+ * the time that takes; then all of them under truncation and byte flips. */
+static void
+test_header_files_and_fuzz (void)
+{
+  char *magick = g_find_program_in_path ("magick");
+  char *dir;
+  static const struct {
+    const char *name, *fmt, *spec2, *define, *out_prefix;
+    guint w, h;
+  } fx[] = {
+    { "a.png",  "png",  "xc:gray",   NULL, "PNG:",  123, 45 },
+    { "b.jpg",  "jpg",  "gradient:", NULL, "JPEG:", 321, 123 },
+    { "c.gif",  "gif",  "xc:gray",   NULL, "GIF:",  64, 48 },
+    { "d.webp", "webp", "gradient:", NULL, "WEBP:", 200, 100 }, /* lossy: VP8 */
+    { "e.webp", "webp", "xc:gray",   "webp:lossless=true", "WEBP:", 77, 33 }, /* VP8L */
+    { "f.webp", "webp", "xc:none",   NULL, "WEBP:", 150, 90 },  /* alpha: VP8X */
+    { "g.bmp",  "bmp",  "xc:gray",   NULL, "BMP:",  635, 600 },
+    { "h.png",  "png",  "xc:gray",   NULL, "PNG:",  3840, 2160 },
+    { "i.jpg",  "jpg",  "xc:gray",   NULL, "JPEG:", 1, 1 },
+    { "j.png",  "png",  "xc:gray",   NULL, "PNG:",  1, 7000 },
+  };
+  GPtrArray *bufs = g_ptr_array_new_with_free_func ((GDestroyNotify) g_byte_array_unref);
+  double total_us = 0;
+  guint n_timed = 0;
+
+  if (magick == NULL)
+    {
+      g_test_skip ("ImageMagick is not installed");
+      g_free (magick);
+      g_ptr_array_unref (bufs);
+      return;
+    }
+  dir = g_dir_make_tmp ("nfc-hdr-XXXXXX", NULL);
+  g_assert_nonnull (dir);
+  for (guint i = 0; i < G_N_ELEMENTS (fx); i++)
+    {
+      char *path = g_build_filename (dir, fx[i].name, NULL);
+      char *size = g_strdup_printf ("%ux%u", fx[i].w, fx[i].h);
+      char *out = g_strconcat (fx[i].out_prefix, path, NULL);
+      guint32 w = 0, h = 0;
+      gint64 t0;
+      gchar *contents = NULL;
+      gsize len = 0;
+
+      {
+        char *argv[10];
+        int status = -1, n = 0;
+
+        argv[n++] = magick; argv[n++] = "-quiet"; argv[n++] = "-size"; argv[n++] = size;
+        argv[n++] = (char *) fx[i].spec2;
+        if (fx[i].define != NULL)
+          {
+            argv[n++] = "-define";
+            argv[n++] = (char *) fx[i].define;
+          }
+        argv[n++] = out;
+        argv[n] = NULL;
+        g_assert_true (g_spawn_sync (NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL |
+                                     G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL, NULL, NULL,
+                                     &status, NULL) && status == 0);
+      }
+      t0 = g_get_monotonic_time ();
+      g_assert_true (nfc_header_read_file (path, fx[i].fmt, &w, &h));
+      total_us += (double) (g_get_monotonic_time () - t0);
+      n_timed++;
+      g_assert_cmpuint (w, ==, fx[i].w);
+      g_assert_cmpuint (h, ==, fx[i].h);
+      /* the wrong format key never matches */
+      g_assert_false (nfc_header_read_file (path, g_str_equal (fx[i].fmt, "png") ? "gif" : "png",
+                                            &w, &h));
+      g_assert_true (g_file_get_contents (path, &contents, &len, NULL));
+      g_ptr_array_add (bufs, g_byte_array_new_take ((guint8 *) contents, len));
+      g_free (path); g_free (size); g_free (out);
+    }
+  g_test_message ("header read+parse of %u real files: %.1f us on average", n_timed,
+                  total_us / n_timed);
+  g_assert_cmpfloat (total_us / n_timed, <, 20000.0); /* far below the 1 ms a menu would feel */
+
+  /* Fuzz: every prefix of every file (first 600 bytes one by one, then
+   * strides), and 400 random byte flips each, through every parser: never a read
+   * beyond the buffer (ASan), never a crash, and a success has non-zero sizes. */
+  {
+    GRand *rnd = g_rand_new_with_seed (42);
+    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp", "tiff" };
+
+    for (guint b = 0; b < bufs->len; b++)
+      {
+        GByteArray *a = bufs->pdata[b];
+        gsize cap = MIN (a->len, (gsize) 3000);
+
+        for (gsize len = 0; len <= cap; len += (len < 600 ? 1 : 37))
+          for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
+            {
+              guint32 w = 0, h = 0;
+
+              if (parse_exact (fmts[f], a->data, len, &w, &h))
+                {
+                  g_assert_cmpuint (w, >, 0);
+                  g_assert_cmpuint (h, >, 0);
+                }
+            }
+        for (guint round = 0; round < 400; round++)
+          {
+            guint8 *copy = g_memdup2 (a->data, cap);
+            guint flips = 1 + g_rand_int_range (rnd, 0, 4);
+
+            for (guint k = 0; k < flips; k++)
+              copy[g_rand_int_range (rnd, 0, cap)] = (guint8) g_rand_int (rnd);
+            for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
+              {
+                guint32 w = 0, h = 0;
+
+                if (parse_exact (fmts[f], copy, cap, &w, &h))
+                  {
+                    g_assert_cmpuint (w, >, 0);
+                    g_assert_cmpuint (h, >, 0);
+                  }
+              }
+            g_free (copy);
+          }
+      }
+    g_rand_free (rnd);
+  }
+  /* pure garbage, all lengths up to 100, from a fixed seed */
+  {
+    GRand *rnd = g_rand_new_with_seed (7);
+    guint8 junk[100];
+    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp" };
+
+    for (guint round = 0; round < 3000; round++)
+      {
+        gsize len = g_rand_int_range (rnd, 0, 100);
+
+        for (gsize k = 0; k < len; k++)
+          junk[k] = (guint8) g_rand_int (rnd);
+        /* bias towards the magic numbers so the deeper code is reached */
+        if (round % 3 == 0 && len > 12)
+          memcpy (junk, round % 2 ? "RIFF\0\0\0\0WEBPVP8X" : "\xff\xd8\xff\xe1\x00\x10", 6);
+        for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
+          {
+            guint32 w, h;
+
+            parse_exact (fmts[f], junk, len, &w, &h);
+          }
+      }
+    g_rand_free (rnd);
+  }
+  {
+    char *rm[] = { "rm", "-rf", dir, NULL };
+
+    g_spawn_sync (NULL, rm, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, NULL, NULL, NULL);
+  }
+  g_free (dir);
+  g_free (magick);
+  g_ptr_array_unref (bufs);
+}
+
+/* ------------------------------------------------------------------------
+ * Resize
+ * --------------------------------------------------------------------- */
+
+static void
+check_out (const char *cat_key, const NfcResizePreset *p, guint64 w, guint64 h, gboolean want,
+           guint64 want_w, guint64 want_h)
+{
+  guint64 ow = 99, oh = 99;
+  gboolean got = nfc_resize_output_size (p, w, h, &ow, &oh);
+
+  if (got != want)
+    g_error ("%s %s %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT ": got %d want %d", cat_key, p->key, w, h,
+             got, want);
+  if (want && (ow != want_w || oh != want_h))
+    g_error ("%s %s %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT ": got %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT
+             ", want %" G_GUINT64_FORMAT "x%" G_GUINT64_FORMAT, cat_key, p->key, w, h, ow, oh, want_w, want_h);
+}
+
+/* which presets a w x h image offers, as "a,b,c" of keys */
+static char *
+offered (NfcCategory cat, guint64 w, guint64 h)
+{
+  GString *s = g_string_new (NULL);
+  guint n;
+  const NfcResizePreset *all = nfc_resize_presets (cat, &n);
+
+  for (guint i = 0; i < n; i++)
+    if (nfc_resize_output_size (&all[i], w, h, NULL, NULL))
+      g_string_append_printf (s, "%s%s", s->len ? "," : "", all[i].key);
+  return g_string_free (s, FALSE);
+}
+
+static void
+test_resize_presets (void)
+{
+  guint n;
+  const NfcResizePreset *im = nfc_resize_presets (NFC_CAT_IMAGE, &n);
+  const NfcResizePreset *vid;
+  char *s;
+
+  /* the table: names, labels, order */
+  g_assert_cmpuint (n, ==, 7);
+  {
+    static const char *const keys[] = { "4k", "1440p", "1080p", "720p", "480p", "50pct", "25pct" };
+    static const char *const labels[] = { "4K (3840 px)", "1440p (2560 px)", "1080p (1920 px)",
+                                          "720p (1280 px)", "480p (854 px)", "50%", "25%" };
+    static const char *const names[] = { "4K", "1440p", "1080p", "720p", "480p", "50%", "25%" };
+
+    for (guint i = 0; i < n; i++)
+      {
+        g_assert_cmpstr (im[i].key, ==, keys[i]);
+        g_assert_cmpstr (im[i].label, ==, labels[i]);
+        g_assert_cmpstr (im[i].name, ==, names[i]);
+        g_assert_true (nfc_resize_preset_from_key (NFC_CAT_IMAGE, keys[i]) == &im[i]);
+      }
+  }
+  vid = nfc_resize_presets (NFC_CAT_VIDEO, &n);
+  g_assert_cmpuint (n, ==, 3);
+  g_assert_cmpstr (vid[0].key, ==, "1080p");
+  g_assert_true (vid[0].short_side);
+  g_assert_cmpuint (vid[2].side, ==, 480);
+  g_assert_null (nfc_resize_presets (NFC_CAT_AUDIO, &n));
+  g_assert_cmpuint (n, ==, 0);
+  g_assert_null (nfc_resize_presets (NFC_CAT_DOC, NULL));
+  g_assert_null (nfc_resize_preset_from_key (NFC_CAT_IMAGE, "2k"));
+  g_assert_null (nfc_resize_preset_from_key (NFC_CAT_IMAGE, NULL));
+  g_assert_null (nfc_resize_preset_from_key (NFC_CAT_VIDEO, "50pct"));
+
+  /* images: a preset is offered when it makes the LONG side strictly smaller; the
+   * percentages when the short side stays at 16 px or more */
+  s = offered (NFC_CAT_IMAGE, 3840, 2160);
+  g_assert_cmpstr (s, ==, "1440p,1080p,720p,480p,50pct,25pct"); /* not 4K itself */
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 7680, 4320);
+  g_assert_cmpstr (s, ==, "4k,1440p,1080p,720p,480p,50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 1000, 800); /* 1280 and 1920 px are larger than the 1000 px side */
+  g_assert_cmpstr (s, ==, "480p,50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 800, 1000); /* portrait: the long side is the height */
+  g_assert_cmpstr (s, ==, "480p,50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 1280, 720); /* equal to 720p: not smaller */
+  g_assert_cmpstr (s, ==, "480p,50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 1281, 720);
+  g_assert_cmpstr (s, ==, "720p,480p,50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 100, 100); /* 50% is 50 px, 25% is 25 px */
+  g_assert_cmpstr (s, ==, "50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 64, 64); /* 25% would be 16: the limit is inclusive */
+  g_assert_cmpstr (s, ==, "50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 63, 63); /* 25% is 15.75 -> 16 px (rounded): offered */
+  g_assert_cmpstr (s, ==, "50pct,25pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 61, 61); /* 25% is 15 px: no */
+  g_assert_cmpstr (s, ==, "50pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 32, 32); /* 50% is 16 */
+  g_assert_cmpstr (s, ==, "50pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 31, 31); /* 50% is 16 after rounding (15.5) */
+  g_assert_cmpstr (s, ==, "50pct");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 30, 30); /* 15 px: nothing at all */
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 20, 20);
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 4000, 20); /* a thin banner: the short side limits the percentages */
+  g_assert_cmpstr (s, ==, "4k,1440p,1080p,720p,480p");
+  g_free (s);
+  s = offered (NFC_CAT_IMAGE, 0, 0); /* unknown */
+  g_assert_cmpstr (s, ==, "");
+  g_free (s);
+
+  /* the sizes */
+  for (guint i = 0; i < 7; i++)
+    {
+      const char *k = im[i].key;
+      const NfcResizePreset *p = &im[i];
+
+      if (g_str_equal (k, "4k"))        check_out ("img", p, 3840, 2160, FALSE, 0, 0);
+      if (g_str_equal (k, "1440p"))     check_out ("img", p, 3840, 2160, TRUE, 2560, 1440);
+      if (g_str_equal (k, "1080p"))     check_out ("img", p, 3840, 2160, TRUE, 1920, 1080);
+      if (g_str_equal (k, "720p"))      check_out ("img", p, 3840, 2160, TRUE, 1280, 720);
+      if (g_str_equal (k, "480p"))      check_out ("img", p, 3840, 2160, TRUE, 854, 480);
+      if (g_str_equal (k, "50pct"))     check_out ("img", p, 3840, 2160, TRUE, 1920, 1080);
+      if (g_str_equal (k, "25pct"))     check_out ("img", p, 3840, 2160, TRUE, 960, 540);
+      if (g_str_equal (k, "1080p"))     check_out ("img", p, 2160, 3840, TRUE, 1080, 1920);
+      if (g_str_equal (k, "480p"))      check_out ("img", p, 1000, 800, TRUE, 854, 683);
+      if (g_str_equal (k, "50pct"))     check_out ("img", p, 101, 51, TRUE, 51, 26); /* nearest */
+      if (g_str_equal (k, "720p"))      check_out ("img", p, 4000, 3, TRUE, 1280, 1); /* never 0 */
+    }
+  /* video: the SHORT side, even sizes, no percentages */
+  for (guint i = 0; i < 3; i++)
+    {
+      const NfcResizePreset *p = &vid[i];
+
+      if (i == 0)
+        {
+          check_out ("vid", p, 1920, 1080, FALSE, 0, 0);
+          check_out ("vid", p, 3840, 2160, TRUE, 1920, 1080);
+          check_out ("vid", p, 4096, 2160, TRUE, 2048, 1080);
+          check_out ("vid", p, 2160, 3840, TRUE, 1080, 1920); /* portrait phone video */
+          check_out ("vid", p, 1921, 1081, TRUE, 1920, 1080);
+          check_out ("vid", p, 1080, 1920, FALSE, 0, 0);
+        }
+      if (i == 1)
+        {
+          check_out ("vid", p, 1920, 1080, TRUE, 1280, 720);
+          check_out ("vid", p, 1280, 720, FALSE, 0, 0);
+          check_out ("vid", p, 405, 864, FALSE, 0, 0);
+          check_out ("vid", p, 1080, 1920, TRUE, 720, 1280);
+          check_out ("vid", p, 1000, 722, TRUE, 998, 720); /* 721.2: even */
+        }
+      if (i == 2)
+        {
+          check_out ("vid", p, 1920, 1080, TRUE, 854, 480);
+          check_out ("vid", p, 854, 480, FALSE, 0, 0);
+          check_out ("vid", p, 640, 360, FALSE, 0, 0);
+        }
+    }
+  s = offered (NFC_CAT_VIDEO, 1920, 1080);
+  g_assert_cmpstr (s, ==, "720p,480p");
+  g_free (s);
+  s = offered (NFC_CAT_VIDEO, 1280, 720);
+  g_assert_cmpstr (s, ==, "480p");
+  g_free (s);
+  g_assert_false (nfc_resize_output_size (NULL, 1920, 1080, NULL, NULL));
+  g_assert_false (nfc_resize_output_size (&im[2], 0, 1080, NULL, NULL));
+  /* absurd sizes cannot overflow */
+  g_assert_true (nfc_resize_output_size (&im[6], G_MAXUINT64, G_MAXUINT64, NULL, NULL));
+  g_assert_true (nfc_resize_output_size (&im[2], G_MAXUINT64, 1, NULL, NULL));
+
+  /* tooltips: the exact size when known */
+  s = nfc_resize_tooltip (&im[2], 3840, 2160);
+  g_assert_nonnull (strstr (s, "1920 × 1080"));
+  g_free (s);
+  s = nfc_resize_tooltip (&im[2], 0, 0);
+  g_assert_nonnull (strstr (s, "1920 px"));
+  g_free (s);
+  s = nfc_resize_tooltip (&im[5], 0, 0);
+  g_assert_nonnull (strstr (s, "50%"));
+  g_free (s);
+  s = nfc_resize_tooltip (&vid[1], 0, 0);
+  g_assert_nonnull (strstr (s, "shorter side is 720"));
+  g_free (s);
+}
+
+static void
+test_resize_targets (void)
+{
+  static const struct { NfcCategory cat; const char *fmt, *key, *ext; NfcCategory tcat; } yes[] = {
+    { NFC_CAT_IMAGE, "png",  "png",  "png",  NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "jpg",  "jpg",  "jpg",  NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "webp", "webp", "webp", NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "avif", "avif", "avif", NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "bmp",  "bmp",  "bmp",  NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "tiff", "tiff", "tiff", NFC_CAT_IMAGE },
+    { NFC_CAT_IMAGE, "gif",  "gif",  "gif",  NFC_CAT_VIDEO }, /* an animation: ffmpeg */
+    { NFC_CAT_VIDEO, "mp4",  "mp4",  "mp4",  NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "m4v",  "mp4",  "mp4",  NFC_CAT_VIDEO }, /* .m4v would be raw H.264 */
+    { NFC_CAT_VIDEO, "mkv",  "mkv",  "mkv",  NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "webm", "webm", "webm", NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "mov",  "mov",  "mov",  NFC_CAT_VIDEO },
+    { NFC_CAT_VIDEO, "avi",  "avi",  "avi",  NFC_CAT_VIDEO },
+  };
+  static const struct { NfcCategory cat; const char *fmt; } no[] = {
+    { NFC_CAT_IMAGE, "heic" }, { NFC_CAT_IMAGE, "svg" }, { NFC_CAT_IMAGE, "ico" },
+    { NFC_CAT_VIDEO, "wmv" }, { NFC_CAT_VIDEO, "flv" }, { NFC_CAT_AUDIO, "mp3" },
+    { NFC_CAT_DOC, "docx" }, { NFC_CAT_SHEET, "csv" }, { NFC_CAT_SLIDE, "pptx" },
+    { NFC_CAT_VIDEO, "jpg" }, { NFC_CAT_IMAGE, "mp4" },
+  };
+
+  for (guint i = 0; i < G_N_ELEMENTS (yes); i++)
+    {
+      NfcResizeTarget t;
+
+      g_assert_true (nfc_resize_target (yes[i].cat, yes[i].fmt, &t));
+      g_assert_cmpstr (t.key, ==, yes[i].key);
+      g_assert_cmpstr (t.ext, ==, yes[i].ext);
+      g_assert_cmpint (t.cat, ==, yes[i].tcat);
+    }
+  for (guint i = 0; i < G_N_ELEMENTS (no); i++)
+    g_assert_false (nfc_resize_target (no[i].cat, no[i].fmt, NULL));
+  g_assert_false (nfc_resize_target (NFC_CAT_IMAGE, NULL, NULL));
+}
+
+/* the argv of a resize of source fmt to output key with preset rs_key of the
+ * source category, as one string ("##" between attempts) */
+static char *
+resize_str (NfcCategory cat, const char *fmt, const char *key, const char *rs_key, gboolean hd)
+{
+  NfcResizeTarget t;
+  NfcImageInfo info = { 3840, 2160, FALSE, 0, 0 };
+  char *src = g_strdup_printf ("/s/a.%s", fmt), *out = g_strdup_printf ("/o/x.%s", key), *s;
+  GPtrArray *at;
+
+  g_assert_true (nfc_resize_target (cat, fmt, &t));
+  at = nfc_build_attempts_resize (t.cat, fmt, key, nfc_resize_preset_from_key (cat, rs_key), src,
+                                  out, "/w", hd ? &info : NULL, NULL);
+  g_assert_nonnull (at);
+  s = attempts_string (at);
+  g_ptr_array_unref (at);
+  g_free (src);
+  g_free (out);
+  return s;
+}
+
+static void
+test_resize_argv (void)
+{
+  char *s;
+  GPtrArray *at;
+
+  use_fake_tools ();
+  set_encoders (0);
+
+  /* PNG stays lossless: Lanczos, long side bounded (never enlarges), alpha kept */
+  s = resize_str (NFC_CAT_IMAGE, "png", "png", "1080p", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet PNG:/s/a.png[0] -auto-orient -filter Lanczos -resize 1920x1920> PNG:/o/x.png");
+  g_free (s);
+  s = resize_str (NFC_CAT_IMAGE, "bmp", "bmp", "4k", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet BMP:/s/a.bmp[0] -auto-orient -filter Lanczos -resize 3840x3840> BMP:/o/x.bmp");
+  g_free (s);
+  s = resize_str (NFC_CAT_IMAGE, "tiff", "tiff", "25pct", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet TIFF:/s/a.tiff[0] -auto-orient -filter Lanczos -resize 25% TIFF:/o/x.tiff");
+  g_free (s);
+  /* JPG: the Best settings of the source class (q99 graphics, q95 photos), flattened */
+  s = resize_str (NFC_CAT_IMAGE, "jpg", "jpg", "50pct", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet JPEG:/s/a.jpg[0] -auto-orient -filter Lanczos -resize 50% -background white -alpha remove -alpha off -quality 95 -sampling-factor 4:4:4 JPEG:/o/x.jpg");
+  g_free (s);
+  /* WEBP: photos lossy q90 + sharp YUV, graphics (here: from a PNG... a WEBP source
+   * counts as a photo) lossless */
+  s = resize_str (NFC_CAT_IMAGE, "webp", "webp", "720p", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/magick -quiet WEBP:/s/a.webp[0] -auto-orient -filter Lanczos -resize 1280x1280> -resize 16383x16383> -quality 90 -define webp:method=6 -define webp:use-sharp-yuv=true WEBP:/o/x.webp");
+  g_free (s);
+  /* AVIF: the flattened PNG gets the resize, then the Best AVIF (crf 12 photo) */
+  s = resize_str (NFC_CAT_IMAGE, "avif", "avif", "480p", FALSE);
+  g_assert_nonnull (strstr (s, "-auto-orient -filter Lanczos -resize 854x854> -background white"));
+  g_assert_nonnull (strstr (s, "-crf 12"));
+  g_assert_nonnull (strstr (s, "/bin/nfc-decode /s/a.avif /w/decoded.png"));
+  g_free (s);
+  /* the dimensions of the source never change the argv of an image */
+  {
+    char *a = resize_str (NFC_CAT_IMAGE, "png", "png", "720p", FALSE);
+    char *b = resize_str (NFC_CAT_IMAGE, "png", "png", "720p", TRUE);
+
+    g_assert_cmpstr (a, ==, b);
+    g_free (a);
+    g_free (b);
+  }
+
+  /* GIF: ffmpeg scale (long side, any size) + the palette chain, NO fps filter */
+  s = resize_str (NFC_CAT_IMAGE, "gif", "gif", "480p", FALSE);
+  g_assert_cmpstr (s, ==, "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.gif -map 0:v:0 -an -sn -dn -vf scale=w='if(gt(iw,ih),min(iw,854),-1)':h='if(gt(iw,ih),-1,min(ih,854))':flags=lanczos,split[s0][s1];[s0]palettegen=stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle -loop 0 /o/x.gif");
+  g_assert_null (strstr (s, "fps"));
+  g_free (s);
+  s = resize_str (NFC_CAT_IMAGE, "gif", "gif", "50pct", FALSE);
+  g_assert_nonnull (strstr (s, "scale=w='trunc(iw*50/100+0.5)':h='trunc(ih*50/100+0.5)':flags=lanczos,split"));
+  g_free (s);
+
+  /* MP4: libx264 crf 18 slow, SHORT side, even sizes; audio copied first, AAC next */
+  s = resize_str (NFC_CAT_VIDEO, "mp4", "mp4", "720p", TRUE);
+  g_assert_cmpstr (s, ==, "/bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -vf scale=w='if(gt(iw,ih),-2,min(iw,720))':h='if(gt(iw,ih),min(ih,720),-2)':flags=lanczos,crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a copy -movflags +faststart /o/x.mp4"
+                   " ## /bin/ffmpeg -hide_banner -loglevel error -nostdin -y -i /s/a.mp4 -map 0:v:0 -map 0:a:0? -sn -dn -vf scale=w='if(gt(iw,ih),-2,min(iw,720))':h='if(gt(iw,ih),min(ih,720),-2)':flags=lanczos,crop=trunc(iw/2)*2:trunc(ih/2)*2 -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p -c:a aac -b:a 192k -movflags +faststart /o/x.mp4");
+  g_free (s);
+  /* a .m4v source is written as mp4; mov gets faststart too; mkv none; avi no B-frames */
+  s = resize_str (NFC_CAT_VIDEO, "m4v", "mp4", "1080p", FALSE);
+  g_assert_nonnull (strstr (s, "-i /s/a.m4v "));
+  g_assert_nonnull (strstr (s, "/o/x.mp4"));
+  g_free (s);
+  s = resize_str (NFC_CAT_VIDEO, "mov", "mov", "480p", FALSE);
+  g_assert_nonnull (strstr (s, "-movflags +faststart /o/x.mov"));
+  g_free (s);
+  s = resize_str (NFC_CAT_VIDEO, "mkv", "mkv", "480p", FALSE);
+  g_assert_null (strstr (s, "-movflags"));
+  g_assert_nonnull (strstr (s, "-c:a copy /o/x.mkv"));
+  g_assert_null (strstr (s, "-c copy"));
+  g_free (s);
+  s = resize_str (NFC_CAT_VIDEO, "avi", "avi", "480p", FALSE);
+  g_assert_nonnull (strstr (s, "-crf 18 -preset slow -bf 0 -pix_fmt yuv420p"));
+  g_assert_null (strstr (s, "-movflags"));
+  g_free (s);
+  /* WebM: VP9 crf 28 (Best), audio copied, else Opus 128k */
+  s = resize_str (NFC_CAT_VIDEO, "webm", "webm", "720p", FALSE);
+  g_assert_nonnull (strstr (s, "-c:v libvpx-vp9 -crf 28 -b:v 0"));
+  g_assert_nonnull (strstr (s, "-c:a copy /o/x.webm ## "));
+  g_assert_nonnull (strstr (s, "-c:a libopus -b:a 128k /o/x.webm"));
+  g_free (s);
+
+  /* libopenh264 only: bitrate of the OUTPUT size (1280 x 720 x 3 bits) */
+  set_encoders (1);
+  s = resize_str (NFC_CAT_VIDEO, "mp4", "mp4", "720p", TRUE);
+  g_assert_nonnull (strstr (s, "-c:v libopenh264 -rc_mode bitrate -b:v 2764800 "));
+  g_assert_nonnull (strstr (s, "-c:a copy"));
+  g_assert_nonnull (strstr (s, "-c:a aac -b:a 192k"));
+  g_free (s);
+  /* both encoders: x264 (copy, aac), then openh264 (copy, aac) */
+  set_encoders (2);
+  at = nfc_build_attempts_resize (NFC_CAT_VIDEO, "mp4", "mp4",
+                                  nfc_resize_preset_from_key (NFC_CAT_VIDEO, "480p"),
+                                  "/s/a.mp4", "/o/x.mp4", "/w", NULL, NULL);
+  g_assert_cmpuint (at->len, ==, 4);
+  g_assert_true (argv_has (last_step (at, 0), "libx264"));
+  g_assert_true (argv_has (last_step (at, 1), "libx264"));
+  g_assert_true (argv_has (last_step (at, 2), "libopenh264"));
+  g_assert_true (argv_has (last_step (at, 3), "libopenh264"));
+  g_assert_cmpstr (argv_after (last_step (at, 0), "-c:a"), ==, "copy");
+  g_assert_cmpstr (argv_after (last_step (at, 1), "-c:a"), ==, "aac");
+  g_ptr_array_unref (at);
+  nfc_test_set_encoders ("");
+
+  /* not a resize target / no preset: NULL */
+  g_assert_null (nfc_build_attempts_resize (NFC_CAT_VIDEO, "wmv", "wmv",
+                                            nfc_resize_preset_from_key (NFC_CAT_VIDEO, "720p"),
+                                            "/s/a.wmv", "/o/x.wmv", "/w", NULL, NULL));
+  g_assert_null (nfc_build_attempts_resize (NFC_CAT_IMAGE, "png", "png", NULL, "/s/a.png",
+                                            "/o/x.png", "/w", NULL, NULL));
+  /* the ordinary builders never resize */
+  s = build_str (NFC_CAT_IMAGE, "png", "png", BEST, FALSE);
+  g_assert_null (strstr (s, "Lanczos"));
+  g_free (s);
+}
+
+/* The menu labels and the toast sizes of the Small preset (item NAMES are unchanged) */
+static void
+test_small_labels (void)
+{
+  guint64 ow, oh;
+
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "jpg", SMALL), ==, "Small (max 2560 px)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "webp", SMALL), ==, "Small (max 2560 px)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "avif", SMALL), ==, "Small (max 2560 px)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_VIDEO, "mp4", SMALL), ==, "Small (max 1080p)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_VIDEO, "webm", SMALL), ==, "Small (max 1080p)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_VIDEO, "gif", SMALL), ==, "Small (480 px)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, NULL, SMALL), ==, "Small (max 2560 px / 1080p)");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "jpg", BEST), ==, "Best");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "jpg", HIGH), ==, "High");
+  g_assert_cmpstr (nfc_preset_menu_label (NFC_CAT_IMAGE, "jpg", BAL), ==, "Balanced");
+  g_assert_cmpstr (nfc_preset_key (SMALL), ==, "small"); /* the item name is unchanged */
+  g_assert_cmpstr (nfc_preset_label (SMALL), ==, "Small"); /* and so is the toast's name */
+
+  /* where Small scaled a picture down */
+  g_assert_true (nfc_preset_output_size (NFC_CAT_IMAGE, "jpg", SMALL, 3840, 2560, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 2560); g_assert_cmpuint (oh, ==, 1707);
+  g_assert_true (nfc_preset_output_size (NFC_CAT_IMAGE, "webp", SMALL, 3000, 6000, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 1280); g_assert_cmpuint (oh, ==, 2560);
+  g_assert_false (nfc_preset_output_size (NFC_CAT_IMAGE, "jpg", SMALL, 2560, 1000, NULL, NULL));
+  g_assert_false (nfc_preset_output_size (NFC_CAT_IMAGE, "jpg", HIGH, 6000, 4000, NULL, NULL));
+  g_assert_false (nfc_preset_output_size (NFC_CAT_IMAGE, "png", SMALL, 6000, 4000, NULL, NULL));
+  g_assert_true (nfc_preset_output_size (NFC_CAT_VIDEO, "mp4", SMALL, 3840, 2160, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 1920); g_assert_cmpuint (oh, ==, 1080);
+  g_assert_false (nfc_preset_output_size (NFC_CAT_VIDEO, "webm", SMALL, 1920, 1080, NULL, NULL));
+  g_assert_true (nfc_preset_output_size (NFC_CAT_VIDEO, "gif", SMALL, 600, 799, &ow, &oh));
+  g_assert_cmpuint (ow, ==, 480); g_assert_cmpuint (oh, ==, 639);
+  g_assert_false (nfc_preset_output_size (NFC_CAT_VIDEO, "gif", SMALL, 480, 300, NULL, NULL));
+  g_assert_false (nfc_preset_output_size (NFC_CAT_VIDEO, "gif", SMALL, 0, 0, NULL, NULL));
+}
+
 int
 main (int argc, char **argv)
 {
@@ -1793,5 +2526,11 @@ main (int argc, char **argv)
   g_test_add_func ("/core/preset-video", test_preset_video);
   g_test_add_func ("/core/preset-distinct-and-ignored", test_preset_distinct_and_ignored);
   g_test_add_func ("/core/failure-message", test_failure_message);
+  g_test_add_func ("/core/header-handmade", test_header_handmade);
+  g_test_add_func ("/core/header-files-and-fuzz", test_header_files_and_fuzz);
+  g_test_add_func ("/core/resize-presets", test_resize_presets);
+  g_test_add_func ("/core/resize-targets", test_resize_targets);
+  g_test_add_func ("/core/resize-argv", test_resize_argv);
+  g_test_add_func ("/core/small-labels", test_small_labels);
   return g_test_run ();
 }

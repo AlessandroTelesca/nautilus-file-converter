@@ -127,13 +127,13 @@ free_top (GList *items)
     nautilus_menu_item_list_free (items);
 }
 
-/* The top-level items of the selection ("Convert to", "Compress"): never any other,
- * each at most once, "Convert to" first. */
+/* The top-level items of the selection ("Convert to", "Compress", "Resize"): never
+ * any other, each at most once, in that order ("Convert to" first). */
 static GList *
 top_items (GList *infos)
 {
   GList *items = nautilus_menu_provider_get_file_items (NAUTILUS_MENU_PROVIDER (provider), infos);
-  guint n_convert = 0, n_compress = 0, pos = 0;
+  guint n_convert = 0, n_compress = 0, n_resize = 0, pos = 0;
 
   for (GList *l = items; l; l = l->next, pos++)
     {
@@ -146,13 +146,19 @@ top_items (GList *infos)
           g_assert_cmpuint (pos, ==, 0);
         }
       else if (g_strcmp0 (label, "Compress") == 0)
-        n_compress++;
+        {
+          n_compress++;
+          g_assert_cmpuint (n_resize, ==, 0);
+        }
+      else if (g_strcmp0 (label, "Resize") == 0)
+        n_resize++;
       else
         g_error ("unexpected top-level item '%s'", label);
       g_free (label);
     }
   g_assert_cmpuint (n_convert, <=, 1);
   g_assert_cmpuint (n_compress, <=, 1);
+  g_assert_cmpuint (n_resize, <=, 1);
   return items;
 }
 
@@ -316,12 +322,18 @@ find_item (GList *items, const char *name)
 }
 
 /* The item has a submenu with exactly Best, High, Balanced, Small, named
- * "<name>::best" ... and with a tooltip each. */
+ * "<name>::best" ... and with a tooltip each. Small's label says what it does to
+ * the size: "Small (max 2560 px)" for an image target, "Small (max 1080p)" for
+ * MP4/WebM, "Small (480 px)" for GIF; the item NAME stays "...::small". */
 static void
 assert_preset_submenu (NautilusMenuItem *item, const char *name)
 {
   static const char *const keys[] = { "best", "high", "balanced", "small" };
-  static const char *const labels[] = { "Best", "High", "Balanced", "Small" };
+  const char *small = strstr (name, "::image::") != NULL ? "Small (max 2560 px)"
+                      : g_str_has_suffix (name, "::gif") ? "Small (480 px)"
+                      : "Small (max 1080p)";
+  const char *const labels[] = { "Best", "High", "Balanced", small };
+  static const char *const tip_starts[] = { "Best", "High", "Balanced", "Small" };
   NautilusMenu *sub = NULL;
   GList *sub_items;
   guint i = 0;
@@ -340,7 +352,7 @@ assert_preset_submenu (NautilusMenuItem *item, const char *name)
       g_assert_cmpstr (n, ==, want);
       g_assert_cmpstr (lab, ==, labels[i]);
       g_assert_nonnull (tip);
-      g_assert_true (g_str_has_prefix (tip, labels[i]));
+      g_assert_true (g_str_has_prefix (tip, tip_starts[i]));
       g_object_get (l->data, "menu", &none, NULL);
       g_assert_null (none); /* the presets are leaves */
       g_free (n); g_free (lab); g_free (tip); g_free (want);
@@ -476,7 +488,8 @@ static void
 assert_compress_submenu (GList *infos)
 {
   static const char *const keys[] = { "high", "balanced", "small" };
-  static const char *const labels[] = { "High", "Balanced", "Small" };
+  static const char *const labels[] = { "High", "Balanced", "Small (max 2560 px / 1080p)" };
+  static const char *const tip_starts[] = { "High", "Balanced", "Small" };
   GList *items = top_items (infos);
   NautilusMenuItem *top = find_top (items, "Compress");
   NautilusMenu *sub = NULL;
@@ -500,7 +513,7 @@ assert_compress_submenu (GList *infos)
       g_assert_cmpstr (n, ==, want);
       g_assert_cmpstr (lab, ==, labels[i]);
       g_assert_nonnull (t);
-      g_assert_true (g_str_has_prefix (t, labels[i]));
+      g_assert_true (g_str_has_prefix (t, tip_starts[i]));
       g_assert_true (item_is_leaf (l->data));
       g_free (n); g_free (lab); g_free (t); g_free (want);
     }
@@ -668,6 +681,230 @@ test_compress_menus (void)
       g_list_free_full (l, g_object_unref);
     }
   g_free (ffmpeg_path);
+}
+
+/* ---- Resize ---- */
+
+/* The names (after "FileConverter::Resize::") of the Resize submenu, joined by
+ * ',' (every item a leaf, its label and tooltip returned through the out
+ * arguments when wanted), or NULL when there is no Resize item. Waits (up to 12 s)
+ * for it to appear; when it should NOT be there, until the Convert menu of the
+ * same selection is, so that the probes of the category have finished. */
+static char *
+resize_names_wait (GList *infos, gboolean expect, char **labels_out, char **tips_out)
+{
+  GList *items = NULL;
+  NautilusMenuItem *top = NULL;
+  GString *names = NULL, *labels = g_string_new (NULL), *tips = g_string_new (NULL);
+
+  for (int i = 0; i < 600; i++)
+    {
+      items = top_items (infos);
+      top = find_top (items, "Resize");
+      if (top != NULL || (!expect && find_top (items, "Convert to") != NULL))
+        break;
+      free_top (items);
+      items = NULL;
+      g_usleep (20000);
+    }
+  if (top != NULL)
+    {
+      NautilusMenu *sub = NULL;
+      GList *sub_items;
+      char *name = item_prop (top, "name");
+
+      g_assert_cmpstr (name, ==, "FileConverter::Resize");
+      g_free (name);
+      g_object_get (top, "menu", &sub, NULL);
+      g_assert_nonnull (sub);
+      sub_items = nautilus_menu_get_items (sub);
+      names = g_string_new (NULL);
+      for (GList *l = sub_items; l; l = l->next)
+        {
+          char *n = item_prop (l->data, "name"), *lab = item_prop (l->data, "label");
+          char *tip = item_prop (l->data, "tip");
+
+          g_assert_true (g_str_has_prefix (n, "FileConverter::Resize::"));
+          g_assert_true (item_is_leaf (l->data));
+          g_string_append_printf (names, "%s%s", names->len ? "," : "",
+                                  n + strlen ("FileConverter::Resize::"));
+          g_string_append_printf (labels, "%s%s", labels->len ? "|" : "", lab);
+          g_string_append_printf (tips, "%s%s", tips->len ? "|" : "", tip);
+          g_free (n); g_free (lab); g_free (tip);
+        }
+      nautilus_menu_item_list_free (sub_items);
+      g_object_unref (sub);
+    }
+  free_top (items);
+  if (labels_out != NULL)
+    *labels_out = g_string_free (labels, FALSE);
+  else
+    g_string_free (labels, TRUE);
+  if (tips_out != NULL)
+    *tips_out = g_string_free (tips, FALSE);
+  else
+    g_string_free (tips, TRUE);
+  return names != NULL ? g_string_free (names, FALSE) : NULL;
+}
+
+/* make an image of w x h pixels with ImageMagick (tests/ have no binary fixtures) */
+static gboolean
+make_image (const char *magick, const char *name, guint w, guint h)
+{
+  char *p = g_build_filename (work, name, NULL);
+  char *size = g_strdup_printf ("%ux%u", w, h);
+  char *fmt = g_str_has_suffix (name, ".jpg") ? g_strdup_printf ("JPEG:%s", p)
+                                              : g_strdup_printf ("PNG:%s", p);
+  char *argv[] = { (char *) magick, "-size", size, "xc:gray", fmt, NULL };
+  int status = -1;
+  gboolean ok = g_spawn_sync (NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                              NULL, NULL, NULL, NULL, &status, NULL) && status == 0;
+
+  g_free (p); g_free (size); g_free (fmt);
+  return ok;
+}
+
+/* "Resize" after "Convert to" and "Compress": only presets that make a picture
+ * smaller (sizes read from the file headers), the fixed list where the size is
+ * not known, 1080p/720p/480p for video. */
+static void
+test_resize_menus (void)
+{
+  char *magick = g_find_program_in_path ("magick");
+  char *ffmpeg = g_find_program_in_path ("ffmpeg");
+  char *names, *labels, *tips;
+  GList *l;
+  const char *all_images = "4k,1440p,1080p,720p,480p,50pct,25pct";
+
+  touch ("r-garbage.png"); touch ("r-video.mp4"); touch ("r-heic.heic"); touch ("r-svg.svg");
+  touch ("r-doc.docx");
+  g_mkdir_with_parents ("resize-dir", 0755);
+  if (magick != NULL)
+    {
+      g_assert_true (make_image (magick, "r-4k.png", 3840, 2160));
+      g_assert_true (make_image (magick, "r-1000x800.jpg", 1000, 800));
+      g_assert_true (make_image (magick, "r-20.png", 20, 20));
+      g_assert_true (make_image (magick, "r-30.png", 30, 30));
+      g_assert_true (make_image (magick, "r-720p.png", 1280, 720));
+
+      /* a 4K PNG: everything smaller than 3840 px, not 4K itself; names, labels
+       * and the exact size in the tooltip */
+      l = sel1 ("r-4k.png", "image/png", FALSE);
+      names = resize_names_wait (l, TRUE, &labels, &tips);
+      g_assert_cmpstr (names, ==, "1440p,1080p,720p,480p,50pct,25pct");
+      g_assert_cmpstr (labels, ==, "1440p (2560 px)|1080p (1920 px)|720p (1280 px)|"
+                                   "480p (854 px)|50%|25%");
+      g_assert_nonnull (strstr (tips, "2560 × 1440 px (aspect ratio kept)")); /* 1440p */
+      g_assert_nonnull (strstr (tips, "1920 × 1080 px (aspect ratio kept)")); /* 1080p, 50% */
+      g_assert_nonnull (strstr (tips, "960 × 540 px (aspect ratio kept)"));   /* 25% */
+      g_free (names); g_free (labels); g_free (tips);
+      g_list_free_full (l, g_object_unref);
+
+      /* a 1000 x 800 JPG: 720p is 1280 px on the long side, which is larger */
+      l = sel1 ("r-1000x800.jpg", "image/jpeg", FALSE);
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "480p,50pct,25pct");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* a 1280 x 720 PNG is not larger than 720p: 480p and the percentages */
+      l = sel1 ("r-720p.png", "image/png", FALSE);
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "480p,50pct,25pct");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* 30 x 30: 50% is 15 px (< 16), so only... nothing; 20 x 20 likewise */
+      l = sel1 ("r-20.png", "image/png", FALSE);
+      g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+      g_list_free_full (l, g_object_unref);
+      l = sel1 ("r-30.png", "image/png", FALSE);
+      g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+      g_list_free_full (l, g_object_unref);
+
+      /* a selection: a preset that makes at least one file smaller is shown */
+      l = sel1 ("r-4k.png", "image/png", FALSE);
+      l = sel_add (l, "r-20.png", "image/png");
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "1440p,1080p,720p,480p,50pct,25pct");
+      g_free (names);
+      l = sel_add (l, "r-1000x800.jpg", "image/jpeg"); /* a JPG and PNGs: still resizable */
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "1440p,1080p,720p,480p,50pct,25pct");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+
+      /* two files that are both too small: no Resize */
+      l = sel1 ("r-20.png", "image/png", FALSE);
+      l = sel_add (l, "r-30.png", "image/png");
+      g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+      g_list_free_full (l, g_object_unref);
+
+      /* a small file and one of unknown size (garbage): the fixed list */
+      l = sel1 ("r-20.png", "image/png", FALSE);
+      l = sel_add (l, "r-garbage.png", "image/png");
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, all_images);
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+    }
+
+  /* a file whose size cannot be read: the fixed image list */
+  if (magick != NULL)
+    {
+      l = sel1 ("r-garbage.png", "image/png", FALSE);
+      names = resize_names_wait (l, TRUE, &labels, NULL);
+      g_assert_cmpstr (names, ==, all_images);
+      g_assert_true (g_str_has_prefix (labels, "4K (3840 px)|1440p (2560 px)|"));
+      g_free (names); g_free (labels);
+      g_list_free_full (l, g_object_unref);
+    }
+
+  /* a video: the size is not known at right-click time, so the fixed list of
+   * short-side presets (offered when ffmpeg has an H.264 encoder) */
+  if (ffmpeg != NULL)
+    {
+      l = sel1 ("r-video.mp4", "video/mp4", FALSE);
+      names = resize_names_wait (l, TRUE, &labels, NULL);
+      if (names != NULL)
+        {
+          g_assert_cmpstr (names, ==, "1080p,720p,480p");
+          g_assert_cmpstr (labels, ==, "1080p|720p|480p");
+        }
+      g_free (names); g_free (labels);
+      g_list_free_full (l, g_object_unref);
+    }
+
+  /* HEIC and SVG cannot be written back in their own format: no Resize; a
+   * document: none */
+  l = sel1 ("r-heic.heic", "image/heic", FALSE);
+  g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("r-svg.svg", "image/svg+xml", FALSE);
+  g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("r-doc.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            FALSE);
+  g_assert_null (top_submenu (l, "Resize"));
+  g_list_free_full (l, g_object_unref);
+
+  /* a directory, alone or with a picture: no menu at all */
+  l = sel1 ("resize-dir", "inode/directory", TRUE);
+  g_assert_null (top_submenu (l, "Resize"));
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("r-garbage.png", "image/png", FALSE);
+  l = g_list_append (l, fake_new ("file:///tmp", "inode/directory", TRUE));
+  g_assert_null (top_submenu (l, "Resize"));
+  g_list_free_full (l, g_object_unref);
+
+  /* images and a video together: no menu */
+  l = sel1 ("r-garbage.png", "image/png", FALSE);
+  l = sel_add (l, "r-video.mp4", "video/mp4");
+  g_assert_null (top_submenu (l, "Resize"));
+  g_list_free_full (l, g_object_unref);
+
+  g_free (magick);
+  g_free (ffmpeg);
 }
 
 static void
@@ -854,6 +1091,7 @@ test_register_and_menu (void)
 
   test_preset_menus ();
   test_compress_menus ();
+  test_resize_menus ();
 
   /* no background items */
   {

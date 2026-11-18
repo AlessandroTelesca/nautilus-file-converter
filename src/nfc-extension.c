@@ -1,7 +1,8 @@
 /* nautilus-file-converter: Nautilus glue (menu provider + module entry points).
  *
  * Select files, right-click, "Convert to" > <format> [> <quality preset>], or
- * "Compress" > <quality preset> (a smaller copy in the same format). All
+ * "Compress" > <quality preset> (a smaller copy in the same format), or
+ * "Resize" > <size> (a smaller copy at a given pixel size). All
  * real work happens in nfc-core.c / nfc-convert.c.
  */
 #include <nautilus-extension.h>
@@ -32,6 +33,7 @@ typedef struct {
   NfcCategory cat;
   NfcPreset preset;
   gboolean compress; /* Compress (key, label, ext unused) instead of Convert to */
+  char *resize_key;  /* Resize to this preset (NfcResizePreset.key); NULL: not a resize */
   char *key, *label, *ext;
   GPtrArray *paths; /* char *, owned */
   GPtrArray *fmts;  /* static strings */
@@ -43,6 +45,7 @@ activate_data_free (gpointer data, GClosure *closure G_GNUC_UNUSED)
   ActivateData *d = data;
 
   g_free (d->key);
+  g_free (d->resize_key);
   g_free (d->label);
   g_free (d->ext);
   g_ptr_array_unref (d->paths);
@@ -57,13 +60,29 @@ on_activate (NautilusMenuItem *item G_GNUC_UNUSED, gpointer user_data)
 
   if (d == NULL || d->paths->len == 0)
     return;
-  if (d->compress)
+  if (d->resize_key != NULL)
+    nfc_batch_run_resize (d->cat, d->resize_key, (const char *const *) d->paths->pdata,
+                          (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
+  else if (d->compress)
     nfc_batch_run_compress (d->cat, d->preset, (const char *const *) d->paths->pdata,
                             (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
   else
     nfc_batch_run_preset (d->cat, d->key, d->preset, d->label, d->ext,
                           (const char *const *) d->paths->pdata,
                           (const char *const *) d->fmts->pdata, d->paths->len, NULL, NULL);
+}
+
+/* the selected files (paths and formats) of the item's action */
+static void
+activate_data_copy_selection (ActivateData *d, const NfcSelection *sel)
+{
+  d->paths = g_ptr_array_new_null_terminated (8, g_free, TRUE);
+  d->fmts = g_ptr_array_new_null_terminated (8, NULL, TRUE);
+  for (guint p = 0; p < sel->paths->len; p++)
+    {
+      g_ptr_array_add (d->paths, g_strdup (sel->paths->pdata[p]));
+      g_ptr_array_add (d->fmts, sel->fmts->pdata[p]);
+    }
 }
 
 /* A menu item that converts the whole selection to target t with this preset (t
@@ -81,13 +100,7 @@ convert_item_new (const NfcSelection *sel, const NfcTarget *t, NfcPreset preset,
   d->key = g_strdup (t != NULL ? t->key : "");
   d->label = g_strdup (t != NULL ? t->label : "Compress");
   d->ext = g_strdup (t != NULL ? t->ext : "");
-  d->paths = g_ptr_array_new_null_terminated (8, g_free, TRUE);
-  d->fmts = g_ptr_array_new_null_terminated (8, NULL, TRUE);
-  for (guint p = 0; p < sel->paths->len; p++)
-    {
-      g_ptr_array_add (d->paths, g_strdup (sel->paths->pdata[p]));
-      g_ptr_array_add (d->fmts, sel->fmts->pdata[p]);
-    }
+  activate_data_copy_selection (d, sel);
   g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), d,
                          activate_data_free, 0);
   return item;
@@ -118,7 +131,7 @@ target_item_new (const NfcSelection *sel, const NfcTarget *t)
       {
         char *pname = g_strdup_printf ("%s::%s", name, nfc_preset_key ((NfcPreset) p));
         NautilusMenuItem *pi = convert_item_new (sel, t, (NfcPreset) p, pname,
-                                                 nfc_preset_label ((NfcPreset) p),
+                                                 nfc_preset_menu_label (sel->cat, t->key, (NfcPreset) p),
                                                  nfc_preset_tooltip (sel->cat, t->key,
                                                                      (NfcPreset) p));
 
@@ -147,11 +160,51 @@ compress_item_new (const NfcSelection *sel)
   for (NfcPreset p = NFC_PRESET_HIGH; p < NFC_PRESET_N; p++)
     {
       char *name = g_strdup_printf ("FileConverter::Compress::%s", nfc_preset_key (p));
-      NautilusMenuItem *pi = convert_item_new (sel, NULL, p, name, nfc_preset_label (p),
+      NautilusMenuItem *pi = convert_item_new (sel, NULL, p, name,
+                                               nfc_preset_menu_label (sel->cat, NULL, p),
                                                nfc_compress_tooltip (p));
 
       nautilus_menu_append_item (sub, pi);
       g_object_unref (pi);
+      g_free (name);
+    }
+  nautilus_menu_item_set_submenu (top, sub);
+  g_object_unref (sub);
+  return top;
+}
+
+/* The "Resize" entry: a submenu of the presets that make the selection smaller
+ * (item names "FileConverter::Resize::<key>", e.g. "...::1080p", "...::50pct").
+ * The tooltip says the exact size when one file of known size is selected. */
+static NautilusMenuItem *
+resize_item_new (const NfcSelection *sel)
+{
+  NautilusMenuItem *top = nautilus_menu_item_new ("FileConverter::Resize", "Resize",
+                                                  "Make a smaller copy next to the original, "
+                                                  "same format, at a given size", NULL);
+  NautilusMenu *sub = nautilus_menu_new ();
+  gboolean one = sel->paths->len == 1 && sel->dims != NULL && sel->dims->len == 1;
+
+  for (guint k = 0; k < sel->resize->len; k++)
+    {
+      const NfcResizePreset *p = sel->resize->pdata[k];
+      char *name = g_strdup_printf ("FileConverter::Resize::%s", p->key);
+      const NfcDims *d = one ? &g_array_index (sel->dims, NfcDims, 0) : NULL;
+      char *tip = nfc_resize_tooltip (p, d != NULL ? d->width : 0, d != NULL ? d->height : 0);
+      NautilusMenuItem *item = nautilus_menu_item_new (name, p->label, tip, NULL);
+      ActivateData *data = g_new0 (ActivateData, 1);
+
+      data->cat = sel->cat;
+      data->resize_key = g_strdup (p->key);
+      data->key = g_strdup ("");
+      data->label = g_strdup ("Resize");
+      data->ext = g_strdup ("");
+      activate_data_copy_selection (data, sel);
+      g_signal_connect_data (item, "activate", G_CALLBACK (on_activate), data,
+                             activate_data_free, 0);
+      nautilus_menu_append_item (sub, item);
+      g_object_unref (item);
+      g_free (tip);
       g_free (name);
     }
   nautilus_menu_item_set_submenu (top, sub);
@@ -224,6 +277,8 @@ nfc_provider_get_file_items (NautilusMenuProvider *provider G_GNUC_UNUSED, GList
     }
   if (ok && sel.can_compress)
     result = g_list_append (result, compress_item_new (&sel));
+  if (ok && sel.resize != NULL && sel.resize->len > 0)
+    result = g_list_append (result, resize_item_new (&sel));
   nfc_selection_clear (&sel);
   /* explicit loop over n: an invalid entry in the middle leaves NULL holes, where
    * g_strfreev() would stop and leak every later entry */

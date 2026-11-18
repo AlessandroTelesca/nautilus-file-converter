@@ -6,7 +6,9 @@ format; the converted copies appear next to the originals. For JPG, WEBP, AVIF,
 MP4, WebM and GIF the target opens a small submenu of quality presets (Best, High,
 Balanced, Small; see "Quality presets" below). A second entry, "Compress"
 (High, Balanced, Small), makes a smaller copy of a JPG, WEBP, AVIF, MP4, WebM or
-GIF in the same format (see "Compress" below).
+GIF in the same format (see "Compress" below), and "Resize" (1080p, 720p, 50 %, ...;
+only sizes smaller than the file) makes a copy at a smaller pixel size (see "Resize"
+below).
 
 Written in C against `libnautilus-extension-4` (Nautilus 43+ / GTK 4) and built
 with meson. There is no scripting-language runtime involved: no Python, no
@@ -172,12 +174,19 @@ and the notifications name it when it is not Best ("Converted 3 files to JPG
   (the tests compare them with a copy of the previous ones).
 * **High**: visually identical on screenshots and photos.
 * **Balanced**: a good default for sharing.
-* **Small**: the smallest acceptable result. It also shrinks: images larger than
+* **Small**: the smallest acceptable result. Its menu label says what it does to
+  the size: "Small (max 2560 px)" for JPG, WEBP and AVIF, "Small (max 1080p)" for
+  MP4 and WebM, "Small (480 px)" for GIF (and "Small (max 2560 px / 1080p)" in
+  Compress); the item name stays `...::small`. When it really scaled a picture
+  down, the success banner gives the new size: "photo.png → photo.jpg (Small,
+  2560×1707)". It also shrinks: images larger than
   2560 px on the long side are scaled to 2560 px (JPG, WEBP, AVIF), video whose
   short side is above 1080 is scaled to 1080p (MP4, WebM; a 4K clip becomes
   1920x1080), GIF is 480 px wide at 10 fps with 128 colours. High and Balanced
   never change the picture size (GIF: High 720 px at 15 fps, Balanced 640 px at
-  12 fps; Best 960 px at 15 fps). The menu tooltips say the same.
+  12 fps; Best 960 px at 15 fps; those are *maximum* rates, the frame rate is
+  `min(source, preset)` so a 10 fps source keeps its 10 fps instead of getting
+  frames duplicated). The menu tooltips say the same.
 
 Settings (the source classes are as above: *graphics* = lossless sources,
 *photo* = lossy sources):
@@ -187,7 +196,7 @@ Settings (the source classes are as above: *graphics* = lossless sources,
 | JPG graphics | q99, 4:4:4 | q95, 4:4:4, progressive | q85, 4:4:4, progressive | q75, 4:2:0, progressive, max 2560 px |
 | JPG photo | q95, 4:4:4 | q92, 4:2:0, progressive | q80, 4:2:0, progressive | q70, 4:2:0, progressive, max 2560 px |
 | WEBP graphics | lossless, method 4 | lossy q95 *or* the lossless file of Best, whichever is smaller | lossy q88 *or* lossless, whichever is smaller | lossy q75 *or* lossless, whichever is smaller, max 2560 px |
-| WEBP photo | lossy q90 | q85 | q78 | q65, max 2560 px |
+| WEBP photo | lossy q90, sharp YUV | q85, sharp YUV | q78, sharp YUV | q65, sharp YUV, max 2560 px |
 | AVIF graphics (4:4:4) | CRF 9 | CRF 18 | CRF 26 | CRF 34, max 2560 px |
 | AVIF photo (4:2:0) | CRF 12 | CRF 20 | CRF 28 | CRF 36, max 2560 px |
 | MP4 libx264 | CRF 18, slow | CRF 23, slow | CRF 28, slow | CRF 34, medium, max 1080p |
@@ -372,6 +381,69 @@ The extension finds the helper at the install path compiled in from the meson
 prefix (`config.h`); `NFC_DECODE_HELPER=/path/to/nfc-decode` overrides it (the
 tests use that to run from the build directory).
 
+### Resize
+
+After "Convert to" and "Compress" the menu has **Resize**: a copy at a smaller
+pixel size, in the *same* format, next to the original (item names
+`FileConverter::Resize::<key>`).
+
+* **Images** (PNG, JPG, WEBP, AVIF, BMP, TIFF, and animated GIF): **4K (3840 px),
+  1440p (2560 px), 1080p (1920 px), 720p (1280 px), 480p (854 px), 50 %, 25 %**
+  (keys `4k 1440p 1080p 720p 480p 50pct 25pct`). The named sizes are the **long
+  side**, the aspect ratio is kept, so a 3840x2160 picture becomes exactly
+  1920x1080 and a portrait 2160x3840 one 1080x1920. 50 % and 25 % scale both
+  sides. HEIC (no HEIC encoder), SVG (vector) and ICO are not offered.
+* **Videos** (MP4/M4V, MKV, WebM, MOV, AVI): **1080p, 720p, 480p** by the **short
+  side** (video convention: 1080p is 1080 lines, a portrait phone video becomes
+  1080 px wide), even dimensions.
+* **Only presets that make the picture smaller are offered.** For an image the
+  menu knows its size: `get_file_items` reads the first 64 KiB of each selected
+  local file (the only place the extension reads file content on the main thread;
+  a bounded read of a regular file, nothing blocks on a FIFO, at most 32 files)
+  and parses the PNG, JPEG, GIF, WebP or BMP header in C (`src/nfc-header.c`).
+  A 3840x2160 PNG offers 1440p ... 25 % but not 4K; a 1000x800 JPG offers 480p, 50
+  %, 25 % (720p is 1280 px, which is larger); a 20x20 icon offers nothing (50 % is
+  10 px, below the 16 px minimum of the percentages), so there is no Resize entry.
+  With several files a preset is offered when it makes at least one of them smaller.
+  Where the size cannot be read (AVIF, TIFF, JPEG with a header block beyond 64
+  KiB, a damaged file) and for every video (probing needs a process, never done
+  in the menu) the fixed list is shown, and the job decides when it runs.
+* **When it runs**, the size is probed (`identify -ping`, `nfc-decode --info`,
+  `ffprobe`) and a file the preset would not make smaller is skipped, not failed:
+  "photo.jpg is already smaller than 1080p", "icon.png is too small to resize to
+  50%". Nothing is written for it.
+* **Quality**: the Best settings of the format. PNG, BMP and TIFF stay lossless,
+  JPG is q95 4:4:4 (photo) or q99 4:4:4 (the source class rules of the table above),
+  WEBP is lossless for graphics and lossy q90 for photos, AVIF CRF 9/12. Resampling
+  is ImageMagick's Lanczos (`-filter Lanczos -resize 1920x1920>`, which never
+  enlarges) and the alpha channel is kept (JPG flattens it on white, as always).
+  GIF is scaled by ffmpeg (`scale=...:flags=lanczos` and the same palette chain
+  as the GIF presets) without touching frames or timing.
+* **Video** is re-encoded (`scale=w=...:h=...:flags=lanczos`, short side, even
+  sizes): MP4, M4V, MOV, MKV and AVI with libx264 CRF 18 slow (libopenh264 with
+  the bitrate of the *output* size when that is all ffmpeg has), WebM with VP9 CRF
+  28. The **audio is copied** (`-c:a copy`); when the container cannot hold the
+  source's codec the next attempt re-encodes it (AAC 192k, Opus 128k for WebM).
+  AVI gets no B-frames (`-bf 0`) because the format cannot carry them reliably.
+  `.m4v` is written as `.mp4` (ffmpeg's `.m4v` muxer is raw H.264).
+* **Name**: `photo (1080p).jpg`, `photo (50%).png`, `clip (720p).mp4` through
+  the normal no-overwrite publishing (`photo (1080p) (1).jpg` if that exists). No
+  byte-size rule applies: the point is fewer pixels, the file may even grow
+  (a flat PNG).
+* **Notifications**: "Resizing…", then "photo.jpg → photo (1080p).jpg, 3840×2160
+  → 1920×1080", or "Resized 3 files to 1080p", plus "photo.jpg is already
+  smaller than 1080p" / "2 files are already smaller than 1080p" for the skipped
+  ones and "Failed: ..." lines.
+
+For features that reuse this: `nfc_analyze_selection` fills `sel->dims` (an
+`NfcDims` per file, 0 x 0 when unknown) and `sel->resize` (the presets to offer);
+`nfc_header_parse` / `nfc_header_read_file` are the header parsers;
+`NfcConvertOptions.resize` makes a job a Resize (it probes the size and ends with
+`NFC_CONVERT_ERROR_NOT_SMALLER` before running any converter when the preset would
+not shrink the source); `nfc_convert_result_dims` hands the probed source size to
+the callback; `nfc_resize_output_size` is the one rule for "what size, and is it
+smaller".
+
 ## Never blocks Nautilus
 
 The extension runs inside the Nautilus process, so nothing it does may block
@@ -387,6 +459,10 @@ the main thread or crash the process:
   selection with nothing known yet gets no menu at all (rather than an empty or
   half-built one). Because the probes are independent, a hung `ffmpeg` does not
   hide image targets that only need ImageMagick.
+* **The one read**: for Resize the menu reads the first 64 KiB of each selected
+  image (at most 32 files, regular local files only, opened `O_NONBLOCK` so a FIFO
+  cannot hang it) to learn its size; microseconds from the page cache (13 us per file
+  measured). Everything else about a file is learned by a process, after the click.
 * **Probe timeout**: each probe is killed (with its whole process group) after
   10 s. A probe that times out or fails counts as "tool unavailable" for the
   rest of the session and is logged.
@@ -470,7 +546,9 @@ and are only honoured when set.
   ("Converted 3 files to MP4") or, on failure, the file name and the last line
   of the tool's error output. A preset other than Best is named: "Converted 3
   files to JPG (Balanced)", "photo.png → photo.jpg (Small)". Compress has its
-  own texts (see "Compress").
+  own texts (see "Compress"), and so has Resize (see "Resize"). When the Small
+  preset scaled a picture down the size is added: "photo.png → photo.jpg (Small,
+  2560×1707)".
 * **Output cap**: a tool's stdout and stderr are read incrementally and only the
   last 64 KiB of each is kept, so a tool that prints without end cannot grow
   memory, the log or the notification (the toast text is also shortened to
@@ -529,7 +607,11 @@ meson test -C build
   tooltip each), PNG, BMP, MP3, MKV and the rest are plain items, also for a
   multi-file selection; and "Compress" (High, Balanced, Small): offered for a
   JPG, `.jpeg`, two JPGs, JPG + WEBP, MP4, M4V, WebM and GIF, not for PNG, BMP, HEIC,
-  JPG + PNG, MP4 + MKV, MKV, audio, a document, a directory.
+  JPG + PNG, MP4 + MKV, MKV, audio, a document, a directory. And "Resize" after
+  "Compress": generated 3840x2160 PNG (1440p ... 25 %, no 4K), 1000x800 JPG (480p, 50
+  %, 25 %), 20x20 and 30x30 PNGs (no Resize at all), a video (fixed 1080p/720p/480p),
+  a selection (a preset that shrinks at least one file), an unreadable size (the
+  fixed list), HEIC, SVG, a document, a directory.
 * `module-probe-freeze`: the same, end to end, with a hanging fake `ffmpeg`
   first in `PATH`: right-clicking a `.txt` returns in microseconds.
 * `conversions`: generates fixtures with ImageMagick / ffmpeg / LibreOffice,
@@ -578,6 +660,19 @@ meson test -C build
   good + one broken) are compared with a fake `notify-send`. WEBP graphics: a
   flat text image comes out at exactly Best's (lossless) size for every preset, a
   plasma image at less than half of it, decreasing, with no `.alt` file left.
+  Resize: a 4K PNG to 1080p is exactly 1920x1080 and named `pic (1080p).png`, a JPG to
+  50 %, a WEBP with transparency to 720p (alpha kept), a 10 fps GIF to 480p (same
+  frame count and rate), BMP, TIFF, AVIF, a 1080p MP4 / MKV to 720p and a 720p
+  WebM/MOV/AVI/M4V to 480p (exact size, video codec as before, audio stream
+  copied), a portrait video (short side), a video without audio; a second resize
+  becomes `(480p) (1)`; sources that are already smaller (an image, an exact match,
+  a 720p video to 720p, a 30 px image to 50 %) are skipped with the plain message and
+  leave nothing; the notification texts are compared with a fake `notify-send`; the
+  GIF frame rate is `min(source, preset)` (10, 30 and 12 fps sources). `core-logic`
+  fuzzes the header parsers (truncation and byte flips of real PNG, JPEG, GIF, WebP
+  lossy / lossless / extended and BMP files, plus random bytes; under ASan nothing
+  may read out of bounds), and `robustness` checks that the header read neither
+  blocks on a FIFO nor reads more than 64 KiB of a 100 GiB file.
 
 ## License
 

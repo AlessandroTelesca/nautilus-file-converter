@@ -49,6 +49,17 @@ const char *nfc_preset_label (NfcPreset preset);
 gboolean    nfc_preset_from_key (const char *key, NfcPreset *out);
 /* Does this target (category, target key) have a preset submenu? */
 gboolean    nfc_target_has_presets (NfcCategory cat, const char *key);
+/* Menu label of a preset, saying what Small does to the size: "Best", "High",
+ * "Balanced", and "Small (max 2560 px)" for JPG/WEBP/AVIF, "Small (max 1080p)" for
+ * MP4/WebM, "Small (480 px)" for GIF. key NULL: the Compress entry ("Small (max
+ * 2560 px / 1080p)"). The item NAME stays nfc_preset_key (). Static string. */
+const char *nfc_preset_menu_label (NfcCategory cat, const char *key, NfcPreset preset);
+/* Did this preset scale a w x h source of target (cat, key) down, and to what?
+ * TRUE (and *ow, *oh) only for Small when the source is larger than its limit
+ * (images: long side 2560 px; MP4/WebM: short side 1080, even; GIF: width 480);
+ * FALSE otherwise. For the toast: "Small, 2560×1707". */
+gboolean    nfc_preset_output_size (NfcCategory cat, const char *key, NfcPreset preset,
+                                    guint64 w, guint64 h, guint64 *ow, guint64 *oh);
 /* One-line tooltip of the preset of a target: what it trades, including any
  * downscaling. Static string, never NULL. */
 const char *nfc_preset_tooltip (NfcCategory cat, const char *key, NfcPreset preset);
@@ -92,6 +103,61 @@ typedef struct {
 gboolean nfc_compress_target (NfcCategory cat, const char *fmt, NfcCompressTarget *out);
 /* One-line tooltip of a Compress preset (HIGH, BALANCED or SMALL); "" otherwise. */
 const char *nfc_compress_tooltip (NfcPreset preset);
+
+/* ---- Resize: a smaller copy in the same format ----
+ *
+ * "Resize" > 1080p (1920 px) / 50% / ...: every selected file becomes a copy in
+ * its own format, named "<name> (1080p).<ext>" / "<name> (50%).<ext>", with the
+ * pixel size of the preset and the Best quality of that format (lossless stays
+ * lossless). Only presets that make the picture STRICTLY smaller are offered
+ * (nfc_resize_output_size).
+ *
+ * Images (and GIF, resized by ffmpeg as an animation: same frames and timing):
+ * the named sizes are the LONG side (4K 3840, 1440p 2560, 1080p 1920, 720p 1280,
+ * 480p 854), aspect ratio kept, plus 50% and 25% (not below 16 px on the short
+ * side). Videos: 1080p, 720p, 480p are the SHORT side (video convention: 1080p
+ * is 1080 lines, so a portrait phone video is 1080 px wide), even dimensions. */
+
+#define NFC_RESIZE_MIN_SIDE 16 /* a percent preset must leave at least this on the short side */
+
+typedef struct {
+  const char *key;    /* menu item name part and CLI key: "1080p", "50pct" */
+  const char *label;  /* menu label: "1080p (1920 px)" */
+  const char *name;   /* "1080p", "50%": the name suffix " (1080p)" and the notifications */
+  guint       side;   /* > 0: target side in pixels (long side; short side if short_side) */
+  guint       percent; /* > 0 (and side == 0): scale factor in percent */
+  gboolean    short_side;
+} NfcResizePreset;
+
+/* The presets of a source category (NFC_CAT_IMAGE or NFC_CAT_VIDEO; none, with
+ * *n = 0, for any other), largest first. Static table. */
+const NfcResizePreset *nfc_resize_presets (NfcCategory cat, guint *n);
+const NfcResizePreset *nfc_resize_preset_from_key (NfcCategory cat, const char *key);
+
+/* The size a w x h source gets with preset p. TRUE only when that is strictly
+ * smaller (long side for named image presets, short side for video, both sides
+ * for percent) and usable; FALSE otherwise ("already smaller than 1080p").
+ * ow/oh (may be NULL) are what ImageMagick / ffmpeg make of it: nearest integer,
+ * video sides even. Unknown size (0): FALSE. */
+gboolean nfc_resize_output_size (const NfcResizePreset *p, guint64 w, guint64 h,
+                                 guint64 *ow, guint64 *oh);
+
+/* Menu tooltip: "Scale down to 1920 x 1080" when the size (w, h; 0 = unknown) is
+ * known, else what the preset means in words. g_free. */
+char *nfc_resize_tooltip (const NfcResizePreset *p, guint64 w, guint64 h);
+
+typedef struct {
+  NfcCategory cat;     /* category to convert in: a GIF image is resized as video */
+  const char *key;     /* target key ("jpg", "mp4", "gif", "mov") */
+  const char *ext;     /* output extension (a .jpeg or .m4v source gets .jpg / .mp4) */
+} NfcResizeTarget;
+
+/* The resize target of a source of category cat and canonical format fmt; FALSE
+ * if it cannot be resized (HEIC: no encoder; SVG, ICO, WMV, FLV, audio, documents).
+ * Static table: says nothing about the installed tools. */
+gboolean nfc_resize_target (NfcCategory cat, const char *fmt, NfcResizeTarget *out);
+/* Can a source of category/fmt be resized right now (target + tools probed). */
+gboolean nfc_resize_available (NfcCategory cat, const char *fmt);
 
 /* Result of classifying a file. fmt is a static canonical key ("jpg", "heic"). */
 typedef struct {
@@ -170,13 +236,32 @@ typedef struct {
   gboolean    is_dir;
 } NfcSelItem;
 
+/* Pixel size of one selected file as far as the right-click menu knows it;
+ * 0 x 0: unknown (not an image, a format without a header parser, a header that
+ * is not in the first 64 KiB, an unreadable file). */
+typedef struct {
+  guint64 width, height;
+} NfcDims;
+
 typedef struct {
   NfcCategory cat;
   GPtrArray  *paths;   /* char *, owned */
   GPtrArray  *fmts;    /* const char *, static */
   GPtrArray  *targets; /* const NfcTarget *, static */
   gboolean    can_compress; /* "Compress" is offered: see nfc_compress_target */
+  /* Image selections of up to NFC_SELECTION_DIMS_MAX files: the size of each
+   * file, read from its header (nfc-header.h) by nfc_analyze_selection: an array
+   * of NfcDims parallel to paths. NULL otherwise (all sizes unknown). */
+  GArray     *dims;
+  /* Resize presets (const NfcResizePreset *, static, in menu order) that make at
+   * least one selected file smaller (a file of unknown size counts); NULL or
+   * empty when "Resize" is not offered. */
+  GPtrArray  *resize;
 } NfcSelection;
+
+/* Selections with more files than this are not given sizes (the menu must stay
+ * instant: each size is a read of up to 64 KiB on the main thread) */
+#define NFC_SELECTION_DIMS_MAX 32
 
 /* TRUE (and a filled sel) if a menu should be shown for this selection.
  *
@@ -190,8 +275,14 @@ typedef struct {
  *
  * Compress is separate from the convert targets: sel->can_compress is TRUE when
  * every selected file can be compressed (nfc_compress_available); each in its
- * own format. The result is TRUE when there is a convert target or can_compress
- * (sel->targets may then be empty). */
+ * own format. The result is TRUE when there is a convert target, can_compress
+ * or a resize preset (sel->targets may then be empty).
+ *
+ * The one thing that touches file content: for image selections it reads the
+ * first 64 KiB of each (regular, local) file to learn its pixel size
+ * (sel->dims, nfc-header.h), so that Resize offers only presets that make the
+ * picture smaller. Bounded, no tool is run; a file whose size cannot be found
+ * simply has none. */
 gboolean nfc_analyze_selection (const NfcSelItem *items, guint n, NfcSelection *sel);
 void     nfc_selection_clear (NfcSelection *sel);
 
@@ -260,6 +351,21 @@ GPtrArray *nfc_build_attempts_preset (NfcCategory cat, const char *fmt, const ch
                                       NfcPreset preset, const char *src, const char *out,
                                       const char *workdir, const NfcImageInfo *info,
                                       gboolean *needs_decode);
+
+/* The commands of a Resize job: cat/fmt/key/ext as nfc_resize_target gives for
+ * the source (key is the output format; an image resize is ImageMagick
+ * `-filter Lanczos -resize` followed by the Best settings of that format; a GIF is
+ * ffmpeg's scale + palette chain without touching the frame rate; a video is
+ * ffmpeg `scale=...:flags=lanczos` (short side) with the Best settings of the
+ * container's codec, the audio stream copied when the container takes it, else
+ * re-encoded). info (may be NULL) is the SOURCE size; the commands never enlarge
+ * (the geometry is "WxH>" and the video scale takes min()), so a missing size is
+ * harmless. Other arguments as nfc_build_attempts_preset. NULL if a tool is
+ * missing or key is not a resize target. */
+GPtrArray *nfc_build_attempts_resize (NfcCategory cat, const char *fmt, const char *key,
+                                      const NfcResizePreset *rs, const char *src,
+                                      const char *out, const char *workdir,
+                                      const NfcImageInfo *info, gboolean *needs_decode);
 
 /* dpi that makes a w x h pixel image fit an A4 page (landscape for a wide
  * image), never below 96 and never resampling; whole number. */
