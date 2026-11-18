@@ -406,7 +406,11 @@ pixel size, in the *same* format, next to the original (item names
   menu knows its size: `get_file_items` reads the first 64 KiB of each selected
   local file (the only place the extension reads file content on the main thread;
   a bounded read of a regular file, nothing blocks on a FIFO, at most 32 files)
-  and parses the PNG, JPEG, GIF, WebP or BMP header in C (`src/nfc-header.c`).
+  and parses the PNG, JPEG, GIF, WebP, BMP, AVIF, HEIC or TIFF header in C
+  (`src/nfc-header.c`; AVIF/HEIC: the `ispe` of the primary item, with `clap`/`irot`
+  applied, else the largest `ispe`; TIFF: ImageWidth/ImageLength of the first IFD,
+  which libtiff writes after the pixels, so a TIFF gets one more bounded read
+  there).
   A 3840x2160 PNG offers 1440p ... 25 % but not 4K; a 1000x800 JPG offers 480p, 50
   %, 25 % (720p is 1280 px, which is larger); a 20x20 icon offers nothing (50 % is
   10 px, below the 16 px minimum of the percentages), so there is no Resize entry.
@@ -782,8 +786,11 @@ meson test -C build
   leave nothing; the notification texts are compared with a fake `notify-send`; the
   GIF frame rate is `min(source, preset)` (10, 30 and 12 fps sources). `core-logic`
   fuzzes the header parsers (truncation and byte flips of real PNG, JPEG, GIF, WebP
-  lossy / lossless / extended and BMP files, plus random bytes; under ASan nothing
-  may read out of bounds), and `robustness` checks that the header read neither
+  lossy / lossless / extended, BMP, AVIF (libaom), HEIC and TIFF (both byte orders)
+  files and of hand-made ISO-box and TIFF/BigTIFF headers, plus random bytes; under
+  ASan nothing may read out of bounds), `module` the Resize and Upscale filtering
+  for AVIF, HEIC and TIFF (including 8000x6000 headers made in memory), and
+  `robustness` checks that the header read neither
   blocks on a FIFO nor reads more than 64 KiB of a 100 GiB file.
   Upscale: `core-logic` covers the tool discovery (a fake install found through
   `NFC_UPSCAYL_BIN`, the model of a config file in `XDG_CONFIG_HOME`), the config

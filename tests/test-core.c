@@ -10,6 +10,7 @@
 #include "nfc-core.h"
 #include "nfc-util.h"
 #include "nfc-header.h"
+#include "header-fixtures.h"
 
 static gboolean
 argv_has (char **argv, const char *s)
@@ -1826,6 +1827,264 @@ make_jpeg (guint n_app, guint seg, guint w, guint h)
   g_byte_array_append (a, b, 4);
   return a;
 }
+static guint32
+be32_at (const guint8 *p)
+{
+  return ((guint32) p[0] << 24) | ((guint32) p[1] << 16) | ((guint32) p[2] << 8) | p[3];
+}
+
+/* the first occurrence of the 4 characters cc in data (a box type), or NULL */
+static guint8 *
+find4 (const guint8 *data, gsize len, const char *cc)
+{
+  for (gsize i = 0; i + 4 <= len; i++)
+    if (memcmp (data + i, cc, 4) == 0)
+      return (guint8 *) data + i;
+  return NULL;
+}
+
+/* AVIF / HEIC / HEIF (ISO base media boxes) made by hand */
+static void
+test_header_isobmff_handmade (void)
+{
+  guint32 w = 0, h = 0;
+  GByteArray *a;
+  HfHeif o;
+  static const char *const brands[] = { "avif", "avis", "heic", "heix", "hevc", "heim", "heis",
+                                        "mif1", "msf1" };
+
+  /* every accepted major brand, with either format key: the primary item's ispe */
+  for (guint i = 0; i < G_N_ELEMENTS (brands); i++)
+    {
+      HfHeif ob = HF_HEIF_DEFAULT (brands[i], 4032, 3024);
+
+      a = hf_make_heif (&ob);
+      g_assert_true (parse_exact ("avif", a->data, a->len, &w, &h));
+      g_assert_cmpuint (w, ==, 4032); g_assert_cmpuint (h, ==, 3024);
+      g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+      g_assert_cmpuint (w, ==, 4032); g_assert_cmpuint (h, ==, 3024);
+      g_byte_array_free (a, TRUE);
+    }
+  /* an unknown major brand is fine when a compatible brand is known (mif1 is in the list),
+   * and an unknown set of brands is not (the file is something else, an MP4) */
+  o = (HfHeif) HF_HEIF_DEFAULT ("isom", 640, 480);
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 640);
+  memcpy (a->data + 8, "isom", 4);
+  memcpy (a->data + 16, "iso2", 4);
+  memcpy (a->data + 20, "iso2", 4);
+  g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+
+  /* several ispe: the primary item's, not the largest (a bigger one belongs to
+   * another item) nor the first (a thumbnail comes first in ipco) */
+  o = (HfHeif) HF_HEIF_DEFAULT ("heic", 3000, 2000);
+  o.decoy = TRUE;
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 3000); g_assert_cmpuint (h, ==, 2000);
+  g_byte_array_free (a, TRUE);
+  /* ... also with the wide ipma (version 1, 32-bit ids, 15-bit indices) */
+  o.wide_ipma = TRUE;
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 3000); g_assert_cmpuint (h, ==, 2000);
+  g_byte_array_free (a, TRUE);
+  /* no pitm: the largest ispe (the decoy) */
+  o.wide_ipma = FALSE;
+  o.pitm = FALSE;
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 6000); g_assert_cmpuint (h, ==, 4000);
+  g_byte_array_free (a, TRUE);
+  /* a pitm naming an item that is not in ipma: the largest too */
+  o.pitm = TRUE;
+  a = hf_make_heif (&o);
+  {
+    /* pitm payload: version/flags (4), item id (2) = 1: make it 9 */
+    guint8 *pitm = (guint8 *) find4 (a->data, a->len, "pitm");
+
+    g_assert_nonnull (pitm);
+    pitm[4 + 4 + 1] = 9;
+    g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+    g_assert_cmpuint (w, ==, 6000); g_assert_cmpuint (h, ==, 4000);
+  }
+  g_byte_array_free (a, TRUE);
+
+  /* irot: 90 and 270 degrees swap, 0 and 180 do not (a portrait HEIC) */
+  for (int r = 0; r < 4; r++)
+    {
+      o = (HfHeif) HF_HEIF_DEFAULT ("heic", 4032, 3024);
+      o.irot = r;
+      a = hf_make_heif (&o);
+      g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+      g_assert_cmpuint (w, ==, (r & 1) ? 3024u : 4032u);
+      g_assert_cmpuint (h, ==, (r & 1) ? 4032u : 3024u);
+      g_byte_array_free (a, TRUE);
+    }
+  /* clap crops (applied before irot, in the order listed), a nonsense one is ignored */
+  o = (HfHeif) HF_HEIF_DEFAULT ("heic", 4032, 3024);
+  o.clap = TRUE; o.clap_w = 2268; o.clap_h = 3024; o.irot = 1;
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 3024); g_assert_cmpuint (h, ==, 2268);
+  g_byte_array_free (a, TRUE);
+  o.clap_w = 0;
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("heic", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 3024); g_assert_cmpuint (h, ==, 4032);
+  g_byte_array_free (a, TRUE);
+
+  /* the biggest sizes: 31 bits are valid, 2^31 and 0 are not */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 0x7fffffff, 1);
+  a = hf_make_heif (&o);
+  g_assert_true (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_assert_cmpuint (w, ==, 0x7fffffff);
+  g_byte_array_free (a, TRUE);
+  o.w = 0x80000000u;
+  a = hf_make_heif (&o);
+  g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+  o.w = 0;
+  a = hf_make_heif (&o);
+  g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+
+  /* box sizes: a largesize (size 1, then 64 bits) for meta; size 0 (to the end)
+   * for the last box; sizes below 8 (or 16 with a largesize), and sizes beyond
+   * the buffer, are refused */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 321, 123);
+  a = hf_make_heif (&o);
+  {
+    guint8 *meta = (guint8 *) find4 (a->data, a->len, "meta") - 4;
+    gsize meta_off = (gsize) (meta - a->data);
+    guint32 msize = be32_at (meta);
+    GByteArray *big = g_byte_array_new ();
+    gsize tail = a->len - meta_off - msize;
+
+    g_byte_array_append (big, a->data, meta_off);
+    hf_u32 (big, 1);
+    hf_cc (big, "meta");
+    hf_u32 (big, 0); hf_u32 (big, msize + 8); /* 64-bit largesize, 8 more for itself */
+    g_byte_array_append (big, a->data + meta_off + 8, msize - 8);
+    g_byte_array_append (big, a->data + meta_off + msize, tail);
+    g_assert_true (parse_exact ("avif", big->data, big->len, &w, &h));
+    g_assert_cmpuint (w, ==, 321); g_assert_cmpuint (h, ==, 123);
+    memset (big->data + meta_off + 8, 0, 8);
+    big->data[meta_off + 15] = 15; /* largesize < 16 */
+    g_assert_false (parse_exact ("avif", big->data, big->len, &w, &h));
+    memset (big->data + meta_off + 8, 0xff, 8); /* 2^64 - 1: far beyond the buffer */
+    g_assert_false (parse_exact ("avif", big->data, big->len, &w, &h));
+    g_byte_array_free (big, TRUE);
+
+    /* meta with size 0: to the end of the file (mdat is then inside it, as junk) */
+    memset (meta, 0, 4);
+    g_assert_true (parse_exact ("avif", a->data, a->len, &w, &h));
+    g_assert_cmpuint (w, ==, 321);
+    meta[3] = 7; /* size 7 < 8 */
+    g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+    meta[3] = 1; /* size 1 with its largesize fields being "meta" bytes */
+    parse_exact ("avif", a->data, a->len, &w, &h);
+    meta[0] = 0xff; meta[1] = 0xff; meta[2] = 0xff; meta[3] = 0xff; /* beyond the buffer */
+    g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+    /* a meta that is cut off by the end of the buffer is not read */
+    g_assert_false (parse_exact ("avif", a->data, meta_off + msize - 1, &w, &h));
+    g_assert_false (parse_exact ("avif", a->data, 12, &w, &h)); /* ftyp cut */
+  }
+  g_byte_array_free (a, TRUE);
+  /* the first box must be ftyp; a PNG or JPEG with the key is no match */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 321, 123);
+  a = hf_make_heif (&o);
+  memcpy (a->data + 4, "free", 4);
+  g_assert_false (parse_exact ("avif", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+  /* a meta that does not come within the buffer: an mdat of 70000 bytes in front of it */
+  a = hf_make_heif (&o);
+  {
+    GByteArray *pre = g_byte_array_new (), *big;
+    guint8 *z = g_malloc0 (70000);
+
+    g_assert_cmpuint (be32_at (a->data), ==, 24); /* ftyp: 8 + major, minor, 2 brands */
+    g_byte_array_append (pre, a->data, 24);
+    big = g_byte_array_new ();
+    hf_u32 (big, 70008); hf_cc (big, "mdat");
+    g_byte_array_append (big, z, 70000);
+    g_byte_array_append (pre, big->data, big->len);
+    g_byte_array_append (pre, a->data + 24, a->len - 24);
+    g_assert_false (parse_exact ("avif", pre->data, MIN (pre->len, NFC_HEADER_MAX_BYTES), &w, &h));
+    g_assert_true (parse_exact ("avif", pre->data, pre->len, &w, &h)); /* the parser itself is fine */
+    g_assert_cmpuint (w, ==, 321);
+    g_byte_array_free (pre, TRUE); g_byte_array_free (big, TRUE);
+    g_free (z);
+  }
+  g_byte_array_free (a, TRUE);
+  g_assert_false (parse_exact ("avif", (const guint8 *) "", 0, &w, &h));
+}
+
+/* TIFF made by hand: II and MM, 32 and 64-bit (BigTIFF), SHORT and LONG sizes,
+ * orientation */
+static void
+test_header_tiff_handmade (void)
+{
+  guint32 w = 0, h = 0;
+  GByteArray *a;
+
+  for (guint v = 0; v < 8; v++)
+    {
+      gboolean le = v & 1, big = v & 2, short_ok = !(v & 4);
+
+      a = hf_make_tiff (le, big, 1425, 950, 0, short_ok);
+      g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h));
+      g_assert_cmpuint (w, ==, 1425); g_assert_cmpuint (h, ==, 950);
+      g_byte_array_free (a, TRUE);
+      a = hf_make_tiff (le, big, 100000, 70000, 0, short_ok); /* > 16 bits: LONG */
+      g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h));
+      g_assert_cmpuint (w, ==, 100000); g_assert_cmpuint (h, ==, 70000);
+      g_byte_array_free (a, TRUE);
+      /* orientation 5..8 swaps, 1..4 does not */
+      for (guint o = 1; o <= 8; o++)
+        {
+          a = hf_make_tiff (le, big, 1425, 950, o, short_ok);
+          g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h));
+          g_assert_cmpuint (w, ==, o >= 5 ? 950u : 1425u);
+          g_assert_cmpuint (h, ==, o >= 5 ? 1425u : 950u);
+          g_byte_array_free (a, TRUE);
+        }
+    }
+  /* a size of 0, of 2^31, a missing tag, a wrong magic, an IFD beyond the buffer */
+  a = hf_make_tiff (TRUE, FALSE, 0, 950, 0, TRUE);
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+  a = hf_make_tiff (TRUE, FALSE, 0x80000000u, 950, 0, FALSE);
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+  a = hf_make_tiff (FALSE, FALSE, 800, 600, 0, TRUE);
+  a->data[3] = 43; /* BigTIFF magic on a classic header: offset size field is junk */
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[3] = 41;
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[3] = 42;
+  g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[0] = 'X';
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[0] = 'M';
+  a->data[4] = 0x7f; /* IFD at 0x7f000008: beyond the buffer */
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[4] = 0; a->data[7] = 7; /* IFD inside the header */
+  g_assert_false (parse_exact ("tiff", a->data, a->len, &w, &h));
+  a->data[7] = 8;
+  a->data[8] = 0xff; a->data[9] = 0xff; /* 65535 entries in a buffer of a few: bounded by it */
+  g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h)); /* the count is bounded by the buffer */
+  g_byte_array_free (a, TRUE);
+  /* cuts of a valid one */
+  a = hf_make_tiff (FALSE, TRUE, 3000, 2000, 6, TRUE);
+  for (gsize len = 0; len < 16 + 8 + 20 * 2; len++) /* header, count, and not both sizes yet */
+    g_assert_false (parse_exact ("tiff", a->data, len, &w, &h));
+  g_assert_true (parse_exact ("tiff", a->data, a->len, &w, &h));
+  g_byte_array_free (a, TRUE);
+}
+
 
 static void
 test_header_handmade (void)
@@ -1925,12 +2184,18 @@ test_header_handmade (void)
   /* a mismatch between the extension and the content, unknown and NULL input */
   j = make_jpeg (0, 0, 10, 10);
   g_assert_false (parse_exact ("png", j->data, j->len, &w, &h));
-  g_assert_false (parse_exact ("tiff", j->data, j->len, &w, &h));
+  g_assert_false (parse_exact ("tiff", j->data, j->len, &w, &h)); /* JPEG data, TIFF key */
+  g_assert_false (parse_exact ("avif", j->data, j->len, &w, &h));
+  g_assert_false (parse_exact ("pdf", j->data, j->len, &w, &h));
   g_assert_false (parse_exact (NULL, j->data, j->len, &w, &h));
   g_assert_false (nfc_header_parse ("jpg", NULL, 0, &w, &h));
   g_assert_true (nfc_header_parse ("jpg", j->data, j->len, NULL, NULL)); /* out params optional */
   g_assert_true (nfc_header_format_known ("webp"));
-  g_assert_false (nfc_header_format_known ("tiff"));
+  g_assert_true (nfc_header_format_known ("tiff"));
+  g_assert_true (nfc_header_format_known ("avif"));
+  g_assert_true (nfc_header_format_known ("heic"));
+  g_assert_false (nfc_header_format_known ("pdf"));
+  g_assert_false (nfc_header_format_known ("ico"));
   g_assert_false (nfc_header_format_known (NULL));
   g_byte_array_free (j, TRUE);
 }
@@ -2010,6 +2275,76 @@ test_header_files_and_fuzz (void)
       g_ptr_array_add (bufs, g_byte_array_new_take ((guint8 *) contents, len));
       g_free (path); g_free (size); g_free (out);
     }
+  /* AVIF from libaom (ffmpeg), TIFF in both byte orders from libtiff (its IFD is
+   * after the pixels), the 16 x 16 HEIC of tests/data, and headers made by hand:
+   * the same checks, and into the fuzz corpus */
+  {
+    char *ffmpeg = g_find_program_in_path ("ffmpeg");
+    const char *data = g_getenv ("NFC_TEST_DATA");
+    char *avif = g_build_filename (dir, "k.avif", NULL);
+    char *heic = data != NULL ? g_build_filename (data, "data", "tiny-hevc.heic", NULL) : NULL;
+    static const struct { const char *name, *endian; } tifs[] = { { "m.tif", "msb" }, { "l.tif", "lsb" } };
+    gchar *contents = NULL;
+    gsize len = 0;
+    guint32 w = 0, h = 0;
+
+    if (ffmpeg != NULL)
+      {
+        char *argv[] = { ffmpeg, "-v", "error", "-f", "lavfi", "-i", "testsrc=s=321x123",
+                         "-frames:v", "1", "-c:v", "libaom-av1", "-still-picture", "1", "-y", avif, NULL };
+        int status = -1;
+
+        if (g_spawn_sync (NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                          NULL, NULL, NULL, NULL, &status, NULL) && status == 0)
+          {
+            g_assert_true (nfc_header_read_file (avif, "avif", &w, &h));
+            g_assert_cmpuint (w, ==, 321); g_assert_cmpuint (h, ==, 123);
+            g_assert_true (nfc_header_read_file (avif, "heic", &w, &h)); /* same container */
+            g_assert_false (nfc_header_read_file (avif, "png", &w, &h));
+            g_assert_false (nfc_header_read_file (avif, "tiff", &w, &h));
+            g_assert_true (g_file_get_contents (avif, &contents, &len, NULL));
+            g_ptr_array_add (bufs, g_byte_array_new_take ((guint8 *) contents, len));
+          }
+        else
+          g_test_message ("ffmpeg has no libaom-av1: no AVIF fixture");
+      }
+    for (guint i = 0; magick != NULL && i < G_N_ELEMENTS (tifs); i++)
+      {
+        char *path = g_build_filename (dir, tifs[i].name, NULL);
+        char *out = g_strconcat ("TIFF:", path, NULL);
+        char *def = g_strdup_printf ("tiff:endian=%s", tifs[i].endian);
+        char *argv[] = { magick, "-quiet", "-size", "13x9", "gradient:", "-define", def, out, NULL };
+        int status = -1;
+
+        g_assert_true (g_spawn_sync (NULL, argv, NULL, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL,
+                                     NULL, NULL, NULL, NULL, &status, NULL) && status == 0);
+        g_assert_true (nfc_header_read_file (path, "tiff", &w, &h));
+        g_assert_cmpuint (w, ==, 13); g_assert_cmpuint (h, ==, 9);
+        g_assert_false (nfc_header_read_file (path, "avif", &w, &h));
+        g_assert_true (g_file_get_contents (path, &contents, &len, NULL));
+        g_assert_true (parse_exact ("tiff", (const guint8 *) contents, len, &w, &h)); /* small: IFD in the buffer */
+        g_assert_cmpuint (w, ==, 13);
+        g_ptr_array_add (bufs, g_byte_array_new_take ((guint8 *) contents, len));
+        g_free (path); g_free (out); g_free (def);
+      }
+    if (heic != NULL && g_file_get_contents (heic, &contents, &len, NULL))
+      {
+        g_assert_true (parse_exact ("heic", (const guint8 *) contents, len, &w, &h));
+        g_assert_cmpuint (w, ==, 16); g_assert_cmpuint (h, ==, 16);
+        g_ptr_array_add (bufs, g_byte_array_new_take ((guint8 *) contents, len));
+      }
+    for (guint i = 0; i < 16; i++)
+      {
+        HfHeif o = HF_HEIF_DEFAULT (i % 2 ? "avif" : "heic", 321 + i, 123);
+
+        o.decoy = i & 2; o.irot = (i & 4) ? 1 : -1; o.clap = (i & 8) != 0;
+        o.clap_w = 100; o.clap_h = 50; o.wide_ipma = i % 3 == 0;
+        g_ptr_array_add (bufs, hf_make_heif (&o));
+      }
+    for (guint i = 0; i < 8; i++)
+      g_ptr_array_add (bufs, hf_make_tiff (i & 1, i & 2, 1000 + i, 500, (i & 4) ? 6 : 0, TRUE));
+    g_free (ffmpeg); g_free (avif); g_free (heic);
+  }
   g_test_message ("header read+parse of %u real files: %.1f us on average", n_timed,
                   total_us / n_timed);
   g_assert_cmpfloat (total_us / n_timed, <, 20000.0); /* far below the 1 ms a menu would feel */
@@ -2019,7 +2354,7 @@ test_header_files_and_fuzz (void)
    * beyond the buffer (ASan), never a crash, and a success has non-zero sizes. */
   {
     GRand *rnd = g_rand_new_with_seed (42);
-    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp", "tiff" };
+    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp", "tiff", "avif", "heic" };
 
     for (guint b = 0; b < bufs->len; b++)
       {
@@ -2063,7 +2398,7 @@ test_header_files_and_fuzz (void)
   {
     GRand *rnd = g_rand_new_with_seed (7);
     guint8 junk[100];
-    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp" };
+    static const char *const fmts[] = { "png", "jpg", "gif", "webp", "bmp", "tiff", "avif", "heic" };
 
     for (guint round = 0; round < 3000; round++)
       {
@@ -2074,6 +2409,20 @@ test_header_files_and_fuzz (void)
         /* bias towards the magic numbers so the deeper code is reached */
         if (round % 3 == 0 && len > 12)
           memcpy (junk, round % 2 ? "RIFF\0\0\0\0WEBPVP8X" : "\xff\xd8\xff\xe1\x00\x10", 6);
+        /* ... and towards an ftyp + meta box (the sizes in it random) and a TIFF header */
+        if (round % 5 == 1 && len > 40)
+          {
+            static const guint8 ftyp[24] = { 0, 0, 0, 24, 'f', 't', 'y', 'p', 'a', 'v', 'i', 'f', 0, 0, 0, 0,
+                                             'm', 'i', 'f', '1', 'a', 'v', 'i', 'f' };
+
+            memcpy (junk, ftyp, sizeof ftyp);
+            memcpy (junk + 28, "meta", 4);
+            /* the size of meta: 0 (to the end) or 40..99, which may or may not fit */
+            junk[24] = junk[25] = junk[26] = 0;
+            junk[27] = round % 7 == 0 ? 0 : (guint8) (40 + round % 60);
+          }
+        else if (round % 5 == 2 && len > 16)
+          memcpy (junk, round % 2 ? "II*\0\x08\0\0\0" : "MM\0*\0\0\0\x08", 8);
         for (guint f = 0; f < G_N_ELEMENTS (fmts); f++)
           {
             guint32 w, h;
@@ -3140,6 +3489,8 @@ main (int argc, char **argv)
   g_test_add_func ("/core/preset-distinct-and-ignored", test_preset_distinct_and_ignored);
   g_test_add_func ("/core/failure-message", test_failure_message);
   g_test_add_func ("/core/header-handmade", test_header_handmade);
+  g_test_add_func ("/core/header-isobmff-handmade", test_header_isobmff_handmade);
+  g_test_add_func ("/core/header-tiff-handmade", test_header_tiff_handmade);
   g_test_add_func ("/core/header-files-and-fuzz", test_header_files_and_fuzz);
   g_test_add_func ("/core/resize-presets", test_resize_presets);
   g_test_add_func ("/core/resize-targets", test_resize_targets);

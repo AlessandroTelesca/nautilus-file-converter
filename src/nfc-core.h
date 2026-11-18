@@ -324,7 +324,7 @@ typedef struct {
 } NfcSelItem;
 
 /* Pixel size of one selected file as far as the right-click menu knows it;
- * 0 x 0: unknown (not an image, a format without a header parser, a header that
+ * 0 x 0: unknown (not an image, a format without a header parser (SVG, ICO), a header that
  * is not in the first 64 KiB, an unreadable file). */
 typedef struct {
   guint64 width, height;
@@ -370,7 +370,8 @@ typedef struct {
  * or a resize preset (sel->targets may then be empty).
  *
  * The one thing that touches file content: for image selections it reads the
- * first 64 KiB of each (regular, local) file to learn its pixel size
+ * first 64 KiB of each (regular, local) file (a TIFF: and 64 KiB at its first IFD)
+ * to learn its pixel size
  * (sel->dims, nfc-header.h), so that Resize offers only presets that make the
  * picture smaller. Bounded, no tool is run; a file whose size cannot be found
  * simply has none. */

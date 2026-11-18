@@ -10,6 +10,8 @@
 #include <nautilus-extension.h>
 #include <string.h>
 
+#include "header-fixtures.h"
+
 /* LeakSanitizer: libnautilus-extension's NautilusMenu keeps a reference to every
  * item appended to it and never releases it (even when the menu itself is
  * finalized), so every menu item an extension builds is leaked by the library,
@@ -1165,6 +1167,169 @@ test_upscale_menus (void)
   g_free (magick);
 }
 
+/* Resize and Upscale for the formats whose size is read by the header parser of
+ * AVIF, HEIC and TIFF (tests/header-fixtures.h makes the headers, so a 8000 x 6000
+ * picture needs no encoder): the menu is filtered by the size like for a PNG. */
+static void
+write_bytes (const char *name, GByteArray *a)
+{
+  char *p = g_build_filename (work, name, NULL);
+
+  g_assert_true (g_file_set_contents (p, (const char *) a->data, (gssize) a->len, NULL));
+  g_free (p);
+  g_byte_array_free (a, TRUE);
+}
+
+static void
+test_header_format_menus (void)
+{
+  char *names, *tips;
+  GList *l;
+  HfHeif o;
+  const char *data = g_getenv ("NFC_TEST_DATA");
+  char *tiny = data != NULL ? g_build_filename (data, "data", "tiny-hevc.heic", NULL) : NULL;
+
+  /* AVIF 128 x 128: only the percentages (1440p ... 480p are larger than the picture; 50% is 64 px) */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 128, 128);
+  write_bytes ("h-128.avif", hf_make_heif (&o));
+  l = sel1 ("h-128.avif", "image/avif", FALSE);
+  names = resize_names_wait (l, TRUE, NULL, &tips);
+  g_assert_cmpstr (names, ==, "50pct,25pct");
+  g_assert_nonnull (strstr (tips, "64 × 64 px"));
+  g_free (names); g_free (tips);
+  g_list_free_full (l, g_object_unref);
+  names = upscale_names_wait (l = sel1 ("h-128.avif", "image/avif", FALSE), TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x,8x");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+
+  /* AVIF 1920 x 1079: 4K and 1440p are bigger, 1080p is 1920 px: not smaller */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 1920, 1079);
+  write_bytes ("h-chat.avif", hf_make_heif (&o));
+  l = sel1 ("h-chat.avif", "image/avif", FALSE);
+  names = resize_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "720p,480p,50pct,25pct");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+
+  /* a picture that is rotated by irot is measured as shown: 3024 x 4032 here, long side 4032 */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 4032, 3024);
+  o.irot = 1;
+  write_bytes ("h-rot.avif", hf_make_heif (&o));
+  l = sel1 ("h-rot.avif", "image/avif", FALSE);
+  names = upscale_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "2x,3x,4x,5x"); /* 6x: 439 MP */
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+
+  /* TIFF 1425 x 950 (both byte orders, classic and BigTIFF): long side above 720p */
+  for (guint v = 0; v < 4; v++)
+    {
+      char *name = g_strdup_printf ("h-1425-%u.tif", v);
+
+      write_bytes (name, hf_make_tiff (v & 1, v & 2, 1425, 950, 0, TRUE));
+      l = sel1 (name, "image/tiff", FALSE);
+      names = resize_names_wait (l, TRUE, NULL, NULL);
+      g_assert_cmpstr (names, ==, "720p,480p,50pct,25pct");
+      g_free (names);
+      g_list_free_full (l, g_object_unref);
+      g_free (name);
+    }
+
+  /* a header that claims 8000 x 6000 (48 MP): 2x is 192 MP, 3x is 432 MP > 400 MP */
+  o = (HfHeif) HF_HEIF_DEFAULT ("avif", 8000, 6000);
+  write_bytes ("h-8000.avif", hf_make_heif (&o));
+  write_bytes ("h-8000.tif", hf_make_tiff (TRUE, FALSE, 8000, 6000, 0, TRUE));
+  write_bytes ("h-8000-big.tif", hf_make_tiff (FALSE, TRUE, 8000, 6000, 0, FALSE));
+  o.brand = "heic";
+  write_bytes ("h-8000.heic", hf_make_heif (&o));
+  {
+    const struct { const char *name, *mime; } big[] = {
+      { "h-8000.avif", "image/avif" }, { "h-8000.tif", "image/tiff" },
+      { "h-8000-big.tif", "image/tiff" }, { "h-8000.heic", "image/heic" },
+    };
+
+    for (guint i = 0; i < G_N_ELEMENTS (big); i++)
+      {
+        l = sel1 (big[i].name, big[i].mime, FALSE);
+        names = upscale_names_wait (l, TRUE, NULL, NULL);
+        g_assert_cmpstr (names, ==, "2x");
+        g_free (names);
+        g_list_free_full (l, g_object_unref);
+      }
+  }
+
+  /* the HEIC of IMG_4718 (2268 x 4032, a portrait HEIC): 6x is 329 MP, 8x 585 MP */
+  o = (HfHeif) HF_HEIF_DEFAULT ("heic", 2268, 4032);
+  o.decoy = TRUE; /* its thumbnail and a tile do not matter */
+  write_bytes ("h-phone.heic", hf_make_heif (&o));
+  l = sel1 ("h-phone.heic", "image/heic", FALSE);
+  names = upscale_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x");
+  g_free (names);
+  g_assert_null (resize_names_wait (l, FALSE, NULL, NULL)); /* HEIC cannot be written back: no Resize */
+  g_list_free_full (l, g_object_unref);
+
+  /* the real 16 x 16 HEIC of the tests: all scales (128 px at 8x), no Resize for a HEIC */
+  if (tiny != NULL)
+    {
+      char *bytes = NULL;
+      gsize len = 0;
+      char *dst = g_build_filename (work, "h-tiny.heic", NULL);
+
+      if (g_file_get_contents (tiny, &bytes, &len, NULL))
+        {
+          g_assert_true (g_file_set_contents (dst, bytes, (gssize) len, NULL));
+          l = sel1 ("h-tiny.heic", "image/heic", FALSE);
+          names = upscale_names_wait (l, TRUE, NULL, &tips);
+          g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x,8x");
+          g_assert_nonnull (strstr (tips, "32 × 32 px")); /* the size was read: 16 x 16 at 2x */
+          g_free (names); g_free (tips);
+          g_assert_null (resize_names_wait (l, FALSE, NULL, NULL));
+          g_list_free_full (l, g_object_unref);
+          g_free (bytes);
+        }
+      g_free (dst);
+    }
+  g_free (tiny);
+
+  /* a selection with one that is too big for 3x and one that is not: 3x is offered
+   * (the job skips the big one), and with only too big ones it is not */
+  l = sel1 ("h-8000.avif", "image/avif", FALSE);
+  l = sel_add (l, "h-128.avif", "image/avif");
+  names = upscale_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "2x,3x,4x,5x,6x,8x");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("h-8000.avif", "image/avif", FALSE);
+  l = sel_add (l, "h-8000.tif", "image/tiff");
+  names = upscale_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "2x");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+
+  /* damaged ones: the size is unknown, so every preset (not an error) */
+  {
+    GByteArray *a = hf_make_heif (&(HfHeif) HF_HEIF_DEFAULT ("avif", 128, 128));
+
+    g_byte_array_set_size (a, 30); /* cut inside meta */
+    write_bytes ("h-cut.avif", a);
+    a = hf_make_tiff (TRUE, FALSE, 128, 128, 0, TRUE);
+    g_byte_array_set_size (a, 12);
+    write_bytes ("h-cut.tif", a);
+  }
+  l = sel1 ("h-cut.avif", "image/avif", FALSE);
+  names = resize_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "4k,1440p,1080p,720p,480p,50pct,25pct");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+  l = sel1 ("h-cut.tif", "image/tiff", FALSE);
+  names = resize_names_wait (l, TRUE, NULL, NULL);
+  g_assert_cmpstr (names, ==, "4k,1440p,1080p,720p,480p,50pct,25pct");
+  g_free (names);
+  g_list_free_full (l, g_object_unref);
+}
+
 
 static void
 test_register_and_menu (void)
@@ -1335,6 +1500,7 @@ test_register_and_menu (void)
   test_compress_menus ();
   test_resize_menus ();
   test_upscale_menus ();
+  test_header_format_menus ();
 
   /* no background items */
   {

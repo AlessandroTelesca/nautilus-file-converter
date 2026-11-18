@@ -32,6 +32,7 @@
 #include "nfc-convert.h"
 #include "nfc-core.h"
 #include "nfc-header.h"
+#include "header-fixtures.h"
 
 #define TEST_TIMEOUT 2        /* NFC_TEST_TIMEOUT_SECS for steps */
 #define TEST_PROBE_TIMEOUT 3  /* NFC_TEST_PROBE_TIMEOUT_SECS */
@@ -268,7 +269,9 @@ test_header_read_safety (void)
   }
   g_assert_false (nfc_header_read_file (NULL, "png", &w, &h));
   g_assert_false (nfc_header_read_file (p, NULL, &w, &h));
-  g_assert_false (nfc_header_read_file (p, "tiff", &w, &h)); /* no parser: the file is not even opened */
+  g_assert_false (nfc_header_read_file (p, "pdf", &w, &h)); /* no parser: the file is not even opened */
+  g_assert_false (nfc_header_read_file (p, "tiff", &w, &h)); /* PNG data, TIFF key */
+  g_assert_false (nfc_header_read_file (p, "avif", &w, &h));
 
   /* a 100 GiB sparse file with a valid header: only the first 64 KiB are read */
   sparse = B (datadir, "sparse.png");
@@ -282,6 +285,35 @@ test_header_read_safety (void)
   g_assert_true (nfc_header_read_file (sparse, "png", &w, &h));
   g_assert_cmpint (g_get_monotonic_time () - t0, <, 100000);
   g_assert_cmpuint (w, ==, 3840);
+
+  /* a TIFF whose first IFD is far in (libtiff writes it after the pixels): read from
+   * where it is, in one more bounded read, even in a huge sparse file; an offset
+   * beyond the end of the file, or a header-only file, is just unknown */
+  {
+    GByteArray *tf = hf_make_tiff (TRUE, FALSE, 4000, 3000, 0, TRUE);
+    char *far = B (datadir, "far-ifd.tif");
+    const guint32 ifd_at = 3000000000u; /* 4 GiB at most in a classic TIFF */
+
+    fp = fopen (far, "wb");
+    g_assert_nonnull (fp);
+    tf->data[4] = ifd_at & 0xff; tf->data[5] = (ifd_at >> 8) & 0xff;
+    tf->data[6] = (ifd_at >> 16) & 0xff; tf->data[7] = ifd_at >> 24;
+    g_assert_cmpuint (fwrite (tf->data, 1, 8, fp), ==, 8);
+    g_assert_cmpint (fseeko (fp, ifd_at, SEEK_SET), ==, 0);
+    g_assert_cmpuint (fwrite (tf->data + 8, 1, tf->len - 8, fp), ==, tf->len - 8);
+    fclose (fp);
+    t0 = g_get_monotonic_time ();
+    g_assert_true (nfc_header_read_file (far, "tiff", &w, &h));
+    g_assert_cmpint (g_get_monotonic_time () - t0, <, 100000);
+    g_assert_cmpuint (w, ==, 4000); g_assert_cmpuint (h, ==, 3000);
+    g_assert_false (nfc_header_read_file (far, "avif", &w, &h));
+    g_assert_cmpint (truncate (far, ifd_at), ==, 0); /* the IFD is now at the end of the file: gone */
+    g_assert_false (nfc_header_read_file (far, "tiff", &w, &h));
+    g_assert_cmpint (truncate (far, ifd_at + 6), ==, 0); /* a cut IFD: not enough entries */
+    g_assert_false (nfc_header_read_file (far, "tiff", &w, &h));
+    g_free (far);
+    g_byte_array_free (tf, TRUE);
+  }
 
   /* a JPEG whose frame header lies beyond 64 KiB: unknown, not an error, not slow */
   junk = g_string_new ("\xff\xd8\xff\xe1\xff\xff");
