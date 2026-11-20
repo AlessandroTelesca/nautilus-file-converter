@@ -226,6 +226,11 @@ gboolean nfc_upscale_available (NfcCategory cat, const char *fmt);
  * "key=value", "#" comments, blanks trimmed; the last upscale-model line wins), or
  * NULL if there is none. g_free. */
 char    *nfc_upscale_config_model (const char *text);
+/* Where upscayl-bin is looked for, in order: /opt/Upscayl, the system Flatpak, the
+ * user Flatpak under data_dir (XDG data home). NULL-terminated; g_strfreev. */
+char   **nfc_upscayl_candidates (const char *data_dir);
+/* The first executable of candidates, else upscayl-bin on the PATH, else NULL. g_free. */
+char    *nfc_find_upscayl_in (char **candidates);
 /* Resolve the backend of the upscayl-bin at `bin`: its models directory
  * (<bindir>/../models) and the model to use: upscale-model of the configuration
  * file config_path (may be NULL or missing) if both its .param and .bin files exist

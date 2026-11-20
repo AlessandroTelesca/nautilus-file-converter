@@ -3186,6 +3186,53 @@ test_upscale_discovery (void)
   g_free (md);
 }
 
+/* the lookup list of upscayl-bin: /opt, the system Flatpak, then the user Flatpak under the
+ * XDG data home; the first executable one wins (the host's own /opt and system Flatpak are
+ * replaced by missing paths, so this passes wherever it runs) */
+static void
+test_upscale_candidates (void)
+{
+  char *data = g_dir_make_tmp ("nfc-upfp-XXXXXX", NULL), *want, *dir, *got;
+  char **c;
+
+  g_assert_nonnull (data);
+  c = nfc_upscayl_candidates (data);
+  g_assert_cmpuint (g_strv_length (c), ==, 3);
+  g_assert_cmpstr (c[0], ==, "/opt/Upscayl/resources/bin/upscayl-bin");
+  g_assert_cmpstr (c[1], ==, "/var/lib/flatpak/app/org.upscayl.Upscayl/current/active/files/upscayl/resources/bin/upscayl-bin");
+  want = g_build_filename (data, "flatpak", "app", "org.upscayl.Upscayl", "current", "active", "files",
+                           "upscayl", "resources", "bin", "upscayl-bin", NULL);
+  g_assert_cmpstr (c[2], ==, want);
+
+  /* not installed: no candidate is taken (the PATH may still offer one: not under test) */
+  g_free (c[0]);
+  g_free (c[1]);
+  c[0] = g_build_filename (data, "none-a", NULL);
+  c[1] = g_build_filename (data, "none-b", NULL);
+  got = nfc_find_upscayl_in (c);
+  g_assert_true (got == NULL || (strcmp (got, want) != 0 && strstr (got, data) == NULL));
+  g_free (got);
+
+  /* a user Flatpak install is found, and a non-executable one is not */
+  dir = g_path_get_dirname (want);
+  g_assert_cmpint (g_mkdir_with_parents (dir, 0755), ==, 0);
+  write_text (want, "#!/bin/sh\nexit 0\n");
+  g_assert_cmpint (g_chmod (want, 0644), ==, 0);
+  got = nfc_find_upscayl_in (c);
+  g_assert_true (got == NULL || strcmp (got, want) != 0);
+  g_free (got);
+  g_assert_cmpint (g_chmod (want, 0755), ==, 0);
+  got = nfc_find_upscayl_in (c);
+  g_assert_cmpstr (got, ==, want);
+  g_free (got);
+
+  nfc_rm_rf (data);
+  g_strfreev (c);
+  g_free (dir);
+  g_free (want);
+  g_free (data);
+}
+
 static void
 use_fake_upscayl (void)
 {
@@ -3497,6 +3544,7 @@ main (int argc, char **argv)
   g_test_add_func ("/core/resize-argv", test_resize_argv);
   g_test_add_func ("/core/small-labels", test_small_labels);
   g_test_add_func ("/core/upscale-discovery", test_upscale_discovery); /* first: reads what main set up */
+  g_test_add_func ("/core/upscale-candidates", test_upscale_candidates);
   g_test_add_func ("/core/upscale-presets", test_upscale_presets);
   g_test_add_func ("/core/upscale-targets", test_upscale_targets);
   g_test_add_func ("/core/upscale-config", test_upscale_config);

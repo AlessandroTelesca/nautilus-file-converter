@@ -339,7 +339,8 @@ sudo dnf install ImageMagick ffmpeg libreoffice libnotify
 * `ffmpeg` (the full build, e.g. from RPM Fusion, for libx264/libmp3lame/libopus...)
 * `libreoffice` (provides `soffice`): documents
 * `Upscayl` (optional, for Upscale only): its backend `upscayl-bin` and models, from the
-  [release RPM](https://github.com/upscayl/upscayl/releases) (`/opt/Upscayl`) or anywhere
+  [release RPM](https://github.com/upscayl/upscayl/releases) (`/opt/Upscayl`), its Flatpak
+  (`org.upscayl.Upscayl`, system or user install) or anywhere
   `upscayl-bin` is on the `PATH` with a `models` directory beside its `bin` directory;
   a Vulkan-capable GPU and driver
 * `libnotify` (`notify-send`): result notifications, replaced in place using
@@ -498,7 +499,13 @@ menu talks to the GPU: the entry is only a menu item until it is clicked.
 
 * **When it is offered.** `upscayl-bin` is looked up once, when the module loads:
   `$NFC_UPSCAYL_BIN` (tests), then Upscayl's install
-  (`/opt/Upscayl/resources/bin/upscayl-bin`), then `upscayl-bin` on the `PATH`. Its
+  (`/opt/Upscayl/resources/bin/upscayl-bin`), then the Flatpak of Upscayl
+  (`org.upscayl.Upscayl`): the system one
+  (`/var/lib/flatpak/app/org.upscayl.Upscayl/current/active/files/upscayl/resources/bin/upscayl-bin`),
+  then the user one (the same path under `$XDG_DATA_HOME`, `~/.local/share/flatpak/...`),
+  then `upscayl-bin` on the `PATH`. The first one that is executable wins. The Flatpak
+  binary is run straight on the host, outside its sandbox (it needs no libraries the
+  host lacks), through the `current/active` links, which survive Flatpak updates. Its
   models are `<bindir>/../models` (`<name>.param` + `<name>.bin`). No binary, no
   models directory or no usable model: no Upscale entry, and the rest of the menu is
   untouched. Images only: PNG, JPG, WEBP, AVIF, HEIC, BMP, TIFF and GIF (its first

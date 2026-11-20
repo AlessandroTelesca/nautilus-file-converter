@@ -48,18 +48,50 @@ find_decode_helper (void)
 }
 
 
+#define UPSCAYL_FLATPAK_REL "flatpak/app/org.upscayl.Upscayl/current/active/files/upscayl/resources/bin/upscayl-bin"
+
+/* The fixed places of upscayl-bin, in lookup order: Upscayl's own install, the
+ * system Flatpak (/var/lib/flatpak), the user Flatpak (<data_dir>/flatpak, data_dir
+ * being the XDG data home). The Flatpak ones go through the "current/active"
+ * symlinks, which stay valid across updates; the binary runs fine on the host (its
+ * models are in the app's files, <bindir>/../models). NULL-terminated, g_strfreev. */
+char **
+nfc_upscayl_candidates (const char *data_dir)
+{
+  char **c = g_new0 (char *, 4);
+
+  c[0] = g_strdup ("/opt/Upscayl/resources/bin/upscayl-bin");
+  c[1] = g_strdup ("/var/lib/" UPSCAYL_FLATPAK_REL);
+  c[2] = g_build_filename (data_dir, UPSCAYL_FLATPAK_REL, NULL);
+  return c;
+}
+
+/* The first executable of the NULL-terminated list, else upscayl-bin on the PATH,
+ * else NULL. g_free. */
+char *
+nfc_find_upscayl_in (char **candidates)
+{
+  for (guint i = 0; candidates != NULL && candidates[i] != NULL; i++)
+    if (g_file_test (candidates[i], G_FILE_TEST_IS_EXECUTABLE))
+      return g_strdup (candidates[i]);
+  return g_find_program_in_path ("upscayl-bin");
+}
+
 /* The Upscale backend: NFC_UPSCAYL_BIN (tests; set but not executable means none),
- * else Upscayl's own install, else upscayl-bin on the PATH. NULL if absent. */
+ * else Upscayl's own install (/opt/Upscayl), else its system, then user Flatpak,
+ * else upscayl-bin on the PATH. NULL if absent. */
 static char *
 find_upscayl (void)
 {
   const char *env = g_getenv ("NFC_UPSCAYL_BIN");
+  char **c, *bin;
 
   if (env != NULL && *env != '\0')
     return g_file_test (env, G_FILE_TEST_IS_EXECUTABLE) ? g_strdup (env) : NULL;
-  if (g_file_test ("/opt/Upscayl/resources/bin/upscayl-bin", G_FILE_TEST_IS_EXECUTABLE))
-    return g_strdup ("/opt/Upscayl/resources/bin/upscayl-bin");
-  return g_find_program_in_path ("upscayl-bin");
+  c = nfc_upscayl_candidates (g_get_user_data_dir ());
+  bin = nfc_find_upscayl_in (c);
+  g_strfreev (c);
+  return bin;
 }
 
 static char *
